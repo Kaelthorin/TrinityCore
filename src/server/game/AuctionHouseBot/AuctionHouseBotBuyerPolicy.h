@@ -33,6 +33,9 @@ namespace AuctionBotBuyerPolicy
     // Highest price per unit (or per item for single items) the bot pays; 0 = no cap.
     uint64 MaxUnitPrice(AuctionPosting const* auction);
 
+    // A listing's price (buyout or bid) per item: a commodity price already is per unit, an item stack's price is for the whole stack.
+    uint64 PerItemPrice(AuctionPosting const* auction, uint64 price);
+
     // Total price of buying the whole listing at the given unit/bid price.
     uint64 TotalPrice(AuctionPosting const* auction, uint64 unitPrice);
 

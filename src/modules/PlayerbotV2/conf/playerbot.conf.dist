@@ -36,6 +36,13 @@ Logger.playerbot.v2=3,Playerbot CrashRing
 Logger.playerbot.api=3,Playerbot CrashRing
 
 #-----------------------------------------------------------------------------
+# Core pathfinding tuning the bots were tested with (worldserver.conf defaults to 0 = stock)
+#-----------------------------------------------------------------------------
+
+# Slope-aware path cost (worldserver.conf, Pathfinding.SlopeCoefficient): each segment costs 1 + slope degrees * value / 100.
+Pathfinding.SlopeCoefficient = 1.0
+
+#-----------------------------------------------------------------------------
 # Core / threading
 #-----------------------------------------------------------------------------
 

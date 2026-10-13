@@ -19,11 +19,11 @@ namespace AuctionBotBuyerPolicy
 namespace
 {
     bool _commodities = false;
-    float _maxPriceMultiplier = 1.5f;
-    uint32 _minDelay = 30;
-    uint32 _maxDelay = 600;
+    float _maxPriceMultiplier = 0.0f;  // 0 = no price cap
+    uint32 _minDelay = 0;
+    uint32 _maxDelay = 0;
     uint64 _dailyBudget = 0;      // copper, 0 = unlimited
-    uint32 _maxBuysPerHour = 60;  // 0 = unlimited
+    uint32 _maxBuysPerHour = 0;   // 0 = unlimited
     bool _fair = false;
     float _fairMinChance = 35.0f; // percent at the price cap
 
@@ -61,11 +61,11 @@ namespace
 void LoadConfig()
 {
     _commodities = sConfigMgr->GetBoolDefault("AuctionHouseBot.Buyer.Commodities", false);
-    _maxPriceMultiplier = sConfigMgr->GetFloatDefault("AuctionHouseBot.Buyer.MaxPriceMultiplier", 1.5f);
-    _minDelay = sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MinDelay", 30);
-    _maxDelay = std::max(_minDelay, uint32(sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MaxDelay", 600)));
+    _maxPriceMultiplier = sConfigMgr->GetFloatDefault("AuctionHouseBot.Buyer.MaxPriceMultiplier", 0.0f);
+    _minDelay = sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MinDelay", 0);
+    _maxDelay = std::max(_minDelay, uint32(sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MaxDelay", 0)));
     _dailyBudget = uint64(sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.DailyBudgetGold", 0)) * GOLD;
-    _maxBuysPerHour = sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MaxBuysPerHour", 60);
+    _maxBuysPerHour = sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MaxBuysPerHour", 0);
     _fair = sConfigMgr->GetBoolDefault("AuctionHouseBot.Buyer.FairPricing", false);
     _fairMinChance = std::clamp(sConfigMgr->GetFloatDefault("AuctionHouseBot.Buyer.FairMinChance", 35.0f), 0.0f, 100.0f);
 }
@@ -124,6 +124,14 @@ uint64 MaxUnitPrice(AuctionPosting const* auction)
     if (_maxPriceMultiplier <= 0.0f || auction->Items.empty())
         return 0;
     return uint64(FairUnitPrice(auction->Items[0]->GetTemplate()) * _maxPriceMultiplier);
+}
+
+uint64 PerItemPrice(AuctionPosting const* auction, uint64 price)
+{
+    if (auction->IsCommodity())
+        return price;
+    uint32 const count = auction->GetTotalItemCount();
+    return count > 1 ? price / count : price;
 }
 
 uint64 TotalPrice(AuctionPosting const* auction, uint64 unitPrice)

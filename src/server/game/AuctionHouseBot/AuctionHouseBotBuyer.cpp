@@ -341,8 +341,8 @@ void AuctionBotBuyer::BuyAndBidItems(BuyerConfiguration& config)
         if (AuctionBotBuyerPolicy::FairPricingEnabled())
         {
             uint32 const qualityChance = GetChanceMultiplier(auction->Items[0]->GetTemplate()->GetQuality());
-            successBuy = auction->BuyoutOrUnitPrice && AuctionBotBuyerPolicy::RollFair(auction, auction->BuyoutOrUnitPrice, qualityChance);
-            successBid = auction->MinBid && AuctionBotBuyerPolicy::RollFair(auction, bidPrice, qualityChance);
+            successBuy = auction->BuyoutOrUnitPrice && AuctionBotBuyerPolicy::RollFair(auction, AuctionBotBuyerPolicy::PerItemPrice(auction, auction->BuyoutOrUnitPrice), qualityChance);
+            successBid = auction->MinBid && AuctionBotBuyerPolicy::RollFair(auction, AuctionBotBuyerPolicy::PerItemPrice(auction, bidPrice), qualityChance);
         }
         else
         {
@@ -353,9 +353,9 @@ void AuctionBotBuyer::BuyAndBidItems(BuyerConfiguration& config)
         // never pay above the fair-price cap (AuctionHouseBot.Buyer.MaxPriceMultiplier)
         if (uint64 cap = AuctionBotBuyerPolicy::MaxUnitPrice(auction))
         {
-            if (auction->BuyoutOrUnitPrice > cap)
+            if (AuctionBotBuyerPolicy::PerItemPrice(auction, auction->BuyoutOrUnitPrice) > cap)
                 successBuy = false;
-            if (bidPrice > cap)
+            if (AuctionBotBuyerPolicy::PerItemPrice(auction, bidPrice) > cap)
                 successBid = false;
         }
 

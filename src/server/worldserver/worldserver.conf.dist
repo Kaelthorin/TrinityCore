@@ -475,12 +475,14 @@ Pathfinding.RoadCostMounted = 0.35
 #                     1.3×, 60° costs 1.6×. The slope term tempers raw
 #                     road preference so bots don't switchback up a
 #                     mountain just because there's a road on it.
-#                     Set to 0.0 to disable the slope penalty entirely.
+#                     Set to 0.0 to disable the slope penalty entirely (stock
+#                     pathing for every creature). The bot module's
+#                     playerbot.conf sets 1.0.
 #                     The dtQueryFilterTC subclass implements this; see
 #                     src/server/game/Movement/dtQueryFilterTC.cpp.
-#        Default:     1.0
+#        Default:     0.0
 
-Pathfinding.SlopeCoefficient = 1.0
+Pathfinding.SlopeCoefficient = 0.0
 
 ###################################################################################################
 # Handcrafted road segments

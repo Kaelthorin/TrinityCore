@@ -16850,10 +16850,7 @@ QuestStatus Player::GetQuestStatus(uint32 quest_id) const
 bool Player::CanShareQuest(uint32 quest_id) const
 {
     Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
-    // Vanilla: every ordinary quest can be shared. The imported Forever quest data does not reliably carry the
-    // SHARABLE flag, which left the Share button (and the bots) without any quest to push, so a quest that is
-    // not repeatable / daily / weekly counts as sharable too.
-    if (qInfo && (qInfo->HasFlag(QUEST_FLAGS_SHARABLE) || (!qInfo->IsRepeatable() && !qInfo->IsDailyOrWeekly())))
+    if (qInfo && qInfo->HasFlag(QUEST_FLAGS_SHARABLE))
     {
         QuestStatusMap::const_iterator itr = m_QuestStatus.find(quest_id);
         return (itr != m_QuestStatus.end());

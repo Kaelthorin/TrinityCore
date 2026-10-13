@@ -862,10 +862,10 @@ void PathGenerator::CreateFilter()
 
     // Phase 3: slope-aware cost penalty. A 30° slope costs 1.30× a flat
     // segment; tempers raw road preference so paths don't switchback up
-    // a hill for the road bonus alone. Default coefficient 1.0; tune via
-    // worldserver.conf:
-    //   Pathfinding.SlopeCoefficient = 1.0   (0.0 = disabled)
-    float slopeCoef = sConfigMgr->GetFloatDefault("Pathfinding.SlopeCoefficient", 1.0f);
+    // a hill for the road bonus alone. Default 0.0 (disabled, stock pathing);
+    // the bot module's playerbot.conf sets 1.0:
+    //   Pathfinding.SlopeCoefficient = 1.0
+    float slopeCoef = sConfigMgr->GetFloatDefault("Pathfinding.SlopeCoefficient", 0.0f);
     _filter.SetSlopeCoefficient(slopeCoef);
 
     // Map-type gate: dungeon/raid instances have spurious "road" tags on
