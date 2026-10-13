@@ -54,7 +54,6 @@
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
-#include "StringFormat.h"
 #include "Transport.h"
 #include "Util.h"
 #include "Vignette.h"
@@ -661,15 +660,6 @@ public:
 
         TeamId oldControllingTeam = GetControllingTeam();
         float pointsGained = CalculatePointsPerSecond(targetList) * _heartbeatRate.count() / 1000.0f;
-
-        // Diagnostic (2026-06-11, EotS towers frozen with eligible players
-        // inside): expose what the grid searcher actually returned vs the
-        // resulting gain. Debug-gated — silent at default log levels.
-        TC_LOG_DEBUG("bg.battleground",
-            "ControlZone {} (map {} inst {}) heartbeat: targets={} gain={} value={}",
-            _owner.GetEntry(), _owner.GetMapId(), _owner.GetMap()->GetInstanceId(),
-            uint32(targetList.size()), pointsGained, _value);
-
         if (pointsGained == 0)
             return;
 
@@ -755,7 +745,7 @@ public:
     float CalculateTimeNeeded(int32 hordePlayers, int32 alliancePlayers) const
     {
         uint32 const uncontestedTime = _owner.GetGOInfo()->controlZone.UncontestedTime;
-        uint32 delta = std::abs(alliancePlayers - hordePlayers);
+        uint32 const delta = std::abs(alliancePlayers - hordePlayers);
         uint32 const minSuperiority = _owner.GetGOInfo()->controlZone.minSuperiority;
 
         if (delta < minSuperiority)
@@ -1677,9 +1667,7 @@ void GameObject::Update(uint32 diff)
                         if (goInfo->trap.spell && goInfo->trap.playerCast)
                             target->CastSpell(target, goInfo->trap.spell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
                         else if (goInfo->trap.spell)
-                        {
                             CastSpell(target, goInfo->trap.spell, args);
-                        }
 
                         // Template value or 4 seconds
                         m_cooldownTime = GameTime::GetGameTimeMS() + (goInfo->trap.cooldown ? goInfo->trap.cooldown : uint32(4)) * IN_MILLISECONDS;

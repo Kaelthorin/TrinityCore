@@ -17,7 +17,6 @@
 
 #include "SpellAuras.h"
 #include "CellImpl.h"
-#include "ClassicSpellValue.h"
 #include "Common.h"
 #include "Containers.h"
 #include "CreatureAI.h"
@@ -610,7 +609,6 @@ void Aura::_ApplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
             caster->GetSpellHistory()->StartCooldown(m_spellInfo, castItem ? castItem->GetEntry() : 0, nullptr, true);
         }
     }
-
 }
 
 void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
@@ -639,7 +637,6 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
     if (caster && GetSpellInfo()->IsCooldownStartedOnEvent())
         // note: item based cooldowns and cooldown spell mods with charges ignored (unknown existed cases)
         caster->GetSpellHistory()->SendCooldownEvent(GetSpellInfo());
-
 }
 
 // removes aura from all targets

@@ -15,9 +15,7 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <unordered_map>
 #include "Spell.h"
-#include "ClassicOpcodes.h"
 #include "DeathRecap.h"
 #include "AzeriteEmpoweredItem.h"
 #include "Battlefield.h"
@@ -3641,7 +3639,6 @@ SpellCastResult Spell::prepare(SpellCastTargets const& targets, AuraEffect const
         if (!(_triggeredCastFlags & TRIGGERED_IGNORE_GCD))
             TriggerGlobalCooldown();
 
-
         // Call CreatureAI hook OnSpellStart
         if (Creature* caster = m_caster->ToCreature())
             if (caster->IsAIEnabled())
@@ -3789,8 +3786,6 @@ void Spell::_cast(bool skipCheck)
     {
         auto cleanupSpell = [this, modOwner](SpellCastResult res, int32* p1 = nullptr, int32* p2 = nullptr)
         {
-            // [raid_rez] (Garr test 2026-10-08: rez casts of 10 s that never landed and never failed at the start): the result of a
-            // resurrection that is refused when its cast bar completes.
             SendCastResult(res, p1, p2);
             SendInterrupted(res);
 
@@ -4428,9 +4423,6 @@ void Spell::finish(SpellCastResult result)
     if (!unitCaster)
         return;
 
-    // [raid_rez] how a resurrection ended (Karrz, MC 2026-10-10): the result, and how many targets survived target selection (a target
-    // dropped by CheckTarget / the effect mask leaves a cast that "succeeds" and offers nothing).
-
     // successful cast of the initial autorepeat spell is moved to idle state so that it is not deleted as long as autorepeat is active
     if (IsAutoRepeat() && unitCaster->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) == this)
         m_spellState = SPELL_STATE_IDLE;
@@ -4507,7 +4499,6 @@ void Spell::finish(SpellCastResult result)
     // Stop Attack for some spells
     if (m_spellInfo->HasAttribute(SPELL_ATTR0_CANCELS_AUTO_ATTACK_COMBAT))
         unitCaster->AttackStop();
-
 }
 
 template<class T>

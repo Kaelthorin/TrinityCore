@@ -379,9 +379,7 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
         return;
 
     if (!group->IsLeader(GetPlayer()->GetGUID()))
-    {
         return;
-    }
 
     if (group->isLFGGroup())
         return;
@@ -400,15 +398,12 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
     }
 
     if (packet.LootThreshold < ITEM_QUALITY_UNCOMMON || packet.LootThreshold > ITEM_QUALITY_ARTIFACT)
-    {
         return;
-    }
 
     if (packet.LootMethod == MASTER_LOOT && !group->IsMember(packet.LootMasterGUID))
-    {
         return;
-    }
 
+    // everything's fine, do it
     group->SetLootMethod(static_cast<LootMethod>(packet.LootMethod));
     group->SetMasterLooterGuid(packet.LootMethod == MASTER_LOOT ? packet.LootMasterGUID : ObjectGuid::Empty);
     group->SetLootThreshold(static_cast<ItemQualities>(packet.LootThreshold));
@@ -614,7 +609,6 @@ void WorldSession::HandleRequestPartyMemberStatsOpcode(WorldPackets::Party::Requ
 void WorldSession::HandleRequestRaidInfoOpcode(WorldPackets::Party::RequestRaidInfo& /*packet*/)
 {
     // every time the player checks the character screen
-    TC_LOG_INFO("instance.lock", "[raid_info] client requested raid info ({})", _player->GetName());
     _player->SendRaidInfo();
 }
 

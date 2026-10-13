@@ -206,38 +206,14 @@ namespace TerrainMgrDetail
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
         std::vector<HandcraftedRoadSegment> const& segs = HandcraftedRoadStorage::GetForMap(mapId);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: mapId={} segments_in_storage={}",
-            mapId, uint32(segs.size()));
         if (segs.empty())
             return 0;
 
-        // Diagnostic: probe every plausible instanceId so we can see whether the
-        // shared-mesh assumption (instance 0) is correct on the live worldserver.
         dtNavMesh* navMesh = MMAP::MMapManager::instance()->GetNavMesh(mapId, 0);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: GetNavMesh(mapId={}, instance=0) returned {}",
-            mapId, navMesh ? "non-null" : "nullptr");
         if (!navMesh)
-            return 0;
-
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: navmesh maxTiles={} (count of tiles populated may be smaller)",
-            navMesh->getMaxTiles());
-
-        // Per-segment diagnostic: scan the first 3 segments to surface
-        // tilesScanned/polysExamined/found so we can pinpoint where the
-        // corridor algorithm rejects everything.
-        for (std::size_t i = 0; i < std::min<std::size_t>(3, segs.size()); ++i)
         {
-            HandcraftedRoadSegment const& s = segs[i];
-            Road::Segment rs{ s.fromX, s.fromY, s.toX, s.toY, s.width };
-            Road::CorridorResult const r = Road::ScanCorridor(*navMesh, rs);
-            TC_LOG_ERROR("misc",
-                "[handcrafted-road] apply diag seg #{}: tc=({}, {})->({}, {}) width={} "
-                "tilesScanned={} polysExamined={} polysFound={}",
-                uint32(s.id), s.fromX, s.fromY, s.toX, s.toY, s.width,
-                r.tilesScanned, r.polysExamined, uint32(r.polyRefs.size()));
+            TC_LOG_DEBUG("misc", "[handcrafted-road] map {}: no navmesh loaded, {} segments not applied", mapId, uint32(segs.size()));
+            return 0;
         }
 
         std::vector<Road::Segment> roadSegs;
@@ -246,9 +222,8 @@ namespace TerrainMgrDetail
             roadSegs.push_back({ s.fromX, s.fromY, s.toX, s.toY, s.width });
 
         std::size_t const tagged = Road::ApplyCorridorsToNavmesh(*navMesh, roadSegs);
-        TC_LOG_ERROR("misc",
-            "[handcrafted-road] apply diag: total tagged={} polys across {} segments",
-            uint32(tagged), uint32(roadSegs.size()));
+        TC_LOG_DEBUG("misc", "[handcrafted-road] map {}: tagged {} polys across {} segments",
+            mapId, uint32(tagged), uint32(roadSegs.size()));
 
         // Mark as applied so the next first-tile-load on this map
         // doesn't re-walk the corridor for nothing.

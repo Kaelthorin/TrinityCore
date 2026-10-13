@@ -373,8 +373,6 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     AuctionPosting* auction = auctionHouse->GetAuction(placeBid.AuctionID);
     if (!auction)
     {
-        TC_LOG_INFO("auctionhouse", "[ahbuy] {} bid on auction {} refused: no such auction in this house (gone, expired or already bought)",
-            GetPlayerInfo(), placeBid.AuctionID);
         SendAuctionCommandResult(placeBid.AuctionID, AuctionCommand::PlaceBid, AuctionResult::ItemNotFound, throttle.DelayUntilNext);
         return;
     }
@@ -398,7 +396,6 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     // buyout attempt with wrong amount (for a stack the price per item is accepted too)
     if (!canBid && placeBid.BidAmount != buyoutPrice && !(stack && placeBid.BidAmount == auction->BuyoutOrUnitPrice))
     {
-        TC_LOG_INFO("auctionhouse", "[ahbuy] {} buyout of auction {} refused: sent {}, buyout is {}", GetPlayerInfo(), placeBid.AuctionID, placeBid.BidAmount, buyoutPrice);
         SendAuctionCommandResult(placeBid.AuctionID, AuctionCommand::PlaceBid, AuctionResult::BidIncrement, throttle.DelayUntilNext);
         return;
     }

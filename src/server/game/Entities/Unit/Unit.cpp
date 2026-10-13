@@ -15,8 +15,6 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "PetFollowSpeed.h"
-#include <atomic>
 #include "Unit.h"
 #include "ClassicArmor.h"
 #include "DeathRecap.h"
@@ -54,7 +52,6 @@
 #include "KillRewarder.h"
 #include "ListUtils.h"
 #include "Log.h"
-#include "Config.h"
 #include "Loot.h"
 #include "LootMgr.h"
 #include "LootPackets.h"
@@ -1333,7 +1330,6 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
         damageInfo->HitInfo |= (damageInfo->damage - damageInfo->resist == 0 ? HITINFO_FULL_RESIST : HITINFO_PARTIAL_RESIST);
 
     damageInfo->damage = dmgInfo.GetDamage();
-
 }
 
 void Unit::DealSpellDamage(SpellNonMeleeDamage const* damageInfo, bool durabilityLoss)
@@ -3267,7 +3263,6 @@ void Unit::InterruptSpell(CurrentSpellTypes spellType, bool withDelayed, bool wi
             m_currentSpells[spellType] = nullptr;
             spell->SetReferencedFromCurrent(false);
         }
-
 
         if (GetTypeId() == TYPEID_UNIT && IsAIEnabled())
             ToCreature()->AI()->OnSpellFailed(spell->GetSpellInfo());
@@ -7068,7 +7063,6 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     if (Player* modOwner = GetSpellModOwner())
         modOwner->ApplySpellMod(spellProto, damagetype == DOT ? SpellModOp::PeriodicHealingAndDamage : SpellModOp::HealingAndDamage, tmpDamage);
 
-
     return int32(std::max(tmpDamage, 0.0f));
 }
 
@@ -7486,7 +7480,7 @@ float Unit::SpellCritChanceTaken(Unit const* caster, Spell* spell, AuraEffect co
 /*static*/ uint32 Unit::SpellCriticalHealingBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit* /*victim*/)
 {
     // Calculate critical bonus
-    // Classic 1.60 (vanilla): a critical heal is 150% of the normal heal, like a critical spell (retail: 200%)
+    // Classic 1.60 (vanilla): heal crits heal for 150% (retail 200%); talents add to the 50% bonus
     int32 crit_bonus = damage / 2;
 
     // adds additional damage to critBonus (from talents)
@@ -9435,7 +9429,6 @@ void Unit::AtEnterCombat()
 
     if (!IsInteractionAllowedInCombat())
         UpdateNearbyPlayersInteractions();
-
 }
 
 void Unit::AtExitCombat()
@@ -9454,7 +9447,6 @@ void Unit::AtExitCombat()
 
     if (!IsInteractionAllowedInCombat())
         UpdateNearbyPlayersInteractions();
-
 }
 
 void Unit::AtEngage(Unit* /*target*/)
@@ -11293,21 +11285,6 @@ void Unit::SetBaseAttackTime(WeaponAttackType att, uint32 val)
 
 void Unit::UpdateAttackTimeField(WeaponAttackType att)
 {
-    if (att < MAX_ATTACK && GetTypeId() == TYPEID_PLAYER && uint32(m_baseAttackSpeed[att] * m_modAttackSpeedPct[att]) == 0)
-    {
-        static std::atomic<uint32> s_zeroAttackTimeLines{ 0 };
-        if (s_zeroAttackTimeLines.fetch_add(1, std::memory_order_relaxed) < 100)
-        {
-            Player const* diagPlayer = ToPlayer();
-            Item const* diagItem = diagPlayer->GetWeaponForAttack(att, true);
-            SpellShapeshiftFormEntry const* diagForm = sSpellShapeshiftFormStore.LookupEntry(GetShapeshiftForm());
-            TC_LOG_ERROR("entities.unit", "[attack_time] {} attack type {} computes 0: baseAttackSpeed {} modAttackSpeedPct {} weapon {} (delay {}) form {} combatRoundTime {}",
-                GetName(), uint32(att), m_baseAttackSpeed[att], m_modAttackSpeedPct[att],
-                diagItem ? diagItem->GetEntry() : 0, diagItem ? diagItem->GetTemplate()->GetDelay() : 0,
-                uint32(GetShapeshiftForm()), diagForm ? diagForm->CombatRoundTime : 0);
-        }
-    }
-
     switch (att)
     {
         case BASE_ATTACK:

@@ -60,8 +60,6 @@
 
 void WorldSession::HandleRepopRequest(WorldPackets::Misc::RepopRequest& /*packet*/)
 {
-    // [release] (Garr test 2026-10-08: the client's Release Spirit seemed to do nothing; this line proves whether the click reaches the server)
-
     if (GetPlayer()->IsAlive() || GetPlayer()->HasPlayerFlag(PLAYER_FLAGS_GHOST))
         return;
 
@@ -433,42 +431,27 @@ void WorldSession::HandleStandStateChangeOpcode(WorldPackets::Misc::StandStateCh
 
 void WorldSession::HandleReclaimCorpse(WorldPackets::Misc::ReclaimCorpse& /*packet*/)
 {
-
     if (_player->IsAlive())
-    {
         return;
-    }
 
     // do not allow corpse reclaim in arena
     if (_player->InArena())
-    {
         return;
-    }
 
     // body not released yet
     if (!_player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
-    {
         return;
-    }
 
     Corpse* corpse = _player->GetCorpse();
     if (!corpse)
-    {
         return;
-    }
-
 
     // prevent resurrect before 30-sec delay after body release not finished
     if (time_t(corpse->GetGhostTime() + _player->GetCorpseReclaimDelay(corpse->GetType() == CORPSE_RESURRECTABLE_PVP)) > time_t(GameTime::GetGameTime()))
-    {
         return;
-    }
 
     if (!corpse->IsWithinDistInMap(_player, CORPSE_RECLAIM_RADIUS, true))
-    {
         return;
-    }
-
 
     // Classic 1.60 Hardcore: refuse before the corpse turns into bones
     if (_player->RefuseHardcoreResurrect())
@@ -476,7 +459,6 @@ void WorldSession::HandleReclaimCorpse(WorldPackets::Misc::ReclaimCorpse& /*pack
 
     // resurrect
     _player->ResurrectPlayer(_player->InBattleground() ? 1.0f : 0.5f);
-
 
     // spawn bones
     _player->SpawnCorpseBones();

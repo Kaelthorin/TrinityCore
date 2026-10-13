@@ -1035,14 +1035,6 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
     // (regressed the Deadmines Gap-1 bridge: tank parked off-mesh at the z51 hole).
     bool sawOffMesh = false;
 
-    // Diagnostic gate: the Deadmines (map 36) foundry->ship corridor up to Admiral
-    // Ripsnarl (~ -62,-823,42.8). endPos is detour-order (y,z,x): [2]=x,[0]=y. Used to
-    // log WHY the Ripsnarl corridor smoothing fails; the route crosses an off-mesh
-    // descent bridge, so the smoother fails at the off-mesh (sawOffMesh path) — handled
-    // by the bot-layer off-mesh-cross machinery, NOT by a pure-mesh straight fallback.
-    const bool ripDbg = _source && _source->GetMapId() == 36 &&
-        std::fabs(endPos[2] - (-62.0f)) < 12.0f && std::fabs(endPos[0] - (-823.0f)) < 12.0f;
-
     dtPolyRef polys[MAX_PATH_LENGTH];
     memcpy(polys, polyPath, sizeof(dtPolyRef)*polyPathSize);
     uint32 npolys = polyPathSize;
@@ -1109,11 +1101,7 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
             // stop but KEEP the partial path built so far (handled after the loop)
             // rather than discarding a valid long route as a straight-line NOPATH.
             if (sawOffMesh)
-            {
-                if (ripDbg)
-                    TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath FAIL@moveSurface-postOffmesh nsmooth={} polyN={}", nsmoothPath, polyPathSize);
                 return DT_FAILURE;
-            }
             surfaceFail = true;
             break;
         }
@@ -1182,19 +1170,13 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
                 // authoritative far endpoint) lands on the landing poly's EDGE. The old
                 // code returned DT_FAILURE here, discarding the ENTIRE route so a path
                 // CROSSING this off-mesh always NOPATH'd and the bot wedged on the near
-                // side — the Deadmines HARBOR bridge to Admiral Ripsnarl (live 06-26:
-                // [rip_dbg] offmesh getPolyHeight FAIL nsmooth=9-11, tank pinned ~290y
-                // out, reach=0). Recover the SAME way the raycast branch does (clamp to
+                // side (the Deadmines harbor bridge to Admiral Ripsnarl). Recover the SAME way the raycast branch does (clamp to
                 // poly boundary on a height miss) and CONTINUE the crossing natively onto
                 // the landing poly (solid ground, never the void). SAFE for the Gap-1
                 // bridge: its off-mesh getPolyHeight SUCCEEDS, so this branch never fires
                 // there (verified across Gap-1 runs — clamp count stayed 0).
                 if (dtStatusFailed(_navMeshQuery->getPolyHeight(polys[0], iterPos, &iterPos[1])))
-                {
                     _navMeshQuery->closestPointOnPolyBoundary(polys[0], iterPos, iterPos);
-                    if (ripDbg)
-                        TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath offmesh getPolyHeight FAIL -> clamped to landing poly + continue, nsmooth={}", nsmoothPath);
-                }
                 iterPos[1] += 0.5f;
             }
         }
@@ -1257,10 +1239,6 @@ dtStatus PathGenerator::FindSmoothPath(float const* startPos, float const* endPo
         if (dtVdot(disp, disp) > minProgress * minProgress)
             return DT_SUCCESS | DT_PARTIAL_RESULT;
     }
-
-    if (ripDbg)
-        TC_LOG_DEBUG("maps.mmaps", "[rip_dbg] FindSmoothPath exit nsmooth={} polyN={} reachedEnd={} surfaceFail={} sawOff={}",
-            nsmoothPath, polyPathSize, reachedEnd, surfaceFail, sawOffMesh);
 
     return DT_SUCCESS;
 }

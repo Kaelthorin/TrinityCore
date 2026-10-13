@@ -131,7 +131,6 @@
 #include "SpellAuras.h"
 #include "SpellCastRequest.h"
 #include "SpellHistory.h"
-#include "ClassicSpellRank.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
 #include "StringConvert.h"
@@ -149,8 +148,6 @@
 #include "Vehicle.h"
 #include "VehiclePackets.h"
 #include "Vignette.h"
-#include "VMapFactory.h"
-#include "VMapManager.h"
 #include "VignettePackets.h"
 #include "VMapFactory.h"
 #include "VMapManager.h"
@@ -1015,6 +1012,7 @@ void Player::Update(uint32 p_time)
     CheckDuelDistance(now);
 
     UpdateAfkReport(now);
+
     UpdateTradeState();
 
     if (GetCombatManager().HasPvPCombat())
@@ -4720,7 +4718,6 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
             }
         }
     }
-
 }
 
 void Player::KillPlayer()
@@ -5115,7 +5112,6 @@ void Player::RepopAtGraveyard()
 
     if (!closestGrave)
         closestGrave = sObjectMgr->GetClosestGraveyard(*this, GetTeam(), this);
-
 
     // stop countdown until repop
     m_deathTimer = 0;
@@ -20971,10 +20967,7 @@ void Player::SendRaidInfo()
         lockInfos.Extended = instanceLock->IsExtended();
     }
 
-    WorldPacket const* data = instanceInfo.Write();
-    TC_LOG_INFO("instance.lock", "[raid_info] sending {} lock(s) to {} ({} bytes)", instanceInfo.LockList.size(), GetName(), data->size());
-
-    SendDirectMessage(data);
+    SendDirectMessage(instanceInfo.Write());
 }
 
 bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbortParams* params, bool report)
@@ -21103,9 +21096,7 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
     // raid instances require the player to be in a raid group to be valid
     if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID) && (map->GetEntry()->Expansion() >= sWorld->getIntConfig(CONFIG_EXPANSION)))
         if (!group || !group->isRaidGroup())
-        {
             return false;
-        }
 
     if (group)
     {
@@ -21116,9 +21107,7 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
     {
         // instance is invalid if we are not grouped and there are other players
         if (map->GetPlayersCountExceptGMs() > 1)
-        {
             return false;
-        }
     }
 
     return true;
@@ -22515,11 +22504,7 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
-            // CHAR_DEL_CHARACTER_AURA_STORED_LOCATION is "... WHERE Guid=? AND
-            // Spell=?". The Spell (itr->first) param was never bound, so the
-            // DELETE matched nothing — a removed teleport-aura location lingered
-            // in the DB. Bind it.
-            stmt->setUInt32(1, itr->first);
+            stmt->setUInt32(1, itr->first);         // WHERE Guid = ? AND Spell = ?: without the spell the DELETE matched nothing
             trans->Append(stmt);
             itr = m_storedAuraTeleportLocations.erase(itr);
             continue;
@@ -22529,11 +22514,7 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
-            // Same unbound-Spell bug: without this the DELETE matched nothing, so
-            // the INSERT below collided on the (Guid,Spell) PRIMARY KEY every save
-            // — a [1062] duplicate-key storm (4,176 identical errors in a 4-day
-            // bot run, ~1 per 90s character save).
-            stmt->setUInt32(1, itr->first);
+            stmt->setUInt32(1, itr->first);         // WHERE Guid = ? AND Spell = ?: without the spell the DELETE matched nothing
             trans->Append(stmt);
 
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_AURA_STORED_LOCATION);
