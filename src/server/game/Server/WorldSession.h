@@ -2140,6 +2140,8 @@ class TC_GAME_API WorldSession
 
         ConnectToKey _instanceConnectKey;
 
+        bool _isBot;
+
         WorldSession(WorldSession const& right) = delete;
         WorldSession& operator=(WorldSession const& right) = delete;
 };
