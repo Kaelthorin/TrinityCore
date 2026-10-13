@@ -32,7 +32,6 @@
 #include "Language.h"
 #include "LanguageMgr.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -130,9 +129,6 @@ void WorldSession::HandleChatMessageOpcode(WorldPackets::Chat::ChatMessage& chat
 
 void WorldSession::HandleChatMessageWhisperOpcode(WorldPackets::Chat::ChatMessageWhisper& chatMessageWhisper)
 {
-    PROBE_LOG("[whisper_probe] CMSG_CHAT_MESSAGE_WHISPER from {}: lang {} target '{}' guid {} realm {} text '{}'",
-                GetPlayerName(), uint32(chatMessageWhisper.Language), chatMessageWhisper.Target,
-                chatMessageWhisper.TargetGUID.ToString(), chatMessageWhisper.TargetVirtualRealmAddress, chatMessageWhisper.Text);
     HandleChatMessage(CHAT_MSG_WHISPER, Language(chatMessageWhisper.Language), chatMessageWhisper.Text, chatMessageWhisper.Target, chatMessageWhisper.TargetGUID);
 }
 
@@ -234,16 +230,8 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
     if (msg.empty())
         return ChatMessageResult::MessageEmpty;
 
-    // [cmd_probe]: a dot / bang command as it arrives (Karrz, MC 2026-10-08: `.revive` typed while dead did nothing, the console's revive worked),
-    // with the sender's life state and whether the command table took it.
-    bool const cmd_probe = msg.size() > 1 && (msg[0] == '.' || msg[0] == '!');
-    if (cmd_probe)
-        PROBE_LOG("[cmd_probe] {} alive={} ghost={} selected={} sent '{}'", sender->GetName(), int(sender->IsAlive()),
-                    int(sender->HasPlayerFlag(PLAYER_FLAGS_GHOST)), sender->GetTarget().ToString(), msg);
     if (ChatHandler(this).ParseCommands(msg.c_str()))
         return ChatMessageResult::HandledCommand;
-    if (cmd_probe)
-        PROBE_LOG("[cmd_probe] {}: '{}' was not taken by the command table (unknown command or no permission) and goes on as chat", sender->GetName(), msg);
 
     // do message validity checks
     if (!ValidateMessage(GetPlayer(), msg))
@@ -325,12 +313,6 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
 
                 receiver = ObjectAccessor::FindConnectedPlayerByName(extName.Name);
             }
-            if (lang != LANG_ADDON)
-                PROBE_LOG("[whisper_probe] {} -> '{}' (guid {}): {}", sender->GetName(), target,
-                            targetGuid ? targetGuid->ToString() : "none",
-                            receiver ? (receiver->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
-            if (!receiver && lang != LANG_ADDON)
-                PROBE_LOG("[whisper_probe] target bytes: {}", Trinity::Impl::ByteArrayToHexStr(reinterpret_cast<uint8 const*>(target.data()), target.size()));
             if (!receiver || (lang != LANG_ADDON && !receiver->isAcceptWhispers() && receiver->GetSession()->HasPermission(rbac::RBAC_PERM_CAN_FILTER_WHISPERS) && !receiver->IsInWhisperWhiteList(sender->GetGUID())))
             {
                 SendChatPlayerNotfoundNotice(target);
@@ -822,8 +804,6 @@ void WorldSession::SendChatRestricted(ChatRestrictionType restriction)
 
 void WorldSession::HandleChatCanLocalWhisperTargetRequest(WorldPackets::Chat::CanLocalWhisperTargetRequest const& canLocalWhisperTargetRequest)
 {
-    PROBE_LOG("[whisper_probe] CMSG_CHAT_CAN_LOCAL_WHISPER_TARGET_REQUEST from {} for {}", GetPlayerName(),
-                canLocalWhisperTargetRequest.WhisperTarget.ToString());
     ChatWhisperTargetStatus status = [&]
     {
         Player* sender = GetPlayer();

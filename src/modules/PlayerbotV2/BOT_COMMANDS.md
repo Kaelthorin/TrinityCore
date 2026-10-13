@@ -56,7 +56,7 @@ Rules worth knowing:
 |---|---|
 | `.bot add <class> [tank\|healer\|dps] [race] [male\|female]` | Creates a companion bound to you, levels it to you, teaches spells, sets role/talents/gear, brings it over and groups it. The role is kept across relog and `.bot call`. |
 | `.bot call <name\|all>` | Brings back a companion (logs it in, joins your group). `all` = your saved roster plus every bot in your group. |
-| `.summon <name\|all>` | Short form of `.bot call`: `.summon all` brings only the bots that are in your group right now (it never logs anyone in), `.summon saved` your saved roster plus the grouped bots (logging them in), `.summon <name>` one of your companions. Normal players can use it for their own bots only (any other name: "You can only summon your own bots"); game masters keep the normal summon of other players for any other name. Needs the auth update `2026_10_08_00_auth_player_summon.sql`. |
+| `.bot summon <name\|all\|saved>` | Every player, own bots only: `.bot summon all` brings only the bots that are in your group right now (it never logs anyone in), `.bot summon saved` your saved roster plus the grouped bots (logging them in), `.bot summon <name>` one of your companions. Any other name: "You can only summon your own bots". The GM `.summon` (other players) is unchanged and stays GM-only. |
 | `.bot save <name\|all>` | Puts a companion (or every bot with you) on your roster. |
 | `.bot unsave <name\|all>` | Takes it off the roster; it stays yours and `.bot call <name>` still works. |
 | `.bot dismiss <name\|all>` | Removes it from your group and logs it out. Gear is kept. |

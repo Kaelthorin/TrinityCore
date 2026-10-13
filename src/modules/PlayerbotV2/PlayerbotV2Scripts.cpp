@@ -13,10 +13,14 @@
 #include "Guild.h"
 #include "Item.h"
 #include "Log.h"
+#include "PathGenerator.h"
 #include "Player.h"
+#include "PlayerbotMovement.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
 #include "WorldSession.h"
+
+void AddSC_playerbot_v2_commandscript();
 
 namespace
 {
@@ -25,6 +29,28 @@ using Playerbot::V2::Module;
 bool IsHuman(Player const* player)
 {
     return player && player->GetSession() && !player->GetSession()->IsBot();
+}
+
+// PathGenerator::LiquidRouteCheck: a bot in a capital keeps out of canals (module liquid policy, PathLiquid.h). Sampling is along
+// the whole path, not only its corners.
+bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArray const& path)
+{
+    using namespace Playerbot::BotMovement;
+    if (!g_LiquidPathPolicy)
+        return false;
+    Player* player = const_cast<Player*>(source->ToPlayer());
+    if (!player || !player->GetSession() || !player->GetSession()->IsBot())
+        return false;
+    if (g_LiquidPathPolicy(player) == LiquidPolicy::None)
+        return false;
+    std::vector<PathPoint> pts;
+    pts.reserve(path.size());
+    for (G3D::Vector3 const& v : path)
+        pts.push_back({ v.x, v.y, v.z });
+    return PathTouchesLiquid(pts, [player](float x, float y, float z)
+    {
+        return ClassifyDestinationLiquid(player, x, y, z) != LiquidVerdict::Dry;
+    });
 }
 }
 
@@ -229,4 +255,7 @@ void AddSC_playerbot_v2()
     new playerbot_v2_unit();
     new playerbot_v2_group();
     new playerbot_v2_guild();
+    AddSC_playerbot_v2_commandscript();
+
+    PathGenerator::SetLiquidRouteCheck(&BotPathTouchesAvoidedLiquid);
 }

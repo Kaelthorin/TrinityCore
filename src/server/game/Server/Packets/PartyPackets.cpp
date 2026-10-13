@@ -19,7 +19,6 @@
 #include "ClassicOpcodes.h"
 #include "CharacterCache.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "Group.h"
 #include "PacketOperators.h"
 #include "Pet.h"
@@ -356,7 +355,6 @@ void UpdateRaidTarget::Read()
     _worldPacket >> Symbol;
     if (PartyIndex)
         _worldPacket >> *PartyIndex;
-    PROBE_LOG("[raid_icon] client symbol {} on {}", int32(Symbol), Target.ToString());
 }
 
 WorldPacket const* SendRaidTargetUpdateSingle::Write()

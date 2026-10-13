@@ -22,7 +22,6 @@
 #include "GuildMgr.h"
 #include "InspectPackets.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "World.h"
@@ -40,13 +39,11 @@ void WorldSession::HandleInspectOpcode(WorldPackets::Inspect::Inspect& inspect)
 
     if (!GetPlayer()->IsWithinDistInMap(player, INSPECT_DISTANCE, false))
     {
-        PROBE_LOG("[inspect_probe] {} inspects {}: too far, no result sent", GetPlayer()->GetName(), player->GetName());
         return;
     }
 
     if (GetPlayer()->IsValidAttackTarget(player))
     {
-        PROBE_LOG("[inspect_probe] {} inspects {}: attackable, no result sent", GetPlayer()->GetName(), player->GetName());
         return;
     }
 
@@ -89,7 +86,6 @@ void WorldSession::HandleInspectOpcode(WorldPackets::Inspect::Inspect& inspect)
     inspectResult.LifetimeHK = player->m_activePlayerData->LifetimeHonorableKills;
     inspectResult.HonorLevel = player->m_playerData->HonorLevel;
 
-    PROBE_LOG("[inspect_probe] {} inspects {}: INSPECT_RESULT sent (item level {})", GetPlayer()->GetName(), player->GetName(), inspectResult.ItemLevel);
     SendPacket(inspectResult.Write());
 }
 

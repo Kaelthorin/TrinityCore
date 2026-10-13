@@ -57,9 +57,6 @@
 
 using namespace Trinity::ChatCommands;
 
-// PlayerbotV2 companion summon (cs_playerbot_v2.cpp): true when `.summon all` / `.summon <companion>` was handled as `.bot call`.
-bool PlayerbotV2TrySummon(ChatHandler* handler, char const* args);
-
 class misc_commandscript : public CommandScript
 {
 public:
@@ -478,9 +475,6 @@ public:
     // Summon Player
     static bool HandleSummonCommand(ChatHandler* handler, char const* args)
     {
-        // `.summon all` / `.summon <companion>` bring the caller's PlayerbotV2 companions (same as `.bot call`); other names are the GM summon.
-        if (PlayerbotV2TrySummon(handler, args))
-            return true;
         Player* target;
         ObjectGuid targetGuid;
         std::string targetName;

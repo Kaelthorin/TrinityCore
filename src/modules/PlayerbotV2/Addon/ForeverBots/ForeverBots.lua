@@ -730,7 +730,7 @@ local function BuildFrame()
     y = y - 30
     Header("Your bots", "The bots you keep between sessions.")
     Row({
-        { "Call saved",  98, "Call saved", "Brings your saved bots, and every bot in your group, to you.", function() ServerCommand(".summon saved") end },
+        { "Call saved",  98, "Call saved", "Brings your saved bots, and every bot in your group, to you.", function() ServerCommand(".bot summon saved") end },
         { "Save group",  98, "Save group", "Puts every bot with you on your saved list.", function() ServerCommand(".bot save all") end },
         { "Dismiss all", 98, "Dismiss all", "Sends all your bots away.", function() ServerCommand(".bot dismiss all") end },
     })

@@ -25,7 +25,7 @@ function(playerbot_v2_configure_sublib target_name)
   target_include_directories(${target_name}
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}
-      ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot
+      ${CMAKE_CURRENT_SOURCE_DIR}/Api
     PRIVATE
       ${CMAKE_SOURCE_DIR}/src/server
       ${CMAKE_SOURCE_DIR}/src/server/shared
@@ -154,13 +154,23 @@ CollectAndAddSourceFiles(playerbot-v2-world ${CMAKE_CURRENT_SOURCE_DIR}/World)
 playerbot_v2_configure_sublib(playerbot-v2-world)
 
 # ---------------------------------------------------------------------------
-# Sub-library: Core — module entry point + Services aggregator.
-# These are the only .cpp files at the V2 root.
+# Sub-library: Api — PlayerbotAPI (the bot's hands on the game: move, cast,
+# loot, trade, queue), bot movement, item scoring and the Classic class/spec,
+# supplies and talent tables.
+# ---------------------------------------------------------------------------
+add_library(playerbot-v2-api STATIC)
+CollectAndAddSourceFiles(playerbot-v2-api ${CMAKE_CURRENT_SOURCE_DIR}/Api)
+playerbot_v2_configure_sublib(playerbot-v2-api)
+
+# ---------------------------------------------------------------------------
+# Sub-library: Core — module entry point, script registration, the commands
+# (.playerbot, .bot, .w) and the Services aggregator.
 # ---------------------------------------------------------------------------
 add_library(playerbot-v2-core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2Scripts.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Services.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/Commands/cs_playerbot_v2.cpp
 )
 target_sources(playerbot-v2-core
   PUBLIC
@@ -200,6 +210,7 @@ set(PLAYERBOT_V2_SUBLIBS
   playerbot-v2-world
   playerbot-v2-diagnostics
   playerbot-v2-util
+  playerbot-v2-api
   playerbot-v2-core
 )
 if(MSVC)
@@ -216,4 +227,4 @@ trinity_add_module(playerbot-v2 AddSC_playerbot_v2
   CONFIGS
     ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist)
 
-message(STATUS "Playerbot V2 module enabled (multi-library: 12 sub-libs)")
+message(STATUS "Playerbot V2 module enabled (multi-library: 13 sub-libs)")

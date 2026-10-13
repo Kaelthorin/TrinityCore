@@ -16,7 +16,6 @@
  */
 
 #include "WorldSession.h"
-#include "Playerbot/DiagProbes.h"
 #include "Account.h"
 #include "AccountMgr.h"
 #include "AuthenticationPackets.h"
@@ -539,24 +538,6 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
         OpcodeClient opcode = static_cast<OpcodeClient>(packet->GetOpcode());
         ClientOpcodeHandler const* opHandle = opcodeTable[opcode];
         TC_METRIC_DETAILED_TIMER("worldsession_update_opcode_time", TC_METRIC_TAG("opcode", opHandle->Name));
-
-        // Playerbot.Diag.Probes: typed /w never shows up in the whisper handler, so log every chat/name/contact
-        // opcode a real player's client sends (name, size, first bytes) to see what the client does instead.
-        if (Playerbot::Probes::Enabled() && !IsBot() && opHandle->Name)
-        {
-            std::string_view name = opHandle->Name;
-            if (name.find("ADDON") == std::string_view::npos && (name.find("CHAT") != std::string_view::npos || name.find("WHISPER") != std::string_view::npos
-                || name.find("QUERY_PLAYER") != std::string_view::npos || name.find("CONTACT") != std::string_view::npos
-                || name.find("FRIEND") != std::string_view::npos || name.find("BNET") != std::string_view::npos
-                || name.find("BATTLENET") != std::string_view::npos || name.find("TEXT_EMOTE") != std::string_view::npos
-                || name.find("INVITE") != std::string_view::npos || name.find("PARTY_UNINVITE") != std::string_view::npos))
-            {
-                std::string hex;
-                for (size_t i = 0; i < packet->size() && i < 48; ++i)
-                    hex += Trinity::StringFormat("{:02x}", (*packet)[i]);
-                TC_LOG_INFO("playerbot.v2", "[chat_opcode] {} from {} size {} bytes {}", name, GetPlayerName(), packet->size(), hex);
-            }
-        }
 
         try
         {

@@ -41,22 +41,10 @@ target_include_directories(game
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR})
 
-# Playerbot V2 — single core modification per v2/REQUIREMENTS.md §3.
-# Always expose the API header path so core code can include
-# Playerbot/PlayerbotHooks.h without conditionals (the header itself selects
-# real vs inline-empty bodies via TRINITY_PLAYERBOT_V2).
-target_include_directories(game
-  PUBLIC
-    ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot)
-
-# When V2 is on: enable real bodies and expose the module include path.
 if(BUILD_PLAYERBOT_V2)
   target_compile_definitions(game
     PUBLIC
       TRINITY_PLAYERBOT_V2=1)
-  target_include_directories(game
-    PRIVATE
-      ${CMAKE_SOURCE_DIR}/src/modules/PlayerbotV2)
 endif()
 
 target_link_libraries(game

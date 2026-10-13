@@ -212,13 +212,9 @@ target_link_libraries(scripts
   PUBLIC
     game-interface)
 
-
-# Playerbot V2 - expose module headers + link the static lib for command scripts.
+# WorldSession's layout depends on TRINITY_PLAYERBOT_V2; scripts link game-interface, not game, so set it here as well.
 if(BUILD_PLAYERBOT_V2)
   target_compile_definitions(scripts PRIVATE TRINITY_PLAYERBOT_V2=1)
-  target_include_directories(scripts PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/modules/PlayerbotV2)
-  target_link_libraries(scripts PRIVATE playerbot-v2)
 endif()
 
 set_target_properties(scripts

@@ -70,7 +70,7 @@ regroup, formation and spacing, tanks and markers), Assign a bot to an icon, You
   wipe with nobody left alive in the instance. While a group healer (or you, as a priest, paladin, shaman or druid)
   is alive next to their bodies they wait for a rez instead. After reviving they rebuff and eat/drink; a bot main
   tank does not start the next pull while anyone is dead or a healer is under 80% mana.
-- Your bots: Call saved (`.summon saved`, same as `.bot call all` but open to normal players: the bots on your saved list and every bot in your group), Save group (`.bot save all`: every
+- Your bots: Call saved (`.bot summon saved`, same as `.bot call all` but open to normal players: the bots on your saved list and every bot in your group), Save group (`.bot save all`: every
   bot with you goes on the list), Dismiss all, Unsave all (empties the list), Delete target (asks first, then
   deletes the targeted bot's character for good), List (`saved` marks the ones on the list), Regear all (`.bot regear
   all`: the same bots as Call saved, online ones only, get their gear re-rolled so they don't all wear the same

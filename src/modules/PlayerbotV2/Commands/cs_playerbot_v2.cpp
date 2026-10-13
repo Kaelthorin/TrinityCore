@@ -1,25 +1,24 @@
 /*
- * Playerbot V2 GM commands. Wired only when BUILD_PLAYERBOT_V2 is on.
- * Per v2/CONFIG.md §8.2 (admin commands).
+ * Playerbot V2 commands (.playerbot, .bot, .w/.tell, .learn all mylevel) and the module's chat listeners.
+ * Registered by AddSC_playerbot_v2 (PlayerbotV2Scripts.cpp).
  */
 
 #include "ScriptMgr.h"
 #include <set>
-
-#if TRINITY_PLAYERBOT_V2
 
 #include "BattlegroundMgr.h"
 #include "BattlegroundPackets.h"
 #include "Chat.h"
 #include "ChatCommand.h"
 #include "CharacterCache.h"
-#include "GameObject.h"          // .playerbot bgzones — control-zone census
+#include "DatabaseEnv.h"
+#include "GameObject.h"          // .playerbot bgzones â control-zone census
 #include "Group.h"
 #include "GroupMgr.h"
 #include "Item.h"                // .bot itemstats
-#include "Map.h"                 // .playerbot bgzones — object store + player list
+#include "Map.h"                 // .playerbot bgzones â object store + player list
 #include "MapReference.h"
-#include "GridDefines.h"         // INVALID_HEIGHT — .playerbot terrainprofile void check
+#include "GridDefines.h"         // INVALID_HEIGHT â .playerbot terrainprofile void check
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"            // .playerbot graveyardscan: world_safe_locs
 #include "PhasingHandler.h"
@@ -80,12 +79,12 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "DB2Stores.h"
-#include "HandcraftedRoadStorage.h"   // .playerbot reloadroutes — road segment reload
-#include "HandcraftedRoadGraph.h"     // .playerbot reloadroutes — invalidate road graph cache
-#include "TerrainMgr.h"               // .playerbot reloadroutes — clear applied-road cache
-#include "GridNotifiers.h"            // .playerbot killentry — AllCreaturesOfEntryInRange
-#include "GridNotifiersImpl.h"        // .playerbot killentry — CreatureListSearcher
-#include "CellImpl.h"                 // .playerbot killentry — Cell::VisitAllObjects
+#include "HandcraftedRoadStorage.h"   // .playerbot reloadroutes â road segment reload
+#include "HandcraftedRoadGraph.h"     // .playerbot reloadroutes â invalidate road graph cache
+#include "TerrainMgr.h"               // .playerbot reloadroutes â clear applied-road cache
+#include "GridNotifiers.h"            // .playerbot killentry â AllCreaturesOfEntryInRange
+#include "GridNotifiersImpl.h"        // .playerbot killentry â CreatureListSearcher
+#include "CellImpl.h"                 // .playerbot killentry â Cell::VisitAllObjects
 #include <algorithm>
 #include <array>
 #include <map>
@@ -97,7 +96,7 @@ namespace
 // Resolve a character name to its low GUID (== BotId). Works for both online
 // and offline characters by falling back to sCharacterCache. Returns 0 when
 // no character with that name exists. This lets GMs run `.playerbot mark
-// <name>` against a character that has never logged in — a chicken-and-egg
+// <name>` against a character that has never logged in â a chicken-and-egg
 // fix for the original mark/unmark which required `FindConnectedPlayerByName`.
 Playerbot::BotId ResolveCharacterId(std::string const& name)
 {
@@ -124,7 +123,7 @@ struct ControlZoneCollector
     }
 };
 
-// Lower-case a string in place (no locale, ASCII only — race/class names).
+// Lower-case a string in place (no locale, ASCII only â race/class names).
 std::string ToLowerAscii(std::string s)
 {
     for (char& c : s) if (c >= 'A' && c <= 'Z') c = char(c + 32);
@@ -172,7 +171,7 @@ uint8 ParseRace(std::string const& token)
     if (s == "earthen"     || s == "ear")     return RACE_EARTHEN_DWARF_ALLIANCE; // alliance default
     if (s == "earthena")                      return RACE_EARTHEN_DWARF_ALLIANCE;
     if (s == "earthenh")                      return RACE_EARTHEN_DWARF_HORDE;
-    if (s == "haranir"     || s == "harronir") return uint8(86); // RACE_HARRONIR — pending TC enable
+    if (s == "haranir"     || s == "harronir") return uint8(86); // RACE_HARRONIR â pending TC enable
     return 0;
 }
 
@@ -201,13 +200,13 @@ uint8 ParseClass(std::string const& token)
 
 // Static-validation pass for `.playerbot smoketest dungeon`. Walks each
 // registered DungeonScript (or one, when `only_map` != 0) and verifies:
-//   1. `bosses[]` non-empty (warns when empty — playable without it but
+//   1. `bosses[]` non-empty (warns when empty â playable without it but
 //      tank-advance falls back to boss-Cell scan only).
 //   2. Every boss creature_template entry resolves via sObjectMgr.
 //   3. Every mandatory_interrupt_spells id resolves via sSpellMgr.
 //   4. Every dangerous_auras id resolves via sSpellMgr.
 // Counts PASS/WARN/FAIL per script and prints a summary table. Runs
-// synchronously on the calling thread — no bots involved.
+// synchronously on the calling thread â no bots involved.
 bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
 {
     auto& mgr = Playerbot::Services::Dungeons();
@@ -217,11 +216,11 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
         return false;
     }
     // Snapshot view requires a real bot, but get_advice via empty arg is
-    // not safe. Instead, call the per-script's get_advice with a stub —
+    // not safe. Instead, call the per-script's get_advice with a stub â
     // we only need the raw advice fields, not snapshot-conditional ones.
     // Most scripts ignore the snapshot anyway (their advice is static).
     // For scripts that DO consult the snapshot (rare), we'll miss those
-    // branches — acceptable for a static-validation pass.
+    // branches â acceptable for a static-validation pass.
     uint32 total_scripts = 0;
     uint32 pass_count    = 0;
     uint32 warn_count    = 0;
@@ -235,7 +234,7 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
         ++total_scripts;
 
         // We don't have a real snapshot to pass, but most scripts don't
-        // consult the view — so passing a null reference would crash.
+        // consult the view â so passing a null reference would crash.
         // Use a default-constructed BotSnapshot wrapped in a view. The
         // view's accessors return zero/empty so any code path is safe.
         Playerbot::BotSnapshot empty_snap{};
@@ -250,7 +249,7 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
             ++local_warn;
             detail += "no_bosses ";
         }
-        // Map_id sanity — catches typos (LostCityOfTolvir 754→755 bug
+        // Map_id sanity â catches typos (LostCityOfTolvir 754â755 bug
         // class). Map.db2 lookup is cheap.
         if (!sMapStore.LookupEntry(script.map_id()))
         {
@@ -323,18 +322,18 @@ bool RunDungeonValidation(ChatHandler* handler, uint32 only_map)
 // registered BattlegroundScript and verifies:
 //   1. role_by_slot non-empty (else the bot never gets a job).
 //   2. role_by_slot does not contain only Free / silent entries.
-//   3. Coords are non-NaN and in plausible ranges (|x|,|y| < 20000 — TC's
-//      map bounds; |z| < 1500 — Hyjal top elevation).
+//   3. Coords are non-NaN and in plausible ranges (|x|,|y| < 20000 â TC's
+//      map bounds; |z| < 1500 â Hyjal top elevation).
 //   4. If endgame_creature_entry set, the entry resolves via sObjectMgr.
 //   5. If vehicle_creature_entries set, each resolves via sObjectMgr.
 //   6. If FlagCarrier role present, auto_use_go_types non-empty (the bot
-//      needs a pickup mechanism — modern NEW_FLAG (36) etc.).
+//      needs a pickup mechanism â modern NEW_FLAG (36) etc.).
 //   7. Nodes with follow_creature_entry set must resolve to a real entry.
 //   8. Per-vehicle seat-spell IDs (vehicle_seat_spell + by_entry) must
 //      resolve via sSpellMgr.
 //   9. AliasToBaseBg coverage: walk a curated set of BattlemasterList
 //      IDs from SharedDefines and assert TryGetScriptFor returns non-null.
-// Runs synchronously on the calling thread — no bots involved.
+// Runs synchronously on the calling thread â no bots involved.
 bool RunBgValidation(ChatHandler* handler, uint32 only_id)
 {
     auto& mgr = Playerbot::Services::Battlegrounds();
@@ -357,7 +356,7 @@ bool RunBgValidation(ChatHandler* handler, uint32 only_id)
         if (only_id != 0 && script.bg_type_id() != only_id) return;
         ++total_scripts;
 
-        // Both faction passes — most scripts branch on s.is_horde().
+        // Both faction passes â most scripts branch on s.is_horde().
         // We don't have a real BotSnapshotView; an empty view's accessors
         // return zero/false safely. Note: the script may produce
         // faction-symmetric advice; we accept that.
@@ -423,7 +422,7 @@ bool RunBgValidation(ChatHandler* handler, uint32 only_id)
             { ++local_warn; detail += fmt::format("unk_seat_spell_{}={} ", entry, spell); }
         }
 
-        // Nodes — coord sanity + follow_creature_entry resolution.
+        // Nodes â coord sanity + follow_creature_entry resolution.
         for (auto const& n : a.nodes)
         {
             if ((n.x != 0.f || n.y != 0.f) && !coord_sane(n.x, n.y, n.z))
@@ -466,7 +465,7 @@ bool RunBgValidation(ChatHandler* handler, uint32 only_id)
     }
 
     // Alias-coverage assertion when running 'all'. Curated list of
-    // BattlemasterList IDs from SharedDefines.h — excludes queue
+    // BattlemasterList IDs from SharedDefines.h â excludes queue
     // meta-IDs (RB 32, RATED_* 100..102, RANDOM_EPIC 901, RANDOM_BG 1029)
     // and PvE / open-world IDs (SS_VS_TM 789, CI 887) which legitimately
     // have no bot script.
@@ -595,7 +594,7 @@ public:
             { "pathcompare",   HandlePathCompare,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "terrainprofile",HandleTerrainProfile,rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "meta",          HandleMeta,          rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            // Player-facing — gated to RBAC_PERM_JOIN_NORMAL_BG (the
+            // Player-facing â gated to RBAC_PERM_JOIN_NORMAL_BG (the
             // "is a regular player" perm every account has by default)
             // so a normal user can summon their own alts without GM
             // rights. Account-match check inside the handler still
@@ -611,6 +610,8 @@ public:
             { "about",         HandleBotAbout,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "add",           HandleBotAdd,        rbac::RBAC_PERM_COMMAND_GM, Console::No  },
             { "call",          HandleBotCall,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
+            { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
             { "dismiss",       HandleBotDismiss,    rbac::RBAC_PERM_COMMAND_GM, Console::No  },
             { "regear",        HandleBotRegear,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
             { "gear",          HandleBotGear,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
@@ -629,9 +630,11 @@ public:
             { "bot",       botTable },
             // `.w <name> <text>` / `.tell <name> <text>`: whisper as a chat command. The 70205 client has no working /w, and inside
             // battlegrounds the addon's whisper is blocked (Karrz 2026-10-08, WSG: SAY packets and dot commands go through,
-            // whispers never leave the client). Same rights as `.summon` (every player).
+            // whispers never leave the client). Every player.
             { "w",    HandleWhisperCmd, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
             { "tell", HandleWhisperCmd, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
+            // Added to the core's `.learn all` table.
+            { "learn all mylevel", HandleLearnAllMyLevelCommand, rbac::RBAC_PERM_COMMAND_LEARN_ALL_MY_SPELLS, Console::No },
         };
         return root;
     }
@@ -841,7 +844,7 @@ public:
     // "all" is your saved roster (`.bot save`) and the companions in your group, not every companion you ever made.
     static bool HandleBotCall(ChatHandler* handler, std::string const& who) { return CallCompanions(handler, who, false); }
 
-    // groupOnly (`.summon all`, Karrz 2026-10-08: in a 2-person party it brought the whole old raid back online): "all" is only the
+    // groupOnly (`.bot summon all`, Karrz 2026-10-08: in a 2-person party it brought the whole old raid back online): "all" is only the
     // companions in the caller's group right now, wherever they are. It never logs anyone in and never adds anyone.
     static bool CallCompanions(ChatHandler* handler, std::string const& who, bool groupOnly)
     {
@@ -860,11 +863,11 @@ public:
                 if (grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id)) && ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
                     ids.push_back(id);
             if (ids.empty())
-            { handler->SendSysMessage("None of your bots are in your group. `.summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
+            { handler->SendSysMessage("None of your bots are in your group. `.bot summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
         }
         else
             ids = roster ? SavedCompanions(sess) : CompanionsMatching(sess, who);
-        // `.bot call all` / `.summon saved` with a saved roster brings exactly that roster. A companion that is only in the group (a crafting
+        // `.bot call all` / `.bot summon saved` with a saved roster brings exactly that roster. A companion that is only in the group (a crafting
         // bot invited earlier) is taken out of it: it held a place and the last saved bot was refused at 40 (2026-10-11).
         if (roster && !groupOnly)
         {
@@ -931,21 +934,18 @@ public:
         return true;
     }
 
-    // `.summon <name|all>` (Karrz 2026-10-08): the short form of `.bot call`. Handled here when the argument is "all" or one of the
-    // caller's own companions; anything else is left to the GM `.summon <player>` (cs_misc.cpp). True = handled.
-    static bool TrySummon(ChatHandler* handler, char const* args)
+    // `.bot summon <all|saved|bot name>`: the every-player form of `.bot call`, for the caller's own bots only (real players are
+    // summoned with the GM `.summon`, which stays GM-only).
+    static bool HandleBotSummon(ChatHandler* handler, Tail args)
     {
         WorldSession* sess = handler ? handler->GetSession() : nullptr;
         if (!sess || !sess->GetPlayer())
             return false;
-        // Normal players may summon their own bots only (the command is granted to the Player role by
-        // sql/updates/auth/master/2026_10_08_00_auth_player_summon.sql); summoning real players stays with game masters.
-        bool const gm = sess->GetSecurity() >= SEC_GAMEMASTER;
-        std::string who = args ? args : "";
+        std::string who(args);
         while (!who.empty() && (who.back() == ' ' || who.back() == '\t')) who.pop_back();
         while (!who.empty() && (who.front() == ' ' || who.front() == '\t')) who.erase(who.begin());
         bool const init = Playerbot::Services::Initialized();
-        // `.summon saved` = the saved roster (`.bot save`) plus the grouped bots, logged in if need be: the addon's "Call saved" button.
+        // `saved` = the saved roster (`.bot save`) plus the grouped bots, logged in if need be: the addon's "Call saved" button.
         // `.bot call all` is the same but needs GM rights, which normal players do not have.
         if (init && ToLowerAscii(who) == "saved")
         {
@@ -957,10 +957,29 @@ public:
             CallCompanions(handler, who, /*groupOnly*/ true);
             return true;
         }
-        if (gm)
-            return false;
-        handler->SendSysMessage("You can only summon your own bots: `.summon all` (your group), `.summon saved` or `.summon <bot name>`.");
+        handler->SendSysMessage("You can only summon your own bots: `.bot summon all` (your group), `.bot summon saved` or `.bot summon <bot name>`.");
         handler->SetSentErrorMessage(true);
+        return false;
+    }
+
+    // .learn all mylevel [player]: what a visit to the class trainers, the class quests and the weapon masters would have
+    // taught at the player's current level, for free and without the NPCs (the same code the owner companions are levelled with).
+    // No spell above the level, no talents.
+    static bool HandleLearnAllMyLevelCommand(ChatHandler* handler, Optional<PlayerIdentifier> player)
+    {
+        if (!player)
+            player = PlayerIdentifier::FromTargetOrSelf(handler);
+        if (!player || !player->IsConnected())
+            return false;
+
+        Player* target = player->GetConnectedPlayer();
+        ::Playerbot::API api(target);
+        uint32 const quest = api.learn_class_quest_spells_free();
+        uint32 const trainer = api.learn_trainer_spells_free();
+        uint32 const weapons = api.learn_weapon_skills_free();
+
+        handler->PSendSysMessage("%s: level %u, learned %u class spells, %u class quest spells, %u weapon skills.",
+            handler->GetNameLink(target).c_str(), uint32(target->GetLevel()), trainer, quest, weapons);
         return true;
     }
 
@@ -1479,7 +1498,7 @@ public:
         // model uses owner_account_id to decide who can issue squad
         // commands, so binding at mark-time gives the GM immediate
         // control without a separate adopt step. Console invocation
-        // (no Player session) leaves the binding empty — useful for
+        // (no Player session) leaves the binding empty â useful for
         // batch-creating bots that an admin will assign later.
         if (Player const* gm = handler->GetSession() ? handler->GetSession()->GetPlayer() : nullptr)
         {
@@ -1493,7 +1512,7 @@ public:
         }
         // Already-online characters get the registry entry without a re-login,
         // so the AI ticks can start at the next world update. Offline characters
-        // get the marker only — the next time someone logs them in (manually or
+        // get the marker only â the next time someone logs them in (manually or
         // via .playerbot login), OnPlayerLogin will see is_bot()==true and
         // attach the AI.
         if (Player const* p = ObjectAccessor::FindConnectedPlayerByName(target_name))
@@ -1510,7 +1529,7 @@ public:
                 Playerbot::Services::Scheduler().register_bot(
                     id, Playerbot::ActivityTier::Idle);
             }
-            handler->PSendSysMessage("Marked %s (online) as a V2 bot — AI active.",
+            handler->PSendSysMessage("Marked %s (online) as a V2 bot â AI active.",
                                      p->GetName().c_str());
         }
         else
@@ -1544,13 +1563,13 @@ public:
             Playerbot::Services::Registry().unregister_bot(id);
         }
         handler->PSendSysMessage("Unmarked '%s'. AI detached.", target_name.c_str());
-        // Owner binding becomes meaningless without the bot — clear it so
+        // Owner binding becomes meaningless without the bot â clear it so
         // a future re-mark of the same character starts clean.
         Playerbot::Services::Owners().ClearOwner(id);
         return true;
     }
 
-    // Adopt / disown / owner — owner binding management. Decoupled from
+    // Adopt / disown / owner â owner binding management. Decoupled from
     // mark/unmark so an admin can transfer ownership (e.g. between two
     // accounts on the same realm) without touching the bot's identity.
 
@@ -1566,7 +1585,7 @@ public:
         { handler->PSendSysMessage("'%s' is not a marked bot. Use .playerbot mark first.",
                                    target_name.c_str());
           return false; }
-        // Console invocation has no session → can't determine an owner.
+        // Console invocation has no session â can't determine an owner.
         // Tell the operator to adopt from in-game (or use a SQL UPDATE
         // for batch ownership transfer).
         if (!handler->GetSession())
@@ -1601,8 +1620,8 @@ public:
         std::string label = "<unknown>";
         if (player_arg)
         {
-            // Resolve the named player → account_id via DB. Online lookup
-            // first (fast); fall back to characters → account.
+            // Resolve the named player â account_id via DB. Online lookup
+            // first (fast); fall back to characters â account.
             if (Player const* p = ObjectAccessor::FindConnectedPlayerByName(*player_arg))
             {
                 account = p->GetSession()->GetAccountId();
@@ -1669,7 +1688,7 @@ public:
         const uint32 account = handler->GetSession()->GetAccountId();
         const size_t n = Playerbot::Services::Owners().SaveSquadPreset(account, preset_name);
         if (n == 0)
-        { handler->PSendSysMessage("Squad save: 0 bots — nothing to save.");
+        { handler->PSendSysMessage("Squad save: 0 bots â nothing to save.");
           return false; }
         handler->PSendSysMessage("Squad save: saved %zu bot(s) under preset '%s'.",
                                  n, preset_name.c_str());
@@ -1707,7 +1726,7 @@ public:
             ai->set_follow_distance(s.follow_distance);
             ai->set_verbose_logging(s.owner_verbose);
             // Re-emit follow with new offset if the bot is currently
-            // tracking someone — gives instant visual feedback.
+            // tracking someone â gives instant visual feedback.
             if (ai->owner_command() == Playerbot::BotAI::OwnerCommand::Follow &&
                 !ai->owner_target().IsEmpty())
             {
@@ -1739,7 +1758,7 @@ public:
         }
         const size_t marked     = Playerbot::Services::Lifecycle().size();
         const size_t registered = Playerbot::Services::Registry().size();
-        // Walk marked ids and count how many resolve to a connected Player —
+        // Walk marked ids and count how many resolve to a connected Player â
         // gives the actual "in-world right now" number, distinct from
         // registered (registered counts every bot whose AI exists, including
         // ones whose Player* may have despawned mid-tick).
@@ -1780,7 +1799,7 @@ public:
             handler->SendSysMessage("No marked bots in playerbot_v2_character.");
             return true;
         }
-        // Class id → 3-letter tag for compact line formatting. Indexed by the
+        // Class id â 3-letter tag for compact line formatting. Indexed by the
         // SharedDefines CLASS_* values 1..13 (rows 0/12 are empty/Monk gap).
         static char const* const kClassTag[] = {
             "---", "WAR", "PAL", "HUN", "ROG", "PRI", "DK ",
@@ -1817,8 +1836,8 @@ public:
             else
             {
                 // Cache miss usually means the row was deleted out from under us
-                // — keep the line so the GM can spot orphans and unmark them.
-                handler->PSendSysMessage(" #%llu  %s  <cache miss — orphan?>",
+                // â keep the line so the GM can spot orphans and unmark them.
+                handler->PSendSysMessage(" #%llu  %s  <cache miss â orphan?>",
                     static_cast<unsigned long long>(id), state);
             }
         }
@@ -1848,7 +1867,7 @@ public:
             handler->PSendSysMessage("Login refused: %s", res.reason.c_str());
             return false;
         }
-        handler->PSendSysMessage("Spawn-login submitted for '%s' — bot enters world on next DB callback.",
+        handler->PSendSysMessage("Spawn-login submitted for '%s' â bot enters world on next DB callback.",
                                  target_name.c_str());
         return true;
     }
@@ -1913,7 +1932,7 @@ public:
     // and auto-submits a headless login.
     //
     // All args optional. Anything missing is filled by Blizzlike random
-    // (BotComposition) — race/class weights from public WoW census, with
+    // (BotComposition) â race/class weights from public WoW census, with
     // race/class restrictions enforced (DH=NE/BE only, Evoker=Dracthyr only).
     // Race/class accept names ("warrior","nightelf","be","dh") or numeric ids.
     static bool HandleCreate(ChatHandler* handler,
@@ -1932,14 +1951,14 @@ public:
         // session (it spins up a temporary BotSession owned by the bot-pool
         // account to own the new character, and defaults name-validation locale
         // to enUS). This lets `.playerbot create` run from a sessionless caller
-        // — the SOAP/RA remote console or the server CLI — which is required for
+        // â the SOAP/RA remote console or the server CLI â which is required for
         // headless fleet automation. Only the name locale differs from an
         // in-game GM invocation.
         WorldSession* sess = handler->GetSession();
 
         // Resolve race/class/gender/name. If any are missing or unparseable,
         // fall back to a Blizzlike Roll which respects race/class restrictions.
-        // Explicit args win — Roll receives them as hints so the rolled
+        // Explicit args win â Roll receives them as hints so the rolled
         // fields are constrained around them (e.g., specifying race=nightelf
         // rolls a class from NE's legal subset, not a random class that
         // might be invalid for NE).
@@ -1954,7 +1973,7 @@ public:
             auto picked = Playerbot::V2::BotComposition::Roll(race, cls, gender, name);
             if (picked.race == 0)
             {
-                handler->SendSysMessage("BotComposition::Roll failed — possibly invalid race/class hint. See log.");
+                handler->SendSysMessage("BotComposition::Roll failed â possibly invalid race/class hint. See log.");
                 return false;
             }
             race = picked.race; cls = picked.cls; gender = picked.gender; name = picked.name;
@@ -1966,18 +1985,18 @@ public:
             handler->PSendSysMessage("create failed: %s", r.reason.c_str());
             return false;
         }
-        handler->PSendSysMessage("Created '%s' (guid %s) — race %u class %u gender %u — marked as V2 bot.",
+        handler->PSendSysMessage("Created '%s' (guid %s) â race %u class %u gender %u â marked as V2 bot.",
                                  name.c_str(), r.guid.ToString().c_str(), race, cls, gender);
 
         // Auto-login so the GM sees the bot in-world without a second command.
         auto login = Playerbot::Services::SessionMgr().LoginBot(r.guid);
         if (!login.ok)
         {
-            handler->PSendSysMessage("Spawn-login refused: %s — use `.playerbot login %s` later.",
+            handler->PSendSysMessage("Spawn-login refused: %s â use `.playerbot login %s` later.",
                                      login.reason.c_str(), name.c_str());
             return true;
         }
-        handler->PSendSysMessage("Spawn-login submitted — bot enters world on next DB callback.");
+        handler->PSendSysMessage("Spawn-login submitted â bot enters world on next DB callback.");
         return true;
     }
 
@@ -2097,7 +2116,7 @@ public:
             handler->SendSysMessage("PlayerbotV2 not initialized.");
             return false;
         }
-        // Sessionless callers (SOAP/RA console, server CLI) are allowed — the
+        // Sessionless callers (SOAP/RA console, server CLI) are allowed â the
         // factory owns each new character with a temporary bot-pool BotSession.
         // See HandleCreate for the rationale; enables headless mass-spawn.
         WorldSession* sess = handler->GetSession();
@@ -2190,7 +2209,7 @@ public:
         const Playerbot::BotId id = p->GetGUID().GetCounter();
         if (!Playerbot::Services::Lifecycle().is_bot(id))
         {
-            handler->PSendSysMessage("'%s' is not marked as a V2 bot — refusing to reset a "
+            handler->PSendSysMessage("'%s' is not marked as a V2 bot â refusing to reset a "
                                      "non-bot character.", target_name.c_str());
             return false;
         }
@@ -2200,7 +2219,7 @@ public:
         // threat lists + drops PvP combat flag). RemoveAllAuras then strips
         // buffs/debuffs/HoTs/DoTs. SetFullHealth + SetPower restore resources.
         // GetSpellHistory()->ResetAllCooldowns flushes the cooldown map +
-        // global cooldown — same primitive used by the /cdreset whisper.
+        // global cooldown â same primitive used by the /cdreset whisper.
         p->InterruptNonMeleeSpells(true);
         p->CombatStop();
         p->RemoveAllAuras();
@@ -2209,7 +2228,7 @@ public:
             p->SetPower(Powers(power), p->GetMaxPower(Powers(power)));
         p->GetSpellHistory()->ResetAllCooldowns();
 
-        handler->PSendSysMessage("Reset '%s' — combat dropped, auras cleared, HP/mana full, "
+        handler->PSendSysMessage("Reset '%s' â combat dropped, auras cleared, HP/mana full, "
                                  "cooldowns flushed.", target_name.c_str());
         return true;
     }
@@ -2218,7 +2237,7 @@ public:
     //
     // Instantly level an in-world V2 bot via Player::GiveLevel. Bot must be
     // in-world (use `.playerbot login` first); level must be 1..MaxPlayerLevel.
-    // GiveLevel handles stat/skill/talent/spell scaling in one shot — no
+    // GiveLevel handles stat/skill/talent/spell scaling in one shot â no
     // per-level loop needed. The packet it sends drops via BotSession::SendPacket.
     static bool HandleLevel(ChatHandler* handler,
                             std::string const& target_name,
@@ -2239,7 +2258,7 @@ public:
         const Playerbot::BotId id = p->GetGUID().GetCounter();
         if (!Playerbot::Services::Lifecycle().is_bot(id))
         {
-            handler->PSendSysMessage("'%s' is not marked as a V2 bot — refusing to level a "
+            handler->PSendSysMessage("'%s' is not marked as a V2 bot â refusing to level a "
                                      "non-bot character via `.playerbot level`.", target_name.c_str());
             return false;
         }
@@ -2278,7 +2297,7 @@ public:
                                   Playerbot::Services::Population().RegearNow(p) ? "re-gear pass run" :
                                   "already level-appropriate";
 
-        handler->PSendSysMessage("'%s' leveled %u → %u (max %u, %u trainer spells, talents: %s, gear: %s).",
+        handler->PSendSysMessage("'%s' leveled %u â %u (max %u, %u trainer spells, talents: %s, gear: %s).",
                                  target_name.c_str(), oldLevel, level, maxLevel, trainer_spells, talents_status, gear_status);
         return true;
     }
@@ -2304,7 +2323,7 @@ public:
         }
         if (!Playerbot::Services::Lifecycle().is_bot(id))
         {
-            handler->PSendSysMessage("'%s' is not marked as a V2 bot — refusing to delete a "
+            handler->PSendSysMessage("'%s' is not marked as a V2 bot â refusing to delete a "
                                      "non-bot character via `.playerbot delete`. Use core "
                                      "`.character delete` if you really mean it.", target_name.c_str());
             return false;
@@ -2341,7 +2360,7 @@ public:
         // legacy bots created on the GM's account before the pool existed).
         Playerbot::Services::Accounts().note_character_removed(accountId);
 
-        handler->PSendSysMessage("Deleted '%s' (guid %s) — unmarked + character row removed.",
+        handler->PSendSysMessage("Deleted '%s' (guid %s) â unmarked + character row removed.",
                                  target_name.c_str(), g.ToString().c_str());
         return true;
     }
@@ -2363,10 +2382,10 @@ public:
         return true;
     }
 
-    // .playerbot goto <name> <map> <x> <y> — set a manual cross-map travel
+    // .playerbot goto <name> <map> <x> <y> â set a manual cross-map travel
     // goal on a bot. Drives the SAME pipeline as the owner /goto whisper:
     // the builder synthesizes a relocation objective and the travel rules
-    // route via walk/taxi/portal/ship/areatrigger — never a teleport.
+    // route via walk/taxi/portal/ship/areatrigger â never a teleport.
     // Console-friendly so journeys are testable via SOAP.
     static bool HandleGoto(ChatHandler* handler, std::string const& target_name,
                            uint32 map_id, float x, float y)
@@ -2388,7 +2407,7 @@ public:
         ObjectGuid g = ObjectGuid::Create<HighGuid::Player>(id);
         Player* bot = ObjectAccessor::FindConnectedPlayer(g);
         ai->set_manual_travel(map_id, x, y, bot ? bot->GetPositionZ() : 0.f);
-        handler->PSendSysMessage("'%s': travel goal set to map %u (%.0f, %.0f) — "
+        handler->PSendSysMessage("'%s': travel goal set to map %u (%.0f, %.0f) â "
                                  "journey via flights/portals/ships.",
                                  target_name.c_str(), map_id, x, y);
         return true;
@@ -2490,7 +2509,7 @@ public:
         return true;
     }
 
-    // #1B: `.playerbot wedges` — print the runtime wedge watchdog's current
+    // #1B: `.playerbot wedges` â print the runtime wedge watchdog's current
     // active-wedge list grouped by root-cause category plus per-category
     // lifetime episode totals. Lets the operator see which bots are stuck
     // (and why) without tailing the log or noticing a frozen bot by eye.
@@ -2566,7 +2585,7 @@ public:
     // every CONTROL_ZONE gameobject on that character's map (EotS towers,
     // EPL-style proximity points) with its live capture-bar value,
     // controlling team, and a per-team census of players inside the capture
-    // radius — applying the SAME eligibility tests the core ControlZone
+    // radius â applying the SAME eligibility tests the core ControlZone
     // heartbeat uses (alive + IsOutdoorPvPActive). Built 2026-06-11 to
     // root-cause "EotS towers never flip despite a team standing on them".
     static bool HandleBgZones(ChatHandler* handler, std::string const& target_name)
@@ -2604,12 +2623,12 @@ public:
                 Player* p = ref.GetSource();
                 if (!p || !go->IsWithinDist(p, radius)) continue;
                 ++inRadius;
-                // Phase gate FIRST — the core's PlayerListSearcher filters by
+                // Phase gate FIRST â the core's PlayerListSearcher filters by
                 // the GO's PhaseShift before any eligibility test, so a
                 // phase-mismatched player is INVISIBLE to the capture
                 // heartbeat no matter how eligible. Live evidence 2026-06-11
                 // (EotS inst 6): 18 horde inside BE Tower, bar frozen at
-                // 50.0 — phase mismatch is the prime suspect (Chromie-time
+                // 50.0 â phase mismatch is the prime suspect (Chromie-time
                 // phasing from the leveling fleet?).
                 if (!p->InSamePhase(go))
                 {
@@ -2656,10 +2675,10 @@ public:
     // Form a party from named online players (bots or not):
     //   .playerbot group <leader> <member> [member...]
     // Testability surface for the dungeon/raid coordinator and group
-    // behavior work — TC's own `.group join` can only ADD to an existing
+    // behavior work â TC's own `.group join` can only ADD to an existing
     // group, so there was no console path to create one from scratch.
     // Mirrors LFGMgr's direct group creation (Group::Create + AddMember,
-    // no invite round-trip — headless bot sessions can't click invites
+    // no invite round-trip â headless bot sessions can't click invites
     // from the console anyway).
     static bool HandleGroup(ChatHandler* handler, char const* args)
     {
@@ -2690,7 +2709,7 @@ public:
             for (auto const& slot : g->GetMemberSlots())
                 if (!Playerbot::Services::Lifecycle().is_bot(
                         slot.guid.GetCounter()))
-                    return false;   // human group — hands off
+                    return false;   // human group â hands off
             g->RemoveMember(p->GetGUID());
             return p->GetGroup() == nullptr;
         };
@@ -2705,7 +2724,7 @@ public:
         if (grp && !detach_if_bot_group(leader))
         {
             handler->PSendSysMessage(
-                "Leader '%s' is in a group with humans — not touching it.",
+                "Leader '%s' is in a group with humans â not touching it.",
                 names[0].c_str());
             return true;
         }
@@ -2727,11 +2746,11 @@ public:
         {
             Player* m = ObjectAccessor::FindPlayerByName(names[i]);
             if (!m)
-            { handler->PSendSysMessage("'%s' is not online — skipped.", names[i].c_str()); continue; }
+            { handler->PSendSysMessage("'%s' is not online â skipped.", names[i].c_str()); continue; }
             if (m->GetGroup() == grp)
             { ++added; continue; }
             if (m->GetGroup() && !detach_if_bot_group(m))
-            { handler->PSendSysMessage("'%s' is grouped with humans — skipped.", names[i].c_str()); continue; }
+            { handler->PSendSysMessage("'%s' is grouped with humans â skipped.", names[i].c_str()); continue; }
             if (grp->IsFull() && !grp->isRaidGroup())
                 grp->ConvertToRaid();
             if (grp->AddMember(m))
@@ -2747,9 +2766,9 @@ public:
 
     // .playerbot dungeontest <lfg_dungeon_id> [level]
     //
-    // Stands up (or refreshes) a FIXED pure-bot dungeon squad — 1 tank
+    // Stands up (or refreshes) a FIXED pure-bot dungeon squad â 1 tank
     // (Prot Warrior), 1 healer (Holy Priest), 3 DPS (Frost Mage / Sin
-    // Rogue / BM Hunter), all Alliance Humans — then LFG-queues all five
+    // Rogue / BM Hunter), all Alliance Humans â then LFG-queues all five
     // for the named dungeon so the dungeon-finder forms the group, ports
     // them in, and the bots auto-run it (is_lfg auto-activation). This is
     // the headless equivalent of a player queuing a 5-stack, and the only
@@ -2760,11 +2779,11 @@ public:
     // they're online to spec/gear/level + queue. The target level is
     // clamped into the dungeon's ContentTuning bracket so the LFG level
     // gate (LFGMgr::GetLockedDungeons) can't reject the queue.
-    // .playerbot dungeonreset — force the dungeontest squad out of any
+    // .playerbot dungeonreset â force the dungeontest squad out of any
     // instance back to the Alliance staging area and clear their LFG state,
     // so the next `dungeontest` re-queues a fresh run. The run-protection
     // guard in dungeontest (correctly) refuses to disturb a live run; this is
-    // the explicit "tear the current run down" escape hatch for the harness —
+    // the explicit "tear the current run down" escape hatch for the harness â
     // e.g. after a server restart reloaded the squad mid-run (their saved
     // position is inside the instance, but last_lfg_dungeon_id resets on
     // relogin so they can no longer auto-run), or simply to retry from
@@ -2772,7 +2791,7 @@ public:
     // Dump every registered DungeonScript as a machine-readable line for the
     // offline route generator (tools/gen_dungeon_routes.py). One line per script:
     //   DDUMP|<map_id>|<lfg_dungeonId>|<name>|<boss1,boss2,...>
-    // map_id + bosses come from the script (get_advice with an empty snapshot —
+    // map_id + bosses come from the script (get_advice with an empty snapshot â
     // the same safe static-extraction the dungeon smoketest uses); lfg_dungeonId
     // is the first LFGDungeons.db2 row on that map (used to look up the LFG
     // entrance in wc_world.lfg_dungeon_template). 0 => no LFG entry (generator
@@ -2810,20 +2829,20 @@ public:
         return true;
     }
 
-    // .playerbot reloadroutes — hot-reload ALL bot nav data from the shared DB
+    // .playerbot reloadroutes â hot-reload ALL bot nav data from the shared DB
     // without a server restart, SOAP-callable so the world editor (and test
     // harnesses) can activate committed route/road changes instantly:
-    //  * dungeon route waypoints ({SharedDb}.playerbot_dungeon_routes) —
+    //  * dungeon route waypoints ({SharedDb}.playerbot_dungeon_routes) â
     //    DungeonScriptMgr::LoadGeneratedRoutes builds a fresh table and
     //    atomically swaps it under the routes mutex (AI-worker readers keep a
     //    coherent snapshot); the next GetAdvice tick serves the new routes.
-    //  * handcrafted roads ({SharedDb}.handcrafted_road) — storage reload bumps
+    //  * handcrafted roads ({SharedDb}.handcrafted_road) â storage reload bumps
     //    the generation counter and the road GRAPH cache is invalidated, so the
     //    next ComputeRoute rebuilds from the new segments. NOTE: navmesh AREA
     //    tagging (NAV_AREA_ROAD slope-cost) on already-loaded maps still needs
-    //    `.reload handcrafted_road apply <mapId>` — tag flips are destructive
+    //    `.reload handcrafted_road apply <mapId>` â tag flips are destructive
     //    and per-map, so they stay an explicit step.
-    // Runs on the world thread (command context) — same thread as the startup
+    // Runs on the world thread (command context) â same thread as the startup
     // loads, so the synchronous DB queries are safe here.
     static bool HandleReloadRoutes(ChatHandler* handler)
     {
@@ -2848,11 +2867,11 @@ public:
         return true;
     }
 
-    // .playerbot killentry <botname> <entry> — TEST utility: the named bot
+    // .playerbot killentry <botname> <entry> â TEST utility: the named bot
     // kills the nearest LIVE creature of <entry> within 300y (encounter credit
     // goes to the bot, so dm_credit fires exactly as in a real kill). Exists so
     // boss-progression states can be advanced without clearing every earlier
-    // encounter — e.g. validating the Lord Serpentis traversal link without
+    // encounter â e.g. validating the Lord Serpentis traversal link without
     // first killing four bosses. GM-gated.
     static bool HandleKillEntry(ChatHandler* handler, std::string const& botname,
                                 uint32 entry)
@@ -2932,7 +2951,7 @@ public:
         { handler->PSendSysMessage("dungeontest: no LFGDungeons row %u.", dungeonId); return false; }
 
         // Resolve the dungeon's level bracket from ContentTuning (12.0 has
-        // no MinLevel/MaxLevel on LFGDungeons — it scales via ContentTuning,
+        // no MinLevel/MaxLevel on LFGDungeons â it scales via ContentTuning,
         // the exact source LFGMgr's level gate reads). Pass an empty redirect
         // mask (Chromie CtrOptions is a stub on this server anyway).
         int16 minL = 1, maxL = uint8(sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL));
@@ -2959,14 +2978,14 @@ public:
         // If the squad is already inside an active LFG run for THIS dungeon,
         // re-invoking the command (the harness re-runs it to monitor progress)
         // must NOT disturb it. The per-member position-reset below ejects any
-        // bot found on a dungeon map to the staging area — which, on a squad
+        // bot found on a dungeon map to the staging area â which, on a squad
         // that had JUST been ported in, tore the live run apart and desynced
         // LFG (the group state stayed "In dungeon" while the bodies were yanked
         // back to map 0, so the run never advanced). Detect the live run by LFG
         // state (LFG_STATE_DUNGEON) on the dungeon's own map and short-circuit:
         // report and leave the run alone. Only when the run has genuinely
         // collapsed (the instance is empty of the squad) do we fall through to
-        // re-stage + re-queue — and LeaveLfg() below clears any stale state.
+        // re-stage + re-queue â and LeaveLfg() below clears any stale state.
         {
             uint32 inRun = 0;
             std::string rs;
@@ -2985,12 +3004,12 @@ public:
                     rs += fmt::format("{}=running ", m.name);
                 }
             }
-            // tank + healer + at least one dps still inside ⇒ treat as a live
+            // tank + healer + at least one dps still inside â treat as a live
             // run and refuse to touch it (re-run is a no-op while running).
             if (inRun >= 3)
             {
                 handler->PSendSysMessage(
-                    "dungeontest '%s' (id %u): squad already in an ACTIVE run — "
+                    "dungeontest '%s' (id %u): squad already in an ACTIVE run â "
                     "%u/5 in the dungeon. Not disturbing. [%s]",
                     dun->Name.Str[sWorld->GetDefaultDbcLocale()], dungeonId,
                     inRun, rs.c_str());
@@ -3030,7 +3049,7 @@ public:
             Services::Lifecycle().mark_as_bot(id);
             // Shield the squad from the population overflow-kick: at a low
             // TotalTarget these dedicated test bots are pool inventory and get
-            // logged out the instant online > target — which made them flicker
+            // logged out the instant online > target â which made them flicker
             // offline mid-setup and never reach the LFG queue. A rolling 10-min
             // kick-protection lease (refreshed every command call) takes them
             // off the shaper's books until they're LFG-queued (the queue state
@@ -3043,7 +3062,7 @@ public:
             // BotSession sits in sessions_ forever as an "in flight" zombie that
             // never enters world. Defer login to the next call (row committed by
             // then). For an existing-but-offline member: if a (possibly zombie)
-            // session is already in flight, clear it first — a fresh login on a
+            // session is already in flight, clear it first â a fresh login on a
             // committed row reliably lands the bot in-world; otherwise submit one.
             ObjectGuid og = ObjectGuid::Create<HighGuid::Player>(id);
             Player* p = ObjectAccessor::FindConnectedPlayer(og);
@@ -3071,7 +3090,7 @@ public:
             static constexpr float kSX = -8985.0f, kSY = 511.0f, kSZ = 79.8f;
             if (p->GetMap()->IsDungeon() || p->GetMap()->IsBattleground())
             {
-                // Stranded in old instance — eject to the Alliance staging area.
+                // Stranded in old instance â eject to the Alliance staging area.
                 p->CombatStop(true);
                 p->TeleportTo(0, kSX, kSY, kSZ, 0.0f);
                 ++preparing;
@@ -3080,7 +3099,7 @@ public:
             }
             // Overworld bad state: in water, in combat, or underground/at-sea-level.
             // Teleport is skipped when already near staging to avoid loop, but
-            // CombatStop is ALWAYS called when in combat — stale refs from a prior
+            // CombatStop is ALWAYS called when in combat â stale refs from a prior
             // dungeon run can persist after the staging teleport and must be cleared.
             {
                 float px, py, pz;
@@ -3097,7 +3116,7 @@ public:
                         status += fmt::format("{}=staged ", m.name);
                         continue;
                     }
-                    // Near staging but still in combat (stale refs) — CombatStop
+                    // Near staging but still in combat (stale refs) â CombatStop
                     // was called above; re-check after a tick via another invocation.
                     if (p->IsInCombat())
                     { ++preparing; status += fmt::format("{}=incombat ", m.name); continue; }
@@ -3105,7 +3124,7 @@ public:
             }
             // Alive-gate: a dead/ghost member can't LFG-queue (the API rejects
             // it), so the finder forms an incomplete group and the proposal
-            // lapses — the squad reverts to open-world questing and the run
+            // lapses â the squad reverts to open-world questing and the run
             // never starts. Revive any downed member in place (these are
             // dedicated test bots; a real player would corpse-run, but for the
             // harness an instant rez is correct) and don't count it ready until
@@ -3122,12 +3141,12 @@ public:
             // Setup: level + gear via the standard pipeline, then force the
             // role spec LAST so the bot actually tanks/heals (role inference
             // reads GetPrimarySpecialization). RunFor is incremental and
-            // persists its own per-bot state — the pop manager calls it ONCE
+            // persists its own per-bot state â the pop manager calls it ONCE
             // per tick. We mirror that: exactly one step per command invocation
             // (this command is idempotent/re-run, so setup converges across
             // calls). A tight RunFor loop here ran the full gear+travel pipeline
             // for 5 bots synchronously on the world thread in a single tick and
-            // contributed to a world-thread-hang crash — never loop it. No
+            // contributed to a world-thread-hang crash â never loop it. No
             // Reset(): that would wipe progress every call and never finish.
             // Force exact level match before running the setup pipeline: if the
             // bot leveled past the target (e.g. gained XP fighting mobs while
@@ -3159,7 +3178,7 @@ public:
             return true;
         }
 
-        // All five geared/specced + in-world → solo-queue each for the
+        // All five geared/specced + in-world â solo-queue each for the
         // dungeon with its role. The finder matches the 5, sends a proposal
         // (bots auto-accept, idle:lfg_proposal_accept), ports them in, and
         // dungeon-run auto-activates for the whole is_lfg group.
@@ -3186,7 +3205,7 @@ public:
             }
         }
         handler->PSendSysMessage(
-            "dungeontest '%s' (id %u): squad ready at lvl %u — LFG-queued %u/5 "
+            "dungeontest '%s' (id %u): squad ready at lvl %u â LFG-queued %u/5 "
             "(tank+healer+3dps). Finder will form the group + port them in.",
             dun->Name.Str[sWorld->GetDefaultDbcLocale()], dungeonId, level, queued);
         return true;
@@ -3215,11 +3234,11 @@ public:
     // PathGenerator::CalculatePath after the path stabilises).
     //
     // Modes:
-    //   .playerbot roadstats              — global summary
-    //   .playerbot roadstats <mapId>      — single-map breakdown
-    //   .playerbot roadstats list         — table of every map with tallied paths
+    //   .playerbot roadstats              â global summary
+    //   .playerbot roadstats <mapId>      â single-map breakdown
+    //   .playerbot roadstats list         â table of every map with tallied paths
     //
-    // Reports: paths run, paths with ≥1 road poly (% of total),
+    // Reports: paths run, paths with â¥1 road poly (% of total),
     // road poly fraction, paths in instance, paths with road bonus
     // disabled, paths with slope penalty > 10%.
 
@@ -3312,8 +3331,8 @@ public:
         return true;
     }
 
-    // A/B compare: run the same pathfind twice — once with road bonus,
-    // once without — and report the difference in length + road poly
+    // A/B compare: run the same pathfind twice â once with road bonus,
+    // once without â and report the difference in length + road poly
     // count. Lets the operator confirm road bias is producing visibly
     // different routes for a specific destination.
     //
@@ -3340,9 +3359,9 @@ public:
             {"stormwind-goldshire",   0, -9460.0f,    55.0f,  56.0f,
                 "Eastern Kingdoms south road from Stormwind gate to Goldshire"},
             {"goldshire-westfall",    0, -10650.0f,  1052.0f,  37.0f,
-                "Sentinel Hill — long cobblestone road south"},
+                "Sentinel Hill â long cobblestone road south"},
             {"stormwind-darkshire",   0, -10590.0f,  -1136.0f, 48.0f,
-                "Duskwood Darkshire — winding forest road"},
+                "Duskwood Darkshire â winding forest road"},
             {"ironforge-kharanos",    0, -5500.0f,    -710.0f, 350.0f,
                 "Dun Morogh road from Ironforge to Kharanos"},
             {"orgrimmar-razorhill",   1, 326.0f,    -4690.0f,  10.0f,
@@ -3374,7 +3393,7 @@ public:
             {
                 handler->SendSysMessage("Pathcompare presets:");
                 for (auto const& pr : presets)
-                    handler->PSendSysMessage("  %s (map %u) — %s",
+                    handler->PSendSysMessage("  %s (map %u) â %s",
                                              pr.name, pr.mapId, pr.note);
                 return true;
             }
@@ -3391,7 +3410,7 @@ public:
             }
             if (p->GetMapId() != chosen->mapId)
                 handler->PSendSysMessage(
-                    "Pathcompare: warning — you are on map %u, preset is for map %u. Pathfind may fail.",
+                    "Pathcompare: warning â you are on map %u, preset is for map %u. Pathfind may fail.",
                     p->GetMapId(), chosen->mapId);
             x = chosen->x; y = chosen->y; z = chosen->z;
         }
@@ -3438,13 +3457,13 @@ public:
         const int64 roadDelta = static_cast<int64>(roadWith) - static_cast<int64>(roadWithout);
         char const* verdict;
         if (roadDelta > 0 && std::abs(lenDelta) < 5.0f)
-            verdict = "ROAD BIAS ACTIVE — same length, road-only detour";
+            verdict = "ROAD BIAS ACTIVE â same length, road-only detour";
         else if (roadDelta > 0)
-            verdict = "ROAD BIAS ACTIVE — picked road route";
+            verdict = "ROAD BIAS ACTIVE â picked road route";
         else if (roadDelta == 0 && std::abs(lenDelta) < 0.5f)
             verdict = "no road influence on this route";
         else
-            verdict = "OFF-ROAD PREFERRED — slope or no roads nearby";
+            verdict = "OFF-ROAD PREFERRED â slope or no roads nearby";
         handler->PSendSysMessage("  delta_length=%+.1fy delta_road_polys=%+lld  -> %s",
                                  lenDelta, static_cast<long long>(roadDelta), verdict);
         return true;
@@ -3465,7 +3484,7 @@ public:
 
     static bool HandleReseed(ChatHandler* handler, Optional<std::string> confirm_arg)
     {
-        // Destructive operation — require explicit "confirm" arg to run, so a
+        // Destructive operation â require explicit "confirm" arg to run, so a
         // typo of `.playerbot reseed` doesn't wipe the entire distribution
         // metadata. Resets distribution_level + setup_pipeline_state for ALL
         // V2 characters; the next population tick re-shapes the fleet from
@@ -3582,7 +3601,7 @@ public:
 
         // Drop residual playerbot_v2_character rows in one shot. Some may
         // already be gone if Player::DeleteFromDB cascaded into our table
-        // (it doesn't, currently — but harmless to run unconditionally).
+        // (it doesn't, currently â but harmless to run unconditionally).
         CharacterDatabase.DirectExecute(
             "DELETE FROM playerbot_v2_character");
 
@@ -3880,8 +3899,8 @@ public:
     // history, dropped-intent counter, and DB queue depth. Default count: 5.
     //
     // Sub-commands:
-    //   .playerbot smoketest result   — print the most recent finished run
-    //   .playerbot smoketest status   — print whether a run is in flight
+    //   .playerbot smoketest result   â print the most recent finished run
+    //   .playerbot smoketest status   â print whether a run is in flight
     //
     // Because the wait phase needs the world thread to keep ticking (so
     // async login + setup-pipeline DB callbacks can fire), the test runs on
@@ -3894,7 +3913,7 @@ public:
         if (!Playerbot::Services::Initialized())
         { handler->SendSysMessage("PlayerbotV2 not initialized."); return false; }
 
-        // Sub-command dispatch — string args take precedence over numeric.
+        // Sub-command dispatch â string args take precedence over numeric.
         if (arg)
         {
             std::string const& s = *arg;
@@ -3942,10 +3961,10 @@ public:
             // .playerbot smoketest bglive [count]   (Wave C)
             //
             // Live BG-aware smoketest. Spawns N bots (default 10) and waits
-            // the standard 60s window — same as `.playerbot smoketest`, but
+            // the standard 60s window â same as `.playerbot smoketest`, but
             // additionally asserts that at least one bot has fired an
             // `idle:bg_*` rule during the window. Requires the BG queue-
-            // filler to be enabled in playerbot.conf — without it, bots
+            // filler to be enabled in playerbot.conf â without it, bots
             // never queue and the assertion will fail with the canonical
             // "0 of N bots fired any idle:bg_* rule" message.
             //
@@ -4048,7 +4067,7 @@ public:
         }
 
         // BotCharacterFactory needs a WorldSession for locale + audit.
-        // Console invocation can't supply one — bail with a friendly hint.
+        // Console invocation can't supply one â bail with a friendly hint.
         WorldSession* sess = handler->GetSession();
         if (!sess)
         {
@@ -4079,7 +4098,7 @@ public:
     // Player-facing "summon one of my OWN alts as a bot" command. Distinct
     // from .playerbot mark + .playerbot login (the GM lifecycle pair) in
     // three ways:
-    //   1) Requires an in-game session — there's no notion of "your alts"
+    //   1) Requires an in-game session â there's no notion of "your alts"
     //      from console.
     //   2) Enforces account match: the named character must live on the
     //      same account as the issuing player. Without this gate any GM
@@ -4147,7 +4166,7 @@ public:
         if (target_account != my_account)
         {
             // Hard fail with no leak: don't reveal which account owns the
-            // target. The player either owns this alt or doesn't — that's
+            // target. The player either owns this alt or doesn't â that's
             // all they need to know.
             handler->PSendSysMessage("'%s' is not on your account.",
                                      target_name.c_str());
@@ -4214,7 +4233,7 @@ public:
         }
 
         handler->PSendSysMessage(
-            "Summoning your alt '%s' — AI-controlled bot enters world on "
+            "Summoning your alt '%s' â AI-controlled bot enters world on "
             "the next DB callback. You (and any other char on your account) "
             "can whisper `follow`, `stop`, `engage`, `squad`, `role` to it.",
             target_name.c_str());
@@ -4225,14 +4244,14 @@ public:
     //
     // First-person testing toggle: attach (or detach) the V2 AI to the
     // issuing player's OWN character. Lets the player observe AI decisions
-    // from inside the bot — vastly deeper insight than reading logs after
+    // from inside the bot â vastly deeper insight than reading logs after
     // the fact ("why did it stop?", "why didn't it kick?", "where was the
     // pull heuristic going to send me?").
     //
     // Mechanics: this is a thin wrapper over mark/adopt + register/unregister,
     // scoped to "myself" so the user doesn't have to type their own name.
     // The player's client input still flows through the network normally
-    // — IntentExecutor and the client compete on movement and ability use,
+    // â IntentExecutor and the client compete on movement and ability use,
     // and the player wins when they actively press a key (the AI's movement
     // intents will arrive late and overwrite, but only when the client is
     // idle). For pure observation, the player can simply not move and watch.
@@ -4293,7 +4312,7 @@ public:
             }
             handler->SendSysMessage(
                 "Self-AI: ON. AI now drives your character. Your client "
-                "input still works — pressing movement keys interrupts the "
+                "input still works â pressing movement keys interrupts the "
                 "AI's move intents. Use `.playerbot self off` to detach.");
             return true;
         }
@@ -4322,20 +4341,20 @@ public:
     }
 
     // ----------------------------------------------------------------------
-    // .playerbot meta — world-metadata editor.
+    // .playerbot meta â world-metadata editor.
     //
     // Subcommands:
-    //   add <kind> [radius]      — capture current pos + zone, insert row
-    //   add_at <kind> <m> <x> <y> <z> [radius]  — explicit coords
-    //   list [<kind>] [<r>]      — show rows near caller (default r=200y, all kinds)
-    //   delete <id>              — remove row by id
-    //   reload                   — re-read DB into in-memory cache
-    //   help                     — print kinds + usage
+    //   add <kind> [radius]      â capture current pos + zone, insert row
+    //   add_at <kind> <m> <x> <y> <z> [radius]  â explicit coords
+    //   list [<kind>] [<r>]      â show rows near caller (default r=200y, all kinds)
+    //   delete <id>              â remove row by id
+    //   reload                   â re-read DB into in-memory cache
+    //   help                     â print kinds + usage
     //
     // Kinds: road, crossroad, city, village, hub, danger, vendor, mailbox,
     //        innkeeper, other (see WorldMetadata.h::WorldMetadataKind).
     //
-    // The handler is in-world only — capturing the GM's position requires
+    // The handler is in-world only â capturing the GM's position requires
     // a Player*. Console-only operators use add_at + map coords.
     static bool HandleMeta(ChatHandler* handler, Optional<std::string> argOpt)
     {
@@ -4353,7 +4372,7 @@ public:
         // waypoints. Default destination matches the generator's
         // auto-discovery path (<data>/world_metadata.csv).
         auto auto_export = [](WorldMetadataStore& s) {
-            // Use M:/WorldofWarcraft/world_metadata.csv literally —
+            // Use M:/WorldofWarcraft/world_metadata.csv literally â
             // that's the inputDirectory the GM-curated regens use. If
             // operators want a different path they invoke `meta export
             // <path>` explicitly.
@@ -4361,7 +4380,7 @@ public:
             if (!f) return;
             auto rows = s.Snapshot();
             std::fprintf(f,
-                "# playerbot_v2_world_metadata export — schema_version=9\n"
+                "# playerbot_v2_world_metadata export â schema_version=9\n"
                 "# columns: id,map_id,zone_id,kind,kind_name,x,y,z,radius,label,notes\n");
             for (auto const& r : rows)
             {
@@ -4375,7 +4394,7 @@ public:
         };
 
         auto print_help = [&]() {
-            handler->SendSysMessage("Playerbot meta — world knowledge editor.");
+            handler->SendSysMessage("Playerbot meta â world knowledge editor.");
             handler->SendSysMessage("CREATE / MUTATE:");
             handler->SendSysMessage("  add <kind> [radius]            capture current pos");
             handler->SendSysMessage("  add_at <kind> <m> <x> <y> <z>  explicit coords");
@@ -4452,10 +4471,10 @@ public:
         if (sub == "sanity")
         {
             // Run consistency checks on the cached rows. Reports
-            // problematic rows but doesn't auto-fix — operator decides.
-            //   * radius <= 0 — placeholder bug
-            //   * (x,y,z) == (0,0,0) — likely never-populated row
-            //   * duplicate (map_id, kind, x, y) within 1y — likely
+            // problematic rows but doesn't auto-fix â operator decides.
+            //   * radius <= 0 â placeholder bug
+            //   * (x,y,z) == (0,0,0) â likely never-populated row
+            //   * duplicate (map_id, kind, x, y) within 1y â likely
             //     accidental double-add
             auto rows = store.Snapshot();
             uint32 bad_radius = 0, zero_coords = 0, dupes = 0;
@@ -4537,13 +4556,13 @@ public:
 
         if (sub == "count")
         {
-            // Quick aggregate — total + per-kind, no per-map breakdown.
+            // Quick aggregate â total + per-kind, no per-map breakdown.
             auto rows = store.Snapshot();
             std::array<uint32, uint32(WorldMetadataKind::Count_)> by_kind{};
             for (auto const& r : rows)
                 if (uint32(r.kind) < by_kind.size())
                     ++by_kind[uint32(r.kind)];
-            std::string line = fmt::format("Meta: {} total —", rows.size());
+            std::string line = fmt::format("Meta: {} total â", rows.size());
             for (uint32 k = 1; k < uint32(WorldMetadataKind::Count_); ++k)
                 if (by_kind[k] > 0)
                     line += fmt::format(" {}={}", KindToString(WorldMetadataKind(k)), by_kind[k]);
@@ -4606,7 +4625,7 @@ public:
                 return false;
             }
             std::fprintf(f,
-                "# playerbot_v2_world_metadata export — schema_version=9\n"
+                "# playerbot_v2_world_metadata export â schema_version=9\n"
                 "# columns: id,map_id,zone_id,kind,kind_name,x,y,z,radius,label,notes\n");
             for (auto const& r : rows)
             {
@@ -4947,7 +4966,7 @@ public:
 // PlayerScript hook bridge for the PlayerbotControl addon. We listen for
 // addon-language whispers (LANG_ADDON / LANG_ADDON_LOGGED) and hand the
 // body to AddonControl::OnAddonWhisper. The hook only fires for whispers
-// the player initiates — the addon sends to its own player name (self-
+// the player initiates â the addon sends to its own player name (self-
 // whisper), which still flows through this hook before the WhisperAddon
 // path attempts delivery.
 //
@@ -4965,7 +4984,7 @@ public:
                 std::string& msg, Player* receiver) override
     {
         if (lang != LANG_ADDON && lang != LANG_ADDON_LOGGED) return;
-        // OnChat doesn't carry the prefix — AddonControl filters on body
+        // OnChat doesn't carry the prefix â AddonControl filters on body
         // shape ("1|<seqHex>|...|MTYPE|"). Pass empty prefix.
         Playerbot::V2::AddonControl::OnAddonWhisper(
             player, receiver, /*prefix=*/ std::string{}, msg);
@@ -5002,31 +5021,9 @@ public:
     }
 };
 
-// Called by the GM `.summon` handler (cs_misc.cpp) first: `.summon all` / `.summon <companion>` = `.bot call`.
-bool PlayerbotV2TrySummon(ChatHandler* handler, char const* args)
-{
-    return playerbot_v2_commandscript::TrySummon(handler, args);
-}
-
 void AddSC_playerbot_v2_commandscript()
 {
     new playerbot_v2_commandscript();
     new playerbot_v2_addon_listener();
     new playerbot_v2_chatter_listener();
 }
-
-#else
-
-#include "Chat.h"
-#include "WorldSession.h"
-
-bool PlayerbotV2TrySummon(ChatHandler* handler, char const*)
-{
-    // Module off: normal players still must not summon real players (the Player role may hold the summon permission).
-    WorldSession* sess = handler ? handler->GetSession() : nullptr;
-    return sess && sess->GetSecurity() < SEC_GAMEMASTER;
-}
-
-void AddSC_playerbot_v2_commandscript() {}
-
-#endif // TRINITY_PLAYERBOT_V2

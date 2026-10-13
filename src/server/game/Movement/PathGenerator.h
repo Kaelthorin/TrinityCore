@@ -77,10 +77,14 @@ class TC_GAME_API PathGenerator
         // Calculate the path from owner to given destination
         // return: true if new path was calculated, false otherwise (no change needed)
         bool CalculatePath(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest = false);
-        // Bot sources in a capital (module policy, Playerbot/PathLiquid.h): the last CalculatePath found only a route through liquid,
-        // no land route exists. Every ground move of a bot goes through CalculatePath (move_to, follow, chase), so this is the one
-        // place that keeps town movement out of canals.
+        // Sources that keep out of liquid (see SetLiquidRouteCheck): the last CalculatePath found only a route through liquid,
+        // no land route exists.
         bool IsWetRoute() const { return _wetRoute; }
+
+        // Optional check (set by a module): returns true when `source` should keep out of liquid and `path` touches liquid.
+        // CalculatePath then searches a land-only route and keeps it when it is dry, else keeps the first route (IsWetRoute).
+        using LiquidRouteCheck = bool(*)(WorldObject const* source, Movement::PointsArray const& path);
+        static void SetLiquidRouteCheck(LiquidRouteCheck check) { _liquidRouteCheck = check; }
         bool CalculatePath(float destX, float destY, float destZ, bool forceDest = false);
         bool IsInvalidDestinationZ(WorldObject const* target) const;
 
@@ -147,7 +151,7 @@ class TC_GAME_API PathGenerator
         bool _avoidWater = false;
         bool _wetRoute = false;
         bool CalculatePathImpl(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest);
-        bool PathTouchesLiquid() const;
+        static LiquidRouteCheck _liquidRouteCheck;
 
     public:
         // Per-pathfind opt-out from the road-cost bonus. When set, this

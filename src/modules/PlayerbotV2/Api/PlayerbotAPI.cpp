@@ -11,6 +11,7 @@
 #include "BotItemScorer.h"
 #include "Player.h"
 #include "Corpse.h"
+#include "Log.h"
 #include "Unit.h"
 #include "MotionMaster.h"
 #include "FollowMovementGenerator.h"
@@ -37,7 +38,7 @@
 #include "MMapManager.h"   // endpoint-resolution diag in path_fail
 #include "PhasingHandler.h"
 #include "DetourNavMeshQuery.h"
-#include "PlayerbotHooks.h"  // path-outcome telemetry forwarding
+#include "PlayerbotV2.h"     // path-outcome telemetry, bot-leader battleground queue
 #include "PlayerbotMovement.h"  // unified bot-movement helpers
 #include "PartialRouteStall.h"
 #include "NoMotionGuard.h"
@@ -128,10 +129,10 @@ namespace PathBudget
 // angle jitter still re-attempts, but persistent dead-target spam doesn't
 // burn Detour CalculatePath every tick. Stamp on NoPath /
 // FarFromPolyEnd; early-return Result::Locked on the same bucket for
-// `kPathFailTtlMs` after the stamp. Keyed (player guid low → ring of 4
+// `kPathFailTtlMs` after the stamp. Keyed (player guid low â ring of 4
 // recent failures). Single-threaded access from the world tick so no lock.
 namespace {
-    constexpr size_t  kPathFailCap     = 16;     // was 4 — a bot thrashing between
+    constexpr size_t  kPathFailCap     = 16;     // was 4 â a bot thrashing between
                                                  // several dead targets evicted a
                                                  // persistent off-mesh dest before it
                                                  // could be suppressed (Falin/Varothel
@@ -143,7 +144,7 @@ namespace {
                                                   // destination is off-mesh (above
                                                   // terrain, inside a wall, a phantom
                                                   // POI Z) and will NOT become reachable
-                                                  // in 3s — re-trying every 3s forever
+                                                  // in 3s â re-trying every 3s forever
                                                   // is what made bots run back and forth.
                                                   // Suppress long so goal-selection
                                                   // commits to a reachable objective.
@@ -178,11 +179,11 @@ namespace {
 
     inline uint64 PathDestKey(uint32 map_id, float x, float y)
     {
-        // 5y buckets — angle jitter within ~5y still re-tries; persistent
+        // 5y buckets â angle jitter within ~5y still re-tries; persistent
         // same-spot pushes hit the same bucket. map_id mixed into the high
         // bits so cross-map (x,y) collisions (e.g. (0,0) on every map)
         // don't false-block. 16 bits each for qx/qy is plenty given world
-        // bounds (±17000y / 5 = ±3400, fits in i16).
+        // bounds (Â±17000y / 5 = Â±3400, fits in i16).
         constexpr float kBucket = 5.0f;
         int32 qx = static_cast<int32>(std::floor(x / kBucket));
         int32 qy = static_cast<int32>(std::floor(y / kBucket));
@@ -202,8 +203,8 @@ namespace {
     // Progress probe for the same-goal skip's STALL-BREAKER. The same-goal skip
     // (above) intentionally lets an active spline run without re-issuing, so a
     // winding/chunked route isn't restart-thrashed. But a spline can STALL with
-    // its generator still "live" — e.g. a WaypointMovementGenerator that can't
-    // navigate a long water segment or a water↔land shoreline seam (live: AV
+    // its generator still "live" â e.g. a WaypointMovementGenerator that can't
+    // navigate a long water segment or a waterâland shoreline seam (live: AV
     // pushers frozen in the river z~10 mid-valley; IoC Workshop attackers frozen
     // in the moat 151y short, both on COMPLETE mmap_probe paths). The plain skip
     // then freezes the bot forever AND keeps returning Ok, which resets the
@@ -220,10 +221,10 @@ namespace {
     // spot (building interior, terrain pocket) can have its only route OUT wind
     // past the 74-poly/~292y path cap before the route turns toward a far goal,
     // so the reachable partial ends a touch FARTHER in straight-line
-    // (forward_progress<0) — yet walking it UNLOCKS an advancing path from the
+    // (forward_progress<0) â yet walking it UNLOCKS an advancing path from the
     // new pose (live: Durnan, indoors z505, partial nets 115y to (-4986,-954)
-    // [−47y to goal], but from THERE the next partial advances +372y). The
-    // non-advancing branch otherwise refuses → bot frozen forever (154 blocks).
+    // [â47y to goal], but from THERE the next partial advances +372y). The
+    // non-advancing branch otherwise refuses â bot frozen forever (154 blocks).
     // We FOLLOW such a partial to escape, bounded per (bot,goal) so a true tiny
     // pocket can't ping-pong forever: `crawls` counts consecutive non-advancing
     // escape steps; it resets when the goal changes OR the bot has genuinely
@@ -242,29 +243,29 @@ namespace {
 
     // Per-bot equip-refusal backoff. EquipUpgradeFire (V2 MaintainRules) re-fires
     // equip_item every eligible tick while the candidate is still in the bag.
-    // When the server REFUSES the swap (CanEquipItem != OK — e.g. the loadout
+    // When the server REFUSES the swap (CanEquipItem != OK â e.g. the loadout
     // would break a 2H/dual-wield rule, item is level-gated, slot can't be
     // unequipped), the item stays in the bag and the rule retries forever,
     // burning a CanEquipItem probe every tick AND making /diag believe an equip
-    // is perpetually "pending". Record refused (item-entry → dest-slot) pairs
+    // is perpetually "pending". Record refused (item-entry â dest-slot) pairs
     // with a long TTL so the same hopeless swap is skipped until the situation
     // can plausibly change (level-up, gear swap, respec all far longer than the
     // backoff). Keyed by player-guid-low like the path-fail ring.
-    constexpr uint32  kEquipFailTtlMs = 60000;   // 60s — far longer than a tick
+    constexpr uint32  kEquipFailTtlMs = 60000;   // 60s â far longer than a tick
     // Per-bot map of refused (item-entry,dest-slot) key -> failure timestamp.
     // Was a fixed 6-slot FIFO ring (kEquipFailCap) whose eviction re-enabled the
-    // OLDEST hopeless swap once a bot carried >6 distinct un-equippable items —
+    // OLDEST hopeless swap once a bot carried >6 distinct un-equippable items â
     // the round-robin then out-paced the rule-side lockout, producing the
     // "EquipItem|ServerRefused every few seconds forever" livelock (freeze-dump
     // signature). An unbounded-per-key map keeps EVERY distinct refused key
     // suppressed the full TTL regardless of bag count; expired keys are GC'd
     // opportunistically on insert so the inner map stays bounded by "distinct
     // items refused in the last 60s" (small). World-thread only (equip executes
-    // via the intent drain on the world thread), exactly like the prior ring —
+    // via the intent drain on the world thread), exactly like the prior ring â
     // no lock needed.
     std::unordered_map<uint64, std::unordered_map<uint32, uint32>> g_equip_fail{};
 
-    // Key folds the source item-entry (24 low bits — entries fit) with the
+    // Key folds the source item-entry (24 low bits â entries fit) with the
     // destination equipment slot (8 high bits) so "this item into this slot"
     // is the unit of backoff. The same item refused into a different slot, or a
     // different item into the same slot, still gets a fresh attempt.
@@ -432,7 +433,7 @@ static uint32 HighestKnownRank(Player const* p, uint32 spell_id)
 //
 // Spell::CheckRange (strict, i.e. at Spell::prepare) rejects a player's
 // SPELL_FACING_FLAG_INFRONT spell with SPELL_FAILED_UNIT_NOT_INFRONT unless
-// HasInArc(M_PI, target) — and a player's orientation is normally the
+// HasInArc(M_PI, target) â and a player's orientation is normally the
 // client's. SetFacingToObject is no use right before a cast: it queues a
 // MotionMaster facing spline whose orientation lands only on the NEXT unit
 // update, and the spline's launch sets MOVEMENTFLAG_FORWARD until then, so
@@ -441,7 +442,7 @@ static uint32 HighestKnownRank(Player const* p, uint32 spell_id)
 // SPELL_FAILED_MOVING). Unit::SetFacingToPoint launches the facing spline
 // (clients see the turn) and advances it by its own duration at once, so the
 // orientation is server-side current and the spline already finished before
-// CastSpell runs — the same thing the core does for its own facing points.
+// CastSpell runs â the same thing the core does for its own facing points.
 //
 // Only a standing caster is turned: a moving one faces its movement direction
 // (its cast-time spells cannot start anyway, and turning it would overwrite
@@ -625,7 +626,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         // target from the snapshot, which can be one cadence stale: the
         // member may have changed map, phased out, or just disconnected.
         // Casting at it then fails server-side with SPELL_FAILED_BAD_TARGETS
-        // (error 91) — the dominant cause of a 72%-cast-failure / 32K-reject
+        // (error 91) â the dominant cause of a 72%-cast-failure / 32K-reject
         // storm observed live (heals/totems firing at a no-longer-valid
         // unit). Reject here so we never emit the doomed cast.
         if (tu->GetMapId() != p_->GetMapId() || !p_->InSamePhase(tu))
@@ -644,7 +645,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     // Reject offensive casts on a dead (or about-to-despawn) target.
     // Audit 2026-05-22: all 14 caster specs gate only on
     // HasLiveTarget() (target guid present), not on the target's HP
-    // — so when a mob dies mid-cast-emit, the rotation queues a fresh
+    // â so when a mob dies mid-cast-emit, the rotation queues a fresh
     // 2.5s Frostbolt that resolves with SPELL_FAILED_TARGETS_DEAD,
     // wasting the GCD and mana. Centralize the dead-target gate here
     // so every spec inherits it, except rez-style spells that
@@ -660,11 +661,11 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     }
 
     // Reject offensive casts on a target carrying a Spell Reflect
-    // aura. Audit 2026-05-22: no caster spec checks this — bots
+    // aura. Audit 2026-05-22: no caster spec checks this â bots
     // happily chain Frostbolts into a Warrior with Spell Reflection
     // up and absorb their own damage. Targeted spells (info->IsTargetingArea
     // == false) on a HOSTILE target with a reflect aura should be
-    // skipped — let the rotation pick a different spell (instant /
+    // skipped â let the rotation pick a different spell (instant /
     // melee) or the spec's normal "no target" fallback.
     // Spell-reflect aura ids to detect:
     //   23920 Spell Reflection (Warrior; 5s reflect-all-magic buff)
@@ -700,7 +701,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     // can_cast(), but APL predicates across all 39 specs don't
     // consistently gate. Centralize at the API level so a silenced
     // bot doesn't spam SPELL_FAILED_SILENCED. Exception: melee abilities
-    // and self-buff spells aren't silenced — only spells in a school
+    // and self-buff spells aren't silenced â only spells in a school
     // the silence covers. Use the same check TC's CheckCast performs:
     // `HasAuraType(SPELL_AURA_MOD_SILENCE)` blocks all schools, while
     // `HasAuraType(SPELL_AURA_MOD_PACIFY_SILENCE)` blocks both melee
@@ -717,7 +718,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     }
 
     // Defensive range gate. Belt-and-suspenders for any rule whose target
-    // picker selects a unit far out of range — observed: group-buff rules
+    // picker selects a unit far out of range â observed: group-buff rules
     // casting Fortitude/Intellect/Soulstone at members 200-4800y away on a
     // shared continent map_id (~287k rejected casts in a 300MB log window).
     // The core rejects these in Spell::CheckRange anyway, but only after
@@ -741,7 +742,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     }
 
     // Face the target when the spell needs it in front (Spell::CheckRange:
-    // SPELL_FACING_FLAG_INFRONT, ±90°) — Frostbolt, Shadow Bolt, melee and
+    // SPELL_FACING_FLAG_INFRONT, Â±90Â°) â Frostbolt, Shadow Bolt, melee and
     // cone abilities fail with SPELL_FAILED_UNIT_NOT_INFRONT otherwise, and a
     // bot has no client to turn it. Live MC 2026-10-06: mages and warlocks
     // stood with their backs to the boss after a raid move; the old
@@ -782,7 +783,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         }
 
     // Movement spells (Charge/Leap/Jump) pathfind SYNCHRONOUSLY in core
-    // Spell::CheckCast / effect handlers — the 2026-06-17 87s world-thread hang
+    // Spell::CheckCast / effect handlers â the 2026-06-17 87s world-thread hang
     // was exactly a Warrior Charge's PathGenerator here, unguarded by the module.
     // Gate ONLY these on the per-tick pathfinding budget (normal rotation casts
     // never pathfind, so they are never throttled). Return Result::Locked
@@ -808,7 +809,7 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         // picked it, but Casting=0 because the world thread rejected it.
         // For BAD_TARGETS we additionally dump the relationship breakdown so
         // we can tell apart visibility failures, faction friendliness, At-War
-        // flag misses, and immune-to-PC flags — they all surface as the same
+        // flag misses, and immune-to-PC flags â they all surface as the same
         // SpellCastResult but have different fixes.
         const float dist = tu != p_ ? p_->GetDistance(tu) : 0.f;
         if (sr == SPELL_FAILED_BAD_TARGETS && tu != p_)
@@ -816,14 +817,14 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
             // Faction / friendliness / hostility / immunity locals were
             // historically captured here but the log line below only consumes
             // canSee + validAttack + visibility/phase/stealth diagnostics.
-            // The MSVC C4189 spam (8 unused locals × every TU compile) hid
-            // real diagnostics — keep only what the log uses.
+            // The MSVC C4189 spam (8 unused locals Ã every TU compile) hid
+            // real diagnostics â keep only what the log uses.
             bool canSee = p_->CanSeeOrDetect(tu);
             bool validAttack = p_->IsValidAttackTarget(tu, info);
             // Decompose CanSeeOrDetect: phase + map already verified equal in
             // the previous iteration. Now drill down into the remaining branches
-            // — never-visible, private-object ownership, ghost/GM bitmask checks,
-            // detect-stealth/invis — to identify which one rejects the worg.
+            // â never-visible, private-object ownership, ghost/GM bitmask checks,
+            // detect-stealth/invis â to identify which one rejects the worg.
             bool sameMap = p_->GetMap() == tu->GetMap();
             bool samePhase = WorldObject::InSamePhase(p_, tu);
             bool tgtInWorld = tu->IsInWorld();
@@ -870,14 +871,14 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
         // prereq (typical bot cases: warlock Create Healthstone refused
         // because one already exists, Soulstone already up on a target, a
         // proc-gated spell with no proc active). These persist far longer
-        // than a GCD — minutes, or until the underlying state cycles.
+        // than a GCD â minutes, or until the underlying state cycles.
         // Treat as persistent so the 10s back-off in BotIntentExecutor
         // kicks in, instead of hammering the rule every 1.5s GCD tick.
         case SPELL_FAILED_CASTER_AURASTATE:  return Result::ServerRefused;
         case SPELL_FAILED_MOVING:            return Result::Locked;
         // Not facing the target (a moving caster, or one whose turn could
         // not be applied): the next tick's cast faces it first, so retry then
-        // rather than taking the 10s ServerRefused back-off — that back-off
+        // rather than taking the 10s ServerRefused back-off â that back-off
         // is what left casters standing idle facing away from the fight.
         case SPELL_FAILED_UNIT_NOT_INFRONT:  return Result::Locked;
         case SPELL_FAILED_INTERRUPTED:       return Result::Locked;
@@ -929,7 +930,7 @@ Result API::cast_spell_at_position(uint32 spell_id, float x, float y, float z)
         return Result::NotKnown;
 
     // Gate movement ground-casts (Heroic Leap etc.) on the per-tick pathfinding
-    // budget — they pathfind synchronously in core like targeted Charge (see
+    // budget â they pathfind synchronously in core like targeted Charge (see
     // cast_spell). AoE ground-casts have no movement effect and are never gated.
     if (!PathBudget::HasBudget(GameTime::GetGameTimeMS()) &&
         (info->HasEffect(SPELL_EFFECT_CHARGE)      || info->HasEffect(SPELL_EFFECT_CHARGE_DEST) ||
@@ -954,7 +955,7 @@ Result API::cast_spell_at_position(uint32 spell_id, float x, float y, float z)
         // prereq (typical bot cases: warlock Create Healthstone refused
         // because one already exists, Soulstone already up on a target, a
         // proc-gated spell with no proc active). These persist far longer
-        // than a GCD — minutes, or until the underlying state cycles.
+        // than a GCD â minutes, or until the underlying state cycles.
         // Treat as persistent so the 10s back-off in BotIntentExecutor
         // kicks in, instead of hammering the rule every 1.5s GCD tick.
         case SPELL_FAILED_CASTER_AURASTATE:  return Result::ServerRefused;
@@ -975,10 +976,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
 {
     if (!p_) return Result::Other;
 
-    // ── VEHICLE DRIVING ──
+    // ââ VEHICLE DRIVING ââ
     // When the bot CONTROLS a vehicle (IoC siege engine / demolisher / glaive
     // thrower; SoTA/WG engines), it is a SEATED passenger of the vehicle base.
-    // The player's own MotionMaster can't move it — and worse, a seated bot
+    // The player's own MotionMaster can't move it â and worse, a seated bot
     // trips UNIT_STATE_NOT_MOVE / IsMovementPreventedByCasting below and bails
     // Result::Locked, so the vehicle never drives (live: IoC demolishers mounted
     // but frozen at the Workshop pad, [move_blocked] idle:bg_vehicle_drive_to_gate,
@@ -1041,7 +1042,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Movement-prevented precheck. PointMovementGenerator::Initialize sets
     // MOVEMENTGENERATOR_FLAG_INTERRUPTED + StopMoving when the unit has
     // UNIT_STATE_NOT_MOVE (root|stunned|died|distracted) or is mid-cast on
-    // a non-movable spell — the spline never starts and Result::Ok would
+    // a non-movable spell â the spline never starts and Result::Ok would
     // mislead the rule into thinking the bot is walking. Refuse early so
     // the rule's per-target retry / fallback rules can take over.
     if (p_->HasUnitState(UNIT_STATE_NOT_MOVE) ||
@@ -1050,7 +1051,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // Name the refusal. A repeating MoveTo|Locked is indistinguishable in
         // the intent ring from a pathfinding refusal, and the campaign burned
         // two Phase-2 candidates (Shadow Labyrinth, SFK) chasing "missing
-        // geometry" that headless probes then proved COMPLETE — the real
+        // geometry" that headless probes then proved COMPLETE â the real
         // cause is one of ~7 unnamed Locked branches. Throttled, one line.
         static uint32 s_lock_state_ms = 0;
         const uint32 lk_now = GameTime::GetGameTimeMS();
@@ -1067,7 +1068,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     }
 
     // Active FlightPath guard. Bot is on a taxi spline (FLIGHT_MOTION_TYPE)
-    // — issuing MovePoint while in flight queues under, not over, the
+    // â issuing MovePoint while in flight queues under, not over, the
     // flight generator and the bot looks "stuck" until landing. Refuse so
     // the AI re-evaluates next snapshot when the taxi arrives.
     if (p_->GetMotionMaster()->GetCurrentMovementGeneratorType() ==
@@ -1090,15 +1091,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Ok;
     }
 
-    // ── DIRECT move: committed traversal-link crossing ("just move, don't
-    // think"). No pathfinding, no ground snap — the endpoints are human-
+    // ââ DIRECT move: committed traversal-link crossing ("just move, don't
+    // think"). No pathfinding, no ground snap â the endpoints are human-
     // verified rows from {SharedDb()}.playerbot_nav_links, and pathfinding
     // toward the far side of a real navmesh split would NoPath and refuse.
     // MovePoint with generatePath=false launches a straight walk/jump spline
     // exactly like a player crossing the split. Distance-capped so a corrupt
     // row cannot yeet a bot across the map; the same-goal skip below is
     // intentionally bypassed (the caller-side emit dedup already holds the
-    // running spline — see BotIntentEmitter::move_to).
+    // running spline â see BotIntentEmitter::move_to).
     if (drop)
     {
         // A drop off a ledge (WSG graveyard ridge): the bot walked to the ledge point, now it leaves it. A jump move to the landing
@@ -1152,7 +1153,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     }
 
     // Snap target Z to a real walkable surface. Callers (idle:wander,
-    // idle:travel_to_hub, idle:quest_path …) pass either the bot's
+    // idle:travel_to_hub, idle:quest_path â¦) pass either the bot's
     // current Z or a creature/object anchor Z, neither guaranteed to
     // sit on the navmesh. SnapToGround applies the same vmap/mmap
     // composite TC uses in Player::SetPosition, with a fall-through to
@@ -1214,7 +1215,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // isMoving() is FALSE even though the route is alive and about to move. The
     // emitter re-emits move_to every ~1.5s; if the skip required isMoving()==true
     // it fell through during the init delay, re-ran MovePath, and
-    // MotionMaster::DirectAdd REPLACED the generator (same ACTIVE/NORMAL slot) —
+    // MotionMaster::DirectAdd REPLACED the generator (same ACTIVE/NORMAL slot) â
     // restarting the 1000ms delay and _currentNode=0 every cycle. Net effect: a
     // bot with a complete far-goal path froze in place forever, each tick
     // returning Result::Ok (so note_move_succeeded reset the wedge detector and
@@ -1222,18 +1223,18 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // path mmap_probe proved COMPLETE (65 polys). Keying the skip off the live
     // generator type + goal-key (not the movement flag) lets the spline run to
     // completion. This also strictly improves the original winding-route fix
-    // (Grimfang Valley-exit oscillation) — same intent, without the isMoving hole.
+    // (Grimfang Valley-exit oscillation) â same intent, without the isMoving hole.
     uint64 const move_goal_key = PathDestKey(p_->GetMapId(), x, y);
-    // ── TEMP Gap-1 crossing diagnostic (Deadmines map 36 foundry bridge) ──
+    // ââ TEMP Gap-1 crossing diagnostic (Deadmines map 36 foundry bridge) ââ
     // Logs every branch move_to takes while a bot sits in the Gap-1 box, so the
     // off-mesh crossing is debuggable from the log alone. Remove after the fix.
     const bool dbg_gap1 = p_->GetMapId() == 36 &&
         p_->GetPositionY() > -560.0f && p_->GetPositionY() < -480.0f &&
         p_->GetPositionX() > -235.0f && p_->GetPositionX() < -200.0f;
     // Same-goal skip covers BOTH spline kinds:
-    //   * WAYPOINT (long-haul MovePath, below) — original winding-route fix.
+    //   * WAYPOINT (long-haul MovePath, below) â original winding-route fix.
     //   * POINT    (MovePoint(generatePath), incl. the BG short-approach +
-    //     off-mesh-bridge case) — re-issuing MovePoint REPLACES the
+    //     off-mesh-bridge case) â re-issuing MovePoint REPLACES the
     //     PointMovementGenerator and RESTARTS its spline from the bot's current
     //     pose every tick. For a path that crosses an OFF-MESH connection (AV
     //     garrison bridge, cave/den bridges) the off-mesh "hop" is a few points
@@ -1244,10 +1245,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     //     POINT spline run to completion lets the off-mesh hop fire. The 5y
     //     PathDestKey bucket means a captain wandering <5y holds the skip (no
     //     restart) while a real >5y move / a rule redirect changes the key and
-    //     re-issues immediately. Reverts to IDLE on arrival → re-evaluated next
-    //     tick. (Keyed off generator type + goal, NOT isMoving — see the init-gap
+    //     re-issues immediately. Reverts to IDLE on arrival â re-evaluated next
+    //     tick. (Keyed off generator type + goal, NOT isMoving â see the init-gap
     //     note below.)
-    // POINT dedup scoped to battlegrounds AND dungeon/raid instances — both are
+    // POINT dedup scoped to battlegrounds AND dungeon/raid instances â both are
     // verified off-mesh-approach cases (BG captain-garrison / cave-den bridges, and
     // the Deadmines foundry Gap-1 bridge). In a dungeon a per-tick re-emit was
     // restarting the in-flight off-mesh hop from the bot's mid-gap pose, dropping it
@@ -1282,25 +1283,25 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                     (uint32)(now_probe - pr.ms), (int)mtype);
             if (pr.key != move_goal_key)
             {
-                // New goal for the probe — start the progress clock here.
+                // New goal for the probe â start the progress clock here.
                 pr = { move_goal_key, p_->GetPositionX(), p_->GetPositionY(), now_probe };
                 return Result::Ok;
             }
             if (pdx * pdx + pdy * pdy >= 4.0f * 4.0f)
             {
-                // Advanced >=4y since the mark — progressing, refresh + keep running.
+                // Advanced >=4y since the mark â progressing, refresh + keep running.
                 pr.x = p_->GetPositionX(); pr.y = p_->GetPositionY(); pr.ms = now_probe;
                 return Result::Ok;
             }
             if (now_probe - pr.ms < 3000u)
-                return Result::Ok;   // within grace — let the spline keep trying
+                return Result::Ok;   // within grace â let the spline keep trying
             // Stalled >3s within 4y: reset the clock and FALL THROUGH to re-issue.
             pr.x = p_->GetPositionX(); pr.y = p_->GetPositionY(); pr.ms = now_probe;
         }
     }
     // Record the goal we're (re)computing toward, so the next same-goal emit while
     // the resulting WAYPOINT spline is still running is skipped above. Harmless
-    // for MovePoint/Locked outcomes — the WAYPOINT-type check gates the skip.
+    // for MovePoint/Locked outcomes â the WAYPOINT-type check gates the skip.
     g_movePathGoal[p_->GetGUID().GetCounter()] = move_goal_key;
 
     // A goal asked for over and over while the bot does not move is dropped (NoMotionGuard): the destination is suppressed like a
@@ -1346,7 +1347,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     }
 
     // Per-world-tick pathfinding budget. Once this tick's bot-pathfinding window
-    // is spent (set by DrainIntents), DEFER this move — return Result::Locked so
+    // is spent (set by DrainIntents), DEFER this move â return Result::Locked so
     // the rule retries next tick. Bounds the aggregate Detour load per world tick
     // so a quest-funnel surge cannot flood the world thread and hang it
     // (2026-06-17). Placed after the cheap prechecks + per-dest backoff, before
@@ -1356,19 +1357,19 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
 
     // Path validation gate. TC's PointMovementGenerator silently falls back
     // to a straight-line spline when Detour returns PATHFIND_NOPATH /
-    // PATHFIND_FARFROMPOLY_START — that's the root cause of "bot walks
+    // PATHFIND_FARFROMPOLY_START â that's the root cause of "bot walks
     // into walls / stairs / off cliffs" reports. We build the same path
     // PointMovementGenerator would build and inspect the result before
     // committing to the move:
-    //   * NOPATH                → refuse; rule retries another target
-    //   * FARFROMPOLY_START     → NearTeleport onto nearest mesh poly
+    //   * NOPATH                â refuse; rule retries another target
+    //   * FARFROMPOLY_START     â NearTeleport onto nearest mesh poly
     //                              first, then proceed (the next emit
     //                              after the snap will succeed)
-    //   * FARFROMPOLY_END       → refuse; the destination is off-mesh
+    //   * FARFROMPOLY_END       â refuse; the destination is off-mesh
     //                              (cliff edge / inside geometry / etc)
-    //   * SHORT / INCOMPLETE    → walk the partial path; rule re-fires
+    //   * SHORT / INCOMPLETE    â walk the partial path; rule re-fires
     //                              next tick to extend
-    //   * NORMAL / SHORTCUT     → proceed (SHORTCUT is intentional for
+    //   * NORMAL / SHORTCUT     â proceed (SHORTCUT is intentional for
     //                              swimming / falling cases)
     PathGenerator path(p_);
     // Road-aware per-pathfind opt-out heuristic. Disable road bias for
@@ -1380,7 +1381,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Threshold: 25y. Anything shorter is treated as tactical; longer
     // is treated as travel where road preference helps.
     //
-    // Also disable for bots already in combat — even long retreats /
+    // Also disable for bots already in combat â even long retreats /
     // kiting / reposition steps shouldn't detour for roads.
     {
         float dx = p_->GetPositionX() - x;
@@ -1393,17 +1394,17 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Defensive SEH wrap around CalculatePath. Detour's dtNavMeshQuery
     // can ACCESS_VIOLATION when a navmesh tile gets unloaded mid-query
     // (e.g., grid stream-out during the path build). Crash 2026-05-13
-    // 06:44 hit getPathToNode+80 with RAX=0 — null poly deref. We can't
+    // 06:44 hit getPathToNode+80 with RAX=0 â null poly deref. We can't
     // catch AV via try/catch under /EHsc; SEH is the only option. The
     // helper lives outside this scope so no objects with destructors
     // straddle the __try (PathGenerator's destructor lands after this).
     bool path_ok = SehSafeCalculatePath(path, x, y, z);
     PathType pt = path.GetPathType();
-    // Outcome enum mirrors PerfCounters::PathOutcome — order:
+    // Outcome enum mirrors PerfCounters::PathOutcome â order:
     // 0=Ok, 1=NoPath, 2=FarFromPolyStart, 3=FarFromPolyEnd, 4=Incomplete, 5=Short.
     // Per-failure diagnostic. We already counter-aggregate via
     // OnPathOutcome, but the aggregate doesn't tell us WHERE the bot
-    // was when the path failed — needed to diagnose water/swim
+    // was when the path failed â needed to diagnose water/swim
     // pathing without manually positioning a bot. Logs bot name,
     // current position, target position, water flag at both ends,
     // and the outcome. Only fires on FAILURE outcomes so the success
@@ -1413,7 +1414,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         Map* mm = p_->GetMap();
         bool src_water = false;
         // Classify the destination through the shared water gate so the
-        // diagnostic shows WADE / SWIM / HAZARD, not just a water bool —
+        // diagnostic shows WADE / SWIM / HAZARD, not just a water bool â
         // this is what distinguishes "pier path failed over shallow water
         // (data/navmesh problem)" from "destination is genuinely in deep
         // water (correctly refused)". Same per-point + depth model the gate
@@ -1435,7 +1436,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         }
         // Endpoint-resolution introspection: query the SAME navmesh the
         // server uses to see whether src/dst polys resolve and whether
-        // their tiles are loaded — distinguishes "tile not loaded" from
+        // their tiles are loaded â distinguishes "tile not loaded" from
         // "poly out of vertical extents" from "filter excluded".
         char ep_diag[128] = "";
         if (Map* mdiag = p_->GetMap())
@@ -1451,11 +1452,11 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 float ext[3] = {3.0f, 5.0f, 3.0f};
                 // SEH-guarded probes (SehSafeNearestPolyProbe): the raw
                 // findNearestPoly here crashed the world thread twice in
-                // minutes on 2026-06-12 (boot-time mass logins → max
-                // path-fail rate → probe hit a tile mid-load; full WER
+                // minutes on 2026-06-12 (boot-time mass logins â max
+                // path-fail rate â probe hit a tile mid-load; full WER
                 // dumps show dtVlerp/closestPointOnDetailEdges reading
                 // bad detail data). Same hazard CalculatePath learned on
-                // 2026-05-13 — the diag block shipped without the guard.
+                // 2026-05-13 â the diag block shipped without the guard.
                 auto test = [&](float tx, float ty, float tz) -> int
                 {
                     float pt[3] = {ty, tz, tx};  // TC->Detour (y,z,x)
@@ -1490,7 +1491,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // Dest-Z mesh-snap RETRY. Stepped/projected waypoints carry the
         // BOT's z; when the true surface lies far below or above (a step
         // bearing crossing a river gorge under a bluff, an elevated
-        // anchor over ground), findNearestPoly's ±5y vertical extents
+        // anchor over ground), findNearestPoly's Â±5y vertical extents
         // miss every poly and CalculatePath returns NOPATH even though
         // the mesh connects (proven with mmap_probe on Somi's Razor Hill
         // wedge: the exact failing pairs return PARTIAL once the dest z
@@ -1518,7 +1519,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             // Midpoint-bisection rescue. NOPATH|SHORTCUT with BOTH
             // endpoint polys resolvable (Somi's UC lobby walk: a clean
             // 71-poly corridor that the standalone probe routes, but the
-            // live BuildPointPath collapses on — core findStraightPath
+            // live BuildPointPath collapses on â core findStraightPath
             // edge case). Halving the request converges past whatever
             // segment poisons the long call; the rule re-fires next tick
             // from the midpoint and bisects again if needed.
@@ -1543,8 +1544,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                         // FARFROMPOLY_END even though the corridor built
                         // perfectly (observed: 71-point path to z-42.5
                         // refused because the request said z2.5). Walk to
-                        // the path's ACTUAL reachable end — that's the
-                        // progress we wanted — and clear the far-end bit.
+                        // the path's ACTUAL reachable end â that's the
+                        // progress we wanted â and clear the far-end bit.
                         G3D::Vector3 const& bend = path.GetActualEndPosition();
                         x = bend.x; y = bend.y; z = bend.z;
                         pt = PathType(pt & ~PATHFIND_FARFROMPOLY_END);
@@ -1559,21 +1560,21 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // Water-stuck EXIT recovery. A bot that swam / fell into a canal, lake or
         // harbour can sit on a liquid poly cluster the navmesh won't route OUT of
         // toward a dry goal (Detour NoPath) even though a DESIGNED exit (bank
-        // steps / ramp) is only yards away — observed: Tindle wedged in the
+        // steps / ramp) is only yards away â observed: Tindle wedged in the
         // Stormwind canal for HOURS while a valid 11-leg travel route to its quest
         // existed, unreachable solely because it could not leave the water.
         // Crawling straight at the far goal is WRONG (it scales the canal WALL);
         // the canal HAS exits, so navigate to the nearest one. NearestNavPoint's
         // filter is GROUND|GROUND_STEEP|ROAD and EXCLUDES water, so it returns the
-        // nearest DRY footing — the real bank/stairs exit — within the search box.
+        // nearest DRY footing â the real bank/stairs exit â within the search box.
         // Swim STRAIGHT there (generatePath=false: the span to the nearest bank is
         // open water, no obstacle); once on dry mesh the next emit pathfinds to the
         // goal normally. Only fires while actually in water (a legitimate swim has
         // path_ok=true, not NoPath), and the 60y extent bounds it to a local exit,
         // never long-haul routing.
         // Liquid at the bot's CURRENT spot. Use Map::GetLiquidStatus (ANY liquid
-        // present, any depth) — the SAME check that sets the [path_fail] "WATER"
-        // flag — NOT p_->IsInWater() (false unless submerged) and NOT
+        // present, any depth) â the SAME check that sets the [path_fail] "WATER"
+        // flag â NOT p_->IsInWater() (false unless submerged) and NOT
         // ClassifyDestinationLiquid at the bot's feet (returns Dry when the bot
         // stands on the canal BOTTOM with no liquid above its own z). The bot is
         // plainly in the canal but those two report false, which is why the exit
@@ -1593,7 +1594,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             const float exdz = navpt ? exit_pt.GetPositionZ() - p_->GetPositionZ() : 0.f;
             const float exd2 = exdx * exdx + exdy * exdy + exdz * exdz;
             // DIAG (throttled 5s/bot): the [water_exit] recovery never logged across
-            // builds — show which gate fails (liquid? navpoint? distance?).
+            // builds â show which gate fails (liquid? navpoint? distance?).
             {
                 static std::unordered_map<uint64, uint32> s_weAt;
                 uint32& weat = s_weAt[p_->GetGUID().GetCounter()];
@@ -1628,7 +1629,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 return Result::Ok;
             }
         }
-        // Navmesh has no route — but the .map heightfield may still have
+        // Navmesh has no route â but the .map heightfield may still have
         // walkable ground here (a gen-time hole under tree canopy / on a
         // walkway). Try a guarded terrain-skim across a short, near-level gap
         // before giving up. Fixes e.g. the Teldrassil holes that trap Night
@@ -1641,7 +1642,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             TC_LOG_INFO("playerbot.v2", "[gap1] {} REFUSE NoPath pos=({:.1f},{:.1f}) "
                 "dst=({:.1f},{:.1f},{:.1f})", p_->GetName(), p_->GetPositionX(),
                 p_->GetPositionY(), x, y, z);
-        Playerbot::Hooks::OnPathOutcome(1 /*NoPath*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(1 /*NoPath*/);
         log_path_fail("NoPath");
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
@@ -1657,10 +1658,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
              TryBgDescentCrawl(x, y, z, run)) ||
             TryTerrainWalkFallback(x, y, z, run))
             return Result::Ok;
-        Playerbot::Hooks::OnPathOutcome(3 /*FarFromPolyEnd*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
         log_path_fail("FarFromPolyEnd");
         // Off-mesh destination (above terrain / inside geometry / a phantom POI
-        // Z). Permanently unreachable until the data changes — suppress long so
+        // Z). Permanently unreachable until the data changes â suppress long so
         // the bot stops oscillating toward it and goal-selection moves on.
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
@@ -1675,7 +1676,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // Bot is off-mesh at the source (standing on an unmeshed WMO platform,
         // just teleported into geometry, fell off a ledge, login spawn into a
         // wall). Prefer WALKING off it: if there's continuous walkable VMAP
-        // ground toward the target, crawl that way (no start poly needed — the
+        // ground toward the target, crawl that way (no start poly needed â the
         // skim uses GetHeight, not Detour) and let a later emit re-pathfind once
         // back on mesh. Only when no walkable line exists do we resort to the
         // teleport-snap below. This honours no-teleport-rescue: move under the
@@ -1684,13 +1685,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Ok;
         // Snap to the nearest valid poly so the next move_to emit can pathfind
         // from a real mesh point. Use the path's actual end position as a heuristic
-        // for "where Detour wishes the source had been" — this is the
+        // for "where Detour wishes the source had been" â this is the
         // closest poly Detour found from the bot's current XY.
         G3D::Vector3 const& near_poly = path.GetActualEndPosition();
         // XY bound on the snap: it exists to NUDGE the bot onto an adjacent
         // poly (unmeshed platform lip, login-into-wall), not to RELOCATE it.
         // When the whole local area is unmeshed, Detour's "closest poly" can
-        // be enormously far — observed 2026-06-12 Deephaul Ravine: bot
+        // be enormously far â observed 2026-06-12 Deephaul Ravine: bot
         // spawned in the (unmeshed) elevated start area got snapped 1.2K
         // yards outside the arena and wedged there for the whole match
         // (133 NoPath re-paths from one spot). Beyond the bound, refuse:
@@ -1706,7 +1707,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                     p_->GetName(), std::sqrt(sdx * sdx + sdy * sdy), p_->GetMapId(),
                     p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ(),
                     near_poly.x, near_poly.y, near_poly.z);
-                Playerbot::Hooks::OnPathOutcome(2 /*FarFromPolyStart*/);
+                Playerbot::V2::Module::instance().OnPathOutcome(2 /*FarFromPolyStart*/);
                 NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                              GameTime::GetGameTimeMS());
                 return Result::Locked;
@@ -1716,15 +1717,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // 20y Z-delta canary (rejects cave-roof / stratum-skip teleports
         // that the raw Player::NearTeleportTo doesn't guard against).
         // If the snap-target Z is on a different stratum than the bot's
-        // current Z, SafeNearTeleport refuses — return Locked so the
+        // current Z, SafeNearTeleport refuses â return Locked so the
         // rule can try a different target, otherwise we'd loop forever
         // on the same off-mesh source with the same refused snap.
         const bool snap_ok = BotMovement::SafeNearTeleport(
             p_, near_poly.x, near_poly.y, near_poly.z, p_->GetOrientation());
-        Playerbot::Hooks::OnPathOutcome(2 /*FarFromPolyStart*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(2 /*FarFromPolyStart*/);
         if (!snap_ok)
         {
-            // Stamp the destination as failed too — the SOURCE is off-mesh
+            // Stamp the destination as failed too â the SOURCE is off-mesh
             // for THIS target's pathfind. Different XY destinations may
             // still resolve from the same source, so the LRU's per-bucket
             // expiry lets the rule explore other directions.
@@ -1740,15 +1741,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Partial / truncated paths: Detour could not reach the requested
     // destination and returned the closest reachable endpoint instead.
     // Two very different situations share this flag:
-    //   (a) ADVANCING partial — a legitimate long-haul / chunked route
+    //   (a) ADVANCING partial â a legitimate long-haul / chunked route
     //       whose reachable endpoint is meaningfully closer to the goal.
     //       Walk it; the next emit picks up from the new pose and extends.
-    //   (b) NON-ADVANCING partial — the reachable endpoint sits ~at the
+    //   (b) NON-ADVANCING partial â the reachable endpoint sits ~at the
     //       bot (target on a disconnected nav island, a kill mob just past
     //       a closable gap, a poly the A* budget couldn't bridge). Issuing
     //       the MovePoint and returning Ok makes BotIntentExecutor call
-    //       note_move_succeeded() every tick → path_blocked_count_ resets
-    //       → check_anchor_wedge and the wander angle-salt never engage,
+    //       note_move_succeeded() every tick â path_blocked_count_ resets
+    //       â check_anchor_wedge and the wander angle-salt never engage,
     //       and the LRU never suppresses the doomed dst. The bot walks the
     //       short stub, stops, re-emits the SAME dst, and oscillates
     //       forever (project_movement_recovery / wedge reports).
@@ -1760,18 +1761,18 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Distances are 3D to match the road-bonus / swim-span gates above.
     if (pt & PATHFIND_INCOMPLETE)
     {
-        Playerbot::Hooks::OnPathOutcome(4 /*Incomplete*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(4 /*Incomplete*/);
 
         // BG start-platform / graveyard STEP-DOWN (2026-06-22, owner-directed).
         // A bot stranded on an elevated, OVERHANGING battleground platform (EotS)
         // is navmesh-disconnected from the arena floor: Detour returns an
         // Incomplete partial (sometimes "advancing" 200y, sometimes non-advancing)
-        // but the bot can't actually leave the platform — the drop to the field
+        // but the bot can't actually leave the platform â the drop to the field
         // isn't walkable. Handle it FIRST, before the advancing/non-advancing
         // split, so neither the MovePath-the-partial path (which stalls on the
         // rim) nor the local-minimum escape starves it. Relocate the bot onto the
         // field navmesh just in front of its platform (toward the objective, at
-        // field height — the elevator-disembark pattern); normal routing then
+        // field height â the elevator-disembark pattern); normal routing then
         // resumes from solid ground. Tight gate (objective >=18y BELOW the bot)
         // so it fires ONLY for a genuine platform descent, never for normal
         // near-level field movement, and BG-only / downward-only so it can never
@@ -1781,7 +1782,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Ok;
 
         // Minimum meaningful gain. Below this the partial is effectively a
-        // no-op (endpoint at, or no closer to — possibly farther from — the
+        // no-op (endpoint at, or no closer to â possibly farther from â the
         // goal). 5y is one SnapToGround bucket of slop; a genuine long route
         // chunk advances far more than this per emit.
         constexpr float kMinForwardProgressYards = 5.0f;
@@ -1808,12 +1809,12 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         {
             // FINAL-APPROACH exception (2026-06-18): when the REACHABLE endpoint
             // already lands within NPC interaction range of the requested dst, the
-            // dst is simply a few yards OFF the navmesh — a quest giver / object /
+            // dst is simply a few yards OFF the navmesh â a quest giver / object /
             // POI whose exact point doesn't snap to a walkable poly. Parking here
             // freezes the bot ~3-12y short of its goal FOREVER, which the live logs
             // show is the single biggest fleet wedge: Norenen frozen cur_to_dst=5.0
             // with the endpoint 3.3y from dst; Lorashel 12.3/11.7; Bemardel
-            // 10.0/9.6 — all stuck just outside an interactable they could reach.
+            // 10.0/9.6 â all stuck just outside an interactable they could reach.
             // Take the short final hop to the endpoint: it puts the bot within
             // interaction range so the quest/vendor/loot/gossip logic completes,
             // then the bot stops re-pathing. Bounded to end_to_dst <= 6y (the
@@ -1833,7 +1834,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             }
             // Water-stuck EXIT recovery (same as the NoPath branch). A bot in a
             // canal / harbour whose objective sits on a navmesh-DISCONNECTED dry
-            // island (a dock / pier a few yards UP — e.g. the Stormwind harbour
+            // island (a dock / pier a few yards UP â e.g. the Stormwind harbour
             // Hired Courier at z=6.2 over Tindle at the water surface z=0) reports
             // a non-advancing partial here (forward_progress~0, end_to_dst just
             // over the 6y final-approach cap), NOT NoPath, so the recovery above
@@ -1858,7 +1859,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                         const float nexdx = nexit.GetPositionX() - p_->GetPositionX();
                         const float nexdy = nexit.GetPositionY() - p_->GetPositionY();
                         const float nexdz = nexit.GetPositionZ() - p_->GetPositionZ();
-                        // 3D (incl. vertical) — the dock/pier exit can be almost
+                        // 3D (incl. vertical) â the dock/pier exit can be almost
                         // straight up (small XY, large Z); XY-only rejected it.
                         if (nexdx * nexdx + nexdy * nexdy + nexdz * nexdz > 3.0f * 3.0f)
                         {
@@ -1877,13 +1878,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 }
             }
             // NOTE (2026-06-09): a crawl-on-Incomplete fallback was tried here but
-            // ROLLED BACK — combined with the ramp-climb gate it shoved bots up onto
+            // ROLLED BACK â combined with the ramp-climb gate it shoved bots up onto
             // elevator platforms they couldn't then step off (Pyrethel/Gorois stranded
             // riding Org lift 206610). The proper elevator traversal is being designed
             // separately (travel-graph-defined post-platform step). See
             // docs/ELEVATOR_TRAVEL_HANDOVER_20260609.md.
             //
-            // Non-advancing partial — treat exactly like NoPath: stamp the
+            // Non-advancing partial â treat exactly like NoPath: stamp the
             // LRU, do NOT issue the doomed MovePoint, and return Locked so
             // BotIntentExecutor increments path_blocked_count_, logs
             // [move_blocked], and does NOT call note_move_succeeded(). That lets
@@ -1891,7 +1892,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             //
             // TTL is distance-aware. The 60s long TTL is right for a NEARBY
             // disconnected target (an island / unbridgeable poly the bot is
-            // standing next to — geometry-stable, don't re-probe). But for a FAR
+            // standing next to â geometry-stable, don't re-probe). But for a FAR
             // goal the bot is mid CHUNKED long-haul: it momentarily reads
             // non-advancing at THIS pose (budget truncation, a tile not yet
             // loaded, a poly seam) yet the route genuinely extends further (e.g.
@@ -1902,24 +1903,24 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             // retries within a tick or two and continues; keep the long TTL only
             // for a genuinely local disconnected target.
             // LOCAL-MINIMUM ESCAPE (2026-06-20). Before refusing, try to FOLLOW
-            // the partial to crawl OUT of a confined/winding spot — the only fix
+            // the partial to crawl OUT of a confined/winding spot â the only fix
             // for a bot whose route to a far goal must wind away-then-back past
             // the 74-poly cap (live: Durnan frozen 154 blocks indoors; walking the
-            // −47y partial to (-4986,-954) unlocks a +372y advancing path from
+            // â47y partial to (-4986,-954) unlocks a +372y advancing path from
             // there). Strictly gated so it can NOT re-introduce the rolled-back
             // crawl's elevator/ramp stranding or thrash a true dead-end:
-            //   * far goal mid-haul (cur_to_dst > 100y) — not a local disconnected
+            //   * far goal mid-haul (cur_to_dst > 100y) â not a local disconnected
             //     target (those keep the long-TTL refuse below);
-            //   * a real escape leg (endpoint >= 15y away) — not sub-step jitter;
-            //   * NOT climbing (endpoint z <= pose z + 8y) — a downward/level
+            //   * a real escape leg (endpoint >= 15y away) â not sub-step jitter;
+            //   * NOT climbing (endpoint z <= pose z + 8y) â a downward/level
             //     escape can't strand the bot riding a lift UP (the documented
             //     2026-06-09 rollback failure mode);
             //   * pts >= 2 so MovePath feeds real waypoints (no MotionMaster
             //     re-pathfind that degenerates to a same-poly zero-move);
             //   * anti-oscillation budget per (bot,goal): a true tiny pocket
-            //     ping-pongs without ever closing in → after kMaxEscapeCrawls
+            //     ping-pongs without ever closing in â after kMaxEscapeCrawls
             //     it falls through to the refuse and the wedge machinery engages.
-            // No extra pathfind — MovePath drives the ALREADY-COMPUTED partial,
+            // No extra pathfind â MovePath drives the ALREADY-COMPUTED partial,
             // so this adds zero world-thread CalculatePath cost.
             {
                 auto const& esc_pts = path.GetPath();
@@ -1955,14 +1956,14 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                             path_end.x, path_end.y, path_end.z, cur_to_dst);
                         return Result::Ok;
                     }
-                    // Budget exhausted — a genuine pocket / oscillation; fall through.
+                    // Budget exhausted â a genuine pocket / oscillation; fall through.
                 }
             }
             // BG boss-approach CRAWL (2026-06-23). A CLOSE goal (cur_to_dst <
             // 80y) reading non-advancing is typically an objective just OFF/below
             // the navmesh: the AV enemy captain (Galvangar/Balinda) and general
             // (Drek'Thar/Vanndar) stand inside a walled garrison/keep whose floor
-            // is not meshed — the nearest poly sits ~35y ABOVE the spawn, so the
+            // is not meshed â the nearest poly sits ~35y ABOVE the spawn, so the
             // navmesh path dead-ends ~47y out and the whole push squad freezes
             // there and never lands a hit (live: min_gd pinned at 47y for 10min,
             // 0 casts landed, captain untouched). Crawl the remaining gap across
@@ -1980,7 +1981,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                          GameTime::GetGameTimeMS(), nonadv_ttl);
             return Result::Locked;
         }
-        // Advancing partial — drive to the REACHABLE endpoint Detour found, NOT
+        // Advancing partial â drive to the REACHABLE endpoint Detour found, NOT
         // the far requested dst. Re-issuing MovePoint(far dst, generatePath) can
         // leave the bot FROZEN: when the dst's navmesh tile isn't loaded (e.g. a
         // 676y cross-zone quest goal), the MotionMaster's OWN path resolves the
@@ -1988,24 +1989,24 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // (live: Gorthak wedged 9min at the Valley of Trials exit on quest 25133
         // "Report to Sen'jin Village", srcpoly==dstpoly, forward_progress=254y but
         // never a step taken). The API already computed the reachable endpoint;
-        // MovePoint to THAT — it sits on a loaded poly so the MotionMaster paths
+        // MovePoint to THAT â it sits on a loaded poly so the MotionMaster paths
         // cleanly and the bot actually moves. The next emit re-paths from the
         // advanced pose and extends toward the goal, pulling in the next navmesh
-        // tile as the bot crosses the boundary — proper chunked long-haul. This
-        // is the documented "advancing partial — walk it" behavior, made real.
+        // tile as the bot crosses the boundary â proper chunked long-haul. This
+        // is the documented "advancing partial â walk it" behavior, made real.
         {
             // Drive the API's ALREADY-COMPUTED path points via MovePath rather than
             // MovePoint(actual_end, generatePath=true). MovePoint makes the
             // MotionMaster RE-pathfind to the endpoint, and on a truncated long-haul
             // (pts hit the cap) that endpoint sits on a poly/tile seam where the MM's
-            // own pathfind degenerates to a same-poly route and emits ZERO movement —
+            // own pathfind degenerates to a same-poly route and emits ZERO movement â
             // the bot freezes mid-route despite a 230y advancing partial (live:
             // Gorthak/Grimfang frozen at the Valley of Trials exit on Q25133
             // "Report to Sen'jin", Incomplete forward_progress=230y, never a step).
             // MovePath feeds the validated smooth points straight to the waypoint
             // generator (which still navmesh-paths the short hops BETWEEN adjacent
             // points), so the bot actually walks the chunk; the next emit re-paths
-            // from the advanced pose and extends — proper chunked long-haul. Same
+            // from the advanced pose and extends â proper chunked long-haul. Same
             // mechanism the road-centerline branch above already uses successfully.
             auto const& pts = path.GetPath();
             if (!Playerbot::BotMovement::AllowPartialRoute(g_route_stall[p_->GetGUID().GetCounter()],
@@ -2041,7 +2042,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                         : MovementWalkRunSpeedSelectionMode::ForceWalk);
                 return Result::Ok;
             }
-            // Degenerate path (single point) — fall back to the endpoint MovePoint.
+            // Degenerate path (single point) â fall back to the endpoint MovePoint.
             G3D::Vector3 const& adv_end = path.GetActualEndPosition();
             if (p_->IsWalking() == run)
                 p_->SetWalk(!run);
@@ -2052,7 +2053,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     }
     else if (pt & PATHFIND_SHORT)
     {
-        Playerbot::Hooks::OnPathOutcome(5 /*Short*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(5 /*Short*/);
         log_path_fail("Short");
         // A SHORT result discards the real corridor and returns a blind straight
         // 2-point shortcut (the route exceeded the 74-poly/point cap), which walks
@@ -2061,9 +2062,9 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // re-path to the MIDPOINT (mirrors the NoPath bisection above) so the
         // shorter corridor fits the cap and yields a REAL navmesh route; we then
         // MovePath to that reachable end and re-path from the advanced pose next
-        // emit — proper chunked long-haul. Only for a far goal (a near SHORT span
+        // emit â proper chunked long-haul. Only for a far goal (a near SHORT span
         // is open ground and fine to cross straight). One extra CalculatePath, and
-        // only on SHORT (rare) — within the already-checked per-tick path budget.
+        // only on SHORT (rare) â within the already-checked per-tick path budget.
         if (Map* mmS = p_->GetMap())
         {
             const float sdx = x - p_->GetPositionX();
@@ -2103,19 +2104,19 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         }
     }
     else
-        Playerbot::Hooks::OnPathOutcome(0 /*Ok*/);
+        Playerbot::V2::Module::instance().OnPathOutcome(0 /*Ok*/);
 
     // Liquid safety gate. Classifies the destination POINT (not the tile/chunk
-    // — a chunk is routinely half-water / half-dry) through the shared
+    // â a chunk is routinely half-water / half-dry) through the shared
     // BotMovement water gate, which probes Map::GetLiquidStatus at (x,y,z) with
     // the bot's REAL collision height (floored at DEFAULT_COLLISION_HEIGHT).
     // Two refuse cases, both conservative:
-    //   * Hazard (magma / slime) — bot burns to death on contact.
-    //   * Swim (fully submerged for THIS bot) — a non-aquatic bot drowns and
+    //   * Hazard (magma / slime) â bot burns to death on contact.
+    //   * Swim (fully submerged for THIS bot) â a non-aquatic bot drowns and
     //     the navmesh ends at the surface, so no walkable path exists below.
     //
     // Wadeable depth is ALLOWED for all bots. Shoreline hubs (Ratchet, Booty
-    // Bay, Echo Isles' Den, etc.) sit half-in-water — a bot approaching along a
+    // Bay, Echo Isles' Den, etc.) sit half-in-water â a bot approaching along a
     // curved shore momentarily clips the surface; blocking that caused wander
     // to oscillate and starter-zone bots to make zero progress. The collision-
     // height floor guarantees this gate is never more restrictive than the
@@ -2130,16 +2131,16 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         BotMovement::LiquidVerdict const lv =
             BotMovement::ClassifyDestinationLiquid(p_, x, y, z);
 
-        // Hazard (magma / slime) is always refused — the bot burns to death
+        // Hazard (magma / slime) is always refused â the bot burns to death
         // on contact regardless of distance or breath.
         if (lv == BotMovement::LiquidVerdict::Hazard)
         {
-            // Treat as unreachable — wander angle hash picks a different
+            // Treat as unreachable â wander angle hash picks a different
             // direction next emit. Stamp the LRU so a wander loop that hashes
             // the same 5y bucket doesn't re-pay the full Detour + liquid probe
             // every tick; hazard polygons are terrain-stable so the 3s TTL is
             // plenty for wander to rotate through.
-            Playerbot::Hooks::OnPathOutcome(3 /*FarFromPolyEnd*/);
+            Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
             log_path_fail("Magma");
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                          GameTime::GetGameTimeMS());
@@ -2152,14 +2153,14 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         if (BotMovement::g_LiquidPathPolicy && path_ok && !(pt & PATHFIND_NOPATH) && path.IsWetRoute()
             && BotMovement::DecideLiquid(BotMovement::g_LiquidPathPolicy(p_), /*path_wet*/ true, /*dry_found*/ false) == BotMovement::LiquidAction::Refuse)
         {
-            Playerbot::Hooks::OnPathOutcome(3 /*FarFromPolyEnd*/);
+            Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
             log_path_fail("Liquid");
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS());
             return Result::Locked;
         }
 
         // Swim (destination submerges this bot) used to be refused outright,
-        // which meant bots could never cross ANY water — a pond, a stream, a
+        // which meant bots could never cross ANY water â a pond, a stream, a
         // shallow lagoon between two quest hubs all read as Swim at the far
         // bank and the move was rejected. Real players swim short stretches;
         // they just don't path across oceans. So: PERMIT a short swim that
@@ -2172,7 +2173,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         // bot can breathe underwater indefinitely (water-breathing aura, GM
         // breath-disable, or dead/ghost). We assume full breath here because
         // the bot is at the START of the crossing (move_to is the entry to a
-        // swim, not a mid-swim re-emit) — a conservative assumption that only
+        // swim, not a mid-swim re-emit) â a conservative assumption that only
         // becomes MORE permissive when the bot actually still has full air.
         //
         // Budget: require the estimated swim duration to stay under a fraction
@@ -2188,7 +2189,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             constexpr float kBreathSafety = 0.5f;
             // Hard span cap independent of breath, so an indefinite-breather
             // (water-walking / aquatic mount) still can't be routed straight
-            // across an ocean by this gate — long-haul water travel belongs to
+            // across an ocean by this gate â long-haul water travel belongs to
             // the higher routing layer, not a single MovePoint emit.
             constexpr float kMaxSwimSpanYards = 60.0f;
 
@@ -2200,7 +2201,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             // The breath timer (getMaxTimer) is a protected Player member we
             // can't read from here. We don't need it: the hard span cap is the
             // real guard. A <=60y crossing at normal swim speed takes only a
-            // few seconds — far inside the shortest breath bar (~1 min) — so
+            // few seconds â far inside the shortest breath bar (~1 min) â so
             // any crossing that passes the span cap is breath-safe by
             // construction. kBreathSafety is retained only as documentation of
             // the margin the cap implies.
@@ -2209,15 +2210,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
 
             if (!allow_swim)
             {
-                // Genuinely long / unbreathable deep-water span — refuse as
+                // Genuinely long / unbreathable deep-water span â refuse as
                 // before. Stamp the LRU so wander doesn't re-probe every tick.
-                Playerbot::Hooks::OnPathOutcome(3 /*FarFromPolyEnd*/);
+                Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
                 log_path_fail("Submerged");
                 NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                              GameTime::GetGameTimeMS());
                 return Result::Locked;
             }
-            // Short crossing within breath budget — fall through and let the
+            // Short crossing within breath budget â fall through and let the
             // MovePoint below issue the swim spline. PathGenerator already
             // returned a NORMAL/SHORTCUT path (we're past the NOPATH gate), so
             // Detour found a route across; we are only relaxing the *policy*
@@ -2230,14 +2231,14 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // as a waypoint spline instead of beelining. WaypointMovementGenerator still
     // navmesh-paths BETWEEN nodes (generatePath defaults true), so the authored
     // nodes act as guide points that pull the route onto the road while Detour
-    // handles fine pathing — and those sub-paths keep the NAV_AREA_ROAD bias.
+    // handles fine pathing â and those sub-paths keep the NAV_AREA_ROAD bias.
     // Skipped in combat and while flying; the area-cost bias remains the fallback.
     if (!p_->IsInCombat() && !p_->IsFlying())
     {
         std::vector<Position> roadWps;
         bool roadOk = sHandcraftedRoadGraph->ComputeRoute(p_->GetMap(), p_->GetPhaseShift(),
                 p_->GetPosition(), Position(x, y, z, 0.0f), roadWps) && roadWps.size() >= 2;
-        // Reject a road route whose FIRST waypoint heads AWAY from the goal — the
+        // Reject a road route whose FIRST waypoint heads AWAY from the goal â the
         // nearest road entry node can sit BEHIND the bot (e.g. back inside the Orc
         // Valley of Trials), so MovePathing it makes the bot backtrack onto the
         // road and oscillate at the exit chokepoint instead of leaving (live:
@@ -2252,7 +2253,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             float const w2g = std::sqrt(
                 (x - roadWps[0].GetPositionX()) * (x - roadWps[0].GetPositionX()) +
                 (y - roadWps[0].GetPositionY()) * (y - roadWps[0].GetPositionY()));
-            if (w2g > b2g + 15.0f)   // first road node is a >15y backtrack — skip the road
+            if (w2g > b2g + 15.0f)   // first road node is a >15y backtrack â skip the road
                 roadOk = false;
         }
         if (roadOk)
@@ -2281,22 +2282,22 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // state a previous immersive-RP toggle / /walk command left behind,
     // and a "run to quest hub" emit becomes a leisurely 2.5y/s stroll.
     // Mirrors the SetWalk pattern used by FollowMovementGenerator (target's
-    // IsWalking → bot follows with same speed mode).
+    // IsWalking â bot follows with same speed mode).
     if (p_->IsWalking() == run)
         p_->SetWalk(!run);
 
     // Complete path: out of combat, drive the API's computed points via MovePath
-    // for the SAME reason as the advancing-partial branch — MovePoint(x,y,z,
+    // for the SAME reason as the advancing-partial branch â MovePoint(x,y,z,
     // generatePath=true) lets the MotionMaster RE-pathfind the dst and can resolve
     // it to a degenerate same-poly route (zero movement) on certain seams, even
     // when the API found a full path (live: Grimfang frozen at the Valley exit
-    // pursuing a 160y COMPLETE-path goal, no path_fail, never a step — while
+    // pursuing a 160y COMPLETE-path goal, no path_fail, never a step â while
     // Gorthak on the Incomplete branch was already unstuck by the MovePath fix).
     // GATED to !combat && !flying (mirrors the road-centerline branch) so chase /
     // flight movement keeps the established MovePoint behavior; this only changes
     // out-of-combat travel, where the degenerate-freeze wedge actually happens.
     //
-    // EXCEPTION — short approach over an OFF-MESH bridge in an instance (in-BG
+    // EXCEPTION â short approach over an OFF-MESH bridge in an instance (in-BG
     // 2026-06-23; broadened to dungeon/raid 2026-06-25). On a complete path that
     // crosses an off-mesh connection (AV captain garrison / cave-den bridges, and
     // the Deadmines foundry Gap-1 bridge), MovePath re-pathfinds BETWEEN its
@@ -2308,7 +2309,7 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // connections natively (Movement/PathGenerator.cpp getOffMeshConnectionPoly-
     // EndPoints). Scoped to a SHORT (<80y) in-instance approach so it can't reach
     // the FAR cross-tile MovePoint degenerate-freeze (Grimfang, ~160y) the MovePath
-    // branch exists to dodge — at <80y inside a loaded instance the dst poly is
+    // branch exists to dodge â at <80y inside a loaded instance the dst poly is
     // local, so MovePoint resolves a real spline.
     const float bg_cdx = x - p_->GetPositionX();
     const float bg_cdy = y - p_->GetPositionY();
@@ -2367,21 +2368,21 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
     // Per-emit skim cap. This bridges navmesh HOLES (canopy/walkway occlusion
     // during gen, elevated WMO platforms Recast skipped, bridges) where VMAP
     // collision EXISTS but no navmesh poly does. We no longer REFUSE a target
-    // beyond this range — instead we crawl toward it one capped segment per
+    // beyond this range â instead we crawl toward it one capped segment per
     // emit and let the next tick (re-issued from the advanced pose) continue,
     // so the bot "walks forward bit by bit" across an arbitrarily large
     // continuous walkable surface (e.g. the 73y Orgrimmar zeppelin-tower
     // platform that has collision but no mesh). Each segment is still validated
     // step-by-step below, so the crawl STOPS the instant the line hits a wall,
-    // ledge, void, or hazard — it never walks the bot off an edge or through
+    // ledge, void, or hazard â it never walks the bot off an edge or through
     // geometry. Long-range ROUTING still belongs to the pathfinder/travel graph;
     // this only takes over once Detour has already returned NoPath/FarFromPoly.
     constexpr float kFallbackRange = 40.0f;
     // Max ground-height delta between consecutive samples. Above this we're at
-    // a cliff edge / wall face / steep ramp, NOT a flat hole — refuse so we
+    // a cliff edge / wall face / steep ramp, NOT a flat hole â refuse so we
     // never walk off a ledge, through a wall, or down a fall.
     // NOTE (2026-06-09): a 5y asymmetric (up) variant was tried to climb the Org
-    // lift RAMP but ROLLED BACK — it let bots climb onto elevator platforms they
+    // lift RAMP but ROLLED BACK â it let bots climb onto elevator platforms they
     // then couldn't step off. Elevator ramp/platform traversal is being designed
     // properly (travel-graph-defined). See docs/ELEVATOR_TRAVEL_HANDOVER_20260609.md.
     constexpr float kStepClimb = 3.0f;
@@ -2397,7 +2398,7 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
     constexpr float kSampleStep = 4.0f;
 
     // Upper sanity bound on the TARGET distance. The crawl bridges LOCAL holes
-    // (platforms, bridges, mesh gaps) — it must never become long-haul routing
+    // (platforms, bridges, mesh gaps) â it must never become long-haul routing
     // across the open world toward a far target Detour wrongly NoPath'd over flat
     // terrain. Beyond this the travel graph / taxi own the trip; refuse so the
     // bot gives up (NotePathFail) and re-routes instead of wandering. 150y
@@ -2405,15 +2406,15 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
     constexpr float kMaxCrawlTarget = 150.0f;
     // BG start-platform / graveyard DESCENT (2026-06-22, owner-directed). In a
     // battleground a bot only ever moves DOWN off an elevated start or respawn
-    // platform — never UP — so the elevator-stranding failure that retired the
+    // platform â never UP â so the elevator-stranding failure that retired the
     // general crawl-on-Incomplete (see the move_to non-advancing branch) cannot
     // occur here. Two BG-only relaxations let the crawl carry a bot down the
     // unmeshed descent ramp onto the arena floor (where navmesh routing resumes):
-    //   * lift the local-hole TARGET cap — the descent's true goal is a far
+    //   * lift the local-hole TARGET cap â the descent's true goal is a far
     //     objective (an EotS tower ~250y across the arena). Terrain-walk only
     //     engages where Detour already FAILED (the disconnected platform edge);
     //     the field below is meshed, so a far target can't degenerate this into
-    //     open-world long-haul — the crawl ends the instant the bot lands on a
+    //     open-world long-haul â the crawl ends the instant the bot lands on a
     //     navmesh poly and the next emit re-paths normally.
     //   * allow a larger DOWNWARD step (applied at the per-sample gate below);
     //     UP steps keep the tight 3y limit so nothing climbs onto geometry.
@@ -2448,7 +2449,7 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
     }
 
     // Aim at the destination directly when it's within one segment, otherwise at
-    // an intermediate point kFallbackRange along the line — the next emit picks
+    // an intermediate point kFallbackRange along the line â the next emit picks
     // up the remainder. The per-step validation is identical either way.
     const float reach = std::min(dist, kFallbackRange);
     const float tgtX  = sx + (dx / dist) * reach;
@@ -2467,13 +2468,13 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
         float const g = mm->GetHeight(p_->GetPhaseShift(), px, py, prevZ + 5.0f, /*vmap*/ true);
         if (g <= INVALID_HEIGHT)
         {
-            tw_log("refuse:void", px, py, g);              // genuine void — nothing to walk on
+            tw_log("refuse:void", px, py, g);              // genuine void â nothing to walk on
             return false;
         }
         // Cliff/wall/drop guard. UP steps always use the tight kStepClimb (3y)
         // so nothing climbs onto a ledge/elevator. DOWN steps are relaxed in a
         // BG (bg_descent): a bot leaving its start/respawn platform may need to
-        // walk a steep ramp — or take a short controlled drop — onto the arena
+        // walk a steep ramp â or take a short controlled drop â onto the arena
         // floor, and it can only ever go DOWN there, so a steeper descent can't
         // strand it. The void + hazard checks below still apply, so it never
         // crawls into nothing or into magma/deep water.
@@ -2512,12 +2513,12 @@ bool API::TryTerrainWalkFallback(float x, float y, float z, bool run)
 // BG start-platform / graveyard STEP-DOWN (2026-06-22, owner-directed).
 // The EotS start platforms OVERHANG the arena: the platform edge toward the
 // objective has only void below it (GetHeight returns nothing within range), and
-// no continuous walkable ramp exists for a crawl to follow — players reach the
+// no continuous walkable ramp exists for a crawl to follow â players reach the
 // field by dropping off a designed exit, not by walking. Trying to crawl the
 // descent is the wrong model. Instead, do exactly what the elevator-disembark
 // does: find the FIELD navmesh poly in front of the platform (toward the
 // objective, at the objective's field height) and relocate the bot onto it, then
-// let normal navmesh routing take over. This is a SHORT, designed platform→field
+// let normal navmesh routing take over. This is a SHORT, designed platformâfield
 // step (the BG's intended start), not a long-distance stuck-rescue, and it only
 // ever moves the bot DOWN onto the arena floor it is trying to reach.
 bool API::TryBgDescentCrawl(float x, float y, float z, bool run)
@@ -2587,7 +2588,7 @@ Result API::stop_movement(bool clear_generators)
         return Result::Ok;
     }
     // A taxi flight owns the FLIGHT generator and IS the bot's intended
-    // movement — never tear it down here (the caller wants stale movers gone,
+    // movement â never tear it down here (the caller wants stale movers gone,
     // not a legitimate flight cancelled mid-air).
     if (p_->IsInFlight())
         return Result::Ok;
@@ -2613,8 +2614,8 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     if (tu == p_) return Result::InvalidTarget;
     if (!tu->IsAlive()) return Result::InvalidTarget;
 
-    // Friendly-fire gate. Unit::Attack() itself never validates hostility —
-    // it happily arms the swing timer against a groupmate — and the spell
+    // Friendly-fire gate. Unit::Attack() itself never validates hostility â
+    // it happily arms the swing timer against a groupmate â and the spell
     // engine only rejects at cast time (BAD_TARGETS), so a friendly victim
     // WEDGES: the bot keeps swinging air, member.victim publishes the
     // friendly guid, and group assist copies it fleet-wide (2026-06-11
@@ -2642,12 +2643,12 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     // auto-repeat ranged spell) the moment they engage; the server then
     // re-fires it from Unit::_UpdateAutoRepeatSpell entirely server-side.
     // Bots have no client, and Player::Attack(melee=true) only arms the
-    // MELEE swing timer — so until 2026-06-10 every hunter bot did ZERO
+    // MELEE swing timer â so until 2026-06-10 every hunter bot did ZERO
     // ranged auto-attack damage (verified live: Uraimus L13 BM, white
     // damage absent between Steady Shots). Start the auto-repeat here,
     // both on fresh engages and on the idempotent re-engage path (the
     // core cancels CURRENT_AUTOREPEAT_SPELL when a CheckCast fails, e.g.
-    // a brief LOS break — re-arming on the next engage tick restores it).
+    // a brief LOS break â re-arming on the next engage tick restores it).
     // Spell 75 is special-cased in _UpdateAutoRepeatSpell to coexist with
     // hard casts (Steady Shot) and movement, matching retail behavior.
     // Raid school rule (bot module PveOrder::SchoolHint): physical avoided on
@@ -2683,22 +2684,22 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
 
     // Idempotency fast-path: if we are already attacking this exact target,
     // do not re-call Attack or re-init MoveChase. Both have visible side
-    // effects every tick — MoveChase resets the chase generator, clearing
+    // effects every tick â MoveChase resets the chase generator, clearing
     // the spline and forcing a path recalc. Calling it every tick (which
     // the AI does as long as the engage rule keeps firing on the same
     // victim) produces the visible "stutter": bot stops, plans, takes one
     // step, stops again. Detect the no-op case and return Ok.
     // Mirror what a player click does: keep the selection in sync with the
     // victim. NOTE: Player::SetTarget is an EMPTY override ("does not apply
-    // to players") — selection is normally client-driven via
-    // CMSG_SET_SELECTION → SetSelection. Headless bots never send that
+    // to players") â selection is normally client-driven via
+    // CMSG_SET_SELECTION â SetSelection. Headless bots never send that
     // packet, so until 2026-06-11 UNIT_FIELD_TARGET stayed permanently
     // empty on every bot: other players selecting a bot saw no
     // target-of-target frame, and anything else reading the field
     // (assist macros, UnitIsUnit comparisons client-side) misbehaved.
     // MUST run BEFORE the idempotency fast-path: a victim acquired through
     // any other route (Charge-style attack spells, core melee engage)
-    // means every subsequent engage tick takes the early return — with the
+    // means every subsequent engage tick takes the early return â with the
     // selection-set below it, UNIT_FIELD_TARGET never caught up (user
     // re-report 2026-06-11 Stockades).
     if (p_->GetTarget() != tu->GetGUID())
@@ -2706,14 +2707,14 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
 
     // Idempotency fast-path: if we are already attacking this exact target,
     // do not re-call Attack or re-init MoveChase. Both have visible side
-    // effects every tick — MoveChase resets the chase generator, clearing
+    // effects every tick â MoveChase resets the chase generator, clearing
     // the spline and forcing a path recalc. Calling it every tick (which
     // the AI does as long as the engage rule keeps firing on the same
     // victim) produces the visible "stutter": bot stops, plans, takes one
     // step, stops again. Detect the no-op case and return Ok.
     // Ranged-spec hunters with a usable ranged weapon engage RANGED-only:
     // Attack(melee=true) arms the melee swing timer, and TC happily swings
-    // it whenever the victim stands in reach — so in tight corridors
+    // it whenever the victim stands in reach â so in tight corridors
     // (Stockades, user report 2026-06-11) the hunter PUNCHED mobs between
     // shots. Modern hunters have no minimum range and never melee outside
     // Survival; meleeAttack=false still sets the victim/combat state while
@@ -2742,7 +2743,7 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     }
 
     // Face the target. WoW's spell engine rejects casts that aren't in
-    // the caster's front arc (HasInArc(M_PI, target) ~= ±90° cone). Without
+    // the caster's front arc (HasInArc(M_PI, target) ~= Â±90Â° cone). Without
     // an explicit orientation update the bot may have last faced its
     // previous travel waypoint or last npc dialog, causing every cast
     // to fail with SpellCastResult=126 (NOT_INFRONT) until MotionMaster
@@ -2771,13 +2772,13 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     // Real Players chase the target via client input; an AI-driven bot Player
     // has no client and Player::Attack alone doesn't move them. Without an
     // explicit MoveChase the bot just stands at whatever range the engage
-    // rule spotted them — typically 30–40y — which breaks both melee
+    // rule spotted them â typically 30â40y â which breaks both melee
     // (no swings, no combat ignites) and casters (cast fails OOR / LOS).
     //
     // Class-aware chase distance: melee classes close to weapon range; pure
     // ranged classes stop at ~25y so they have a clean window for hard-cast
     // openers (Frostbolt / Shadow Bolt / Steady Shot all 30y range).
-    // Hybrids (Druid/Shaman/Evoker) default to melee here — their caster
+    // Hybrids (Druid/Shaman/Evoker) default to melee here â their caster
     // specs will switch to a ranged stance via the APL once it picks up,
     // and melee specs stay engaged.
     bool is_pure_caster = false;
@@ -2791,7 +2792,7 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
             break;
         case CLASS_HUNTER:
             // BM / MM are ranged-only since the BfA artifact removal, but
-            // SURVIVAL has been a melee spec since Legion — parking an SV
+            // SURVIVAL has been a melee spec since Legion â parking an SV
             // bot at 28y makes every Raptor Strike / Mongoose Bite fail
             // OOR and leaves only Auto Shot-less wand-range idling. Spec
             // check instead of class check; pre-L10 (spec None) hunters
@@ -2800,11 +2801,11 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
                 ::Playerbot::Classic::EffectiveSpecId(p_) != uint32(ChrSpecialization::HunterSurvival);
             break;
         case CLASS_EVOKER:
-            // Evoker is pure-caster like Mage/Hunter (no melee spec —
+            // Evoker is pure-caster like Mage/Hunter (no melee spec â
             // Devastation/Augmentation/Preservation are all caster) BUT
             // baseline range is only 25y (Living Flame, Disintegrate,
             // Azure Strike). The 28y max used for the other casters
-            // would leave Evoker OUT of cast range. Separate flag → 23y
+            // would leave Evoker OUT of cast range. Separate flag â 23y
             // max keeps the bot inside Living Flame range with 2y safety.
             is_pure_caster = true;
             is_short_range_caster = true;
@@ -2836,7 +2837,7 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
     }
     if (is_pure_caster)
     {
-        // MinRange=0 — never back-pedal. ChaseRange(min=5, max=28) had the
+        // MinRange=0 â never back-pedal. ChaseRange(min=5, max=28) had the
         // bot moving backwards whenever a melee mob walked inside 5y, which
         // kept is_moving=true and starved every hard cast (cast attempts
         // surfaced as SPELL_FAILED_MOVING in the log). Real Frost Mages
@@ -2860,12 +2861,12 @@ Result API::stop_attack(bool clear_ghost_combat)
     p_->AttackStop();
     if (!p_->IsInCombat())
         p_->SetSheath(SHEATH_STATE_UNARMED);
-    // Mirror a real client deselecting on disengage — keeps the published
+    // Mirror a real client deselecting on disengage â keeps the published
     // UNIT_FIELD_TARGET truthful for other players' target-of-target frames.
     p_->SetSelection(ObjectGuid::Empty);
     // Ghost-combat self-heal: a stuck combat flag (combat refs to an
     // unreachable/evaded mob) with NO attackers means nothing is actually
-    // fighting the bot — drop the PvE refs so in_combat consumers (the
+    // fighting the bot â drop the PvE refs so in_combat consumers (the
     // tank's member-in-combat advance gate, drink/food rules, vendor
     // gating) stop reading a fight that doesn't exist. Guarded on the
     // attacker list so a bot in a REAL fight can never combat-drop: with
@@ -2879,11 +2880,11 @@ Result API::stop_attack(bool clear_ghost_combat)
         // Also drop the bot's PET/minion combat. CombatStop(owner) purges the
         // owner's PvE refs, but a controlled unit (hunter/warlock pet, guardian)
         // still fighting an EVADED / out-of-scan mob keeps re-flagging the OWNER
-        // InCombat every tick — so clearing only the owner never sticks (observed
+        // InCombat every tick â so clearing only the owner never sticks (observed
         // 2026-06-16: 105 bots cycling [ghost_combat] ~19x each, never escaping).
         // The ghost-combat gate above already excluded the case where a nearby
         // enemy is genuinely fighting the bot or its pet (group_engaged), so the
-        // pet here is fighting nothing reachable — stopping its combat is correct
+        // pet here is fighting nothing reachable â stopping its combat is correct
         // and lets the owner's clear hold.
         for (Unit* minion : p_->m_Controlled)
             if (minion && minion->IsInCombat() && minion->getAttackers().empty())
@@ -3089,9 +3090,9 @@ Result API::cast_vehicle_spell_at(uint32 spell_id, float x, float y, float z)
     SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, base->GetMap()->GetDifficultyID());
     if (!si) return Result::NotKnown;
     // IoC/SoTA siege weapons (demolisher Hurl Boulder 67440, siege-engine Ram /
-    // cannon, catapult) are CATAPULT/GROUND-targeted AoE — they land at a
+    // cannon, catapult) are CATAPULT/GROUND-targeted AoE â they land at a
     // destination and apply siege damage to buildings in the blast. So cast at
-    // the gate's POSITION (NOT a GO target — that fails for ground spells; the
+    // the gate's POSITION (NOT a GO target â that fails for ground spells; the
     // 600k-HP keep gates breach under sustained siege fire).
     SpellCastResult sr = base->CastSpell(Position{x, y, z}, spell_id, false);
     switch (sr)
@@ -3126,7 +3127,7 @@ Result API::unstuck(float distance)
     if (!p_) return Result::Other;
     if (p_->IsInCombat()) return Result::ServerRefused;
     if (p_->IsNonMeleeSpellCast(false, true, true)) return Result::ServerRefused;
-    // SafeNearTeleport below runs a synchronous PathGenerator rescue — gate it on
+    // SafeNearTeleport below runs a synchronous PathGenerator rescue â gate it on
     // the per-tick pathfinding budget so unstuck storms can't pile onto the world
     // thread; already returns Locked on rescue failure so deferral is contract-safe.
     if (!PathBudget::HasBudget(GameTime::GetGameTimeMS())) return Result::Locked;
@@ -3146,7 +3147,7 @@ Result API::near_teleport_to(float x, float y, float z, float o, bool navmesh_po
     if (!p_) return Result::Other;
     if (p_->IsInCombat()) return Result::ServerRefused;
     if (p_->IsNonMeleeSpellCast(false, true, true)) return Result::ServerRefused;
-    // SafeNearTeleport runs a synchronous PathGenerator FARFROMPOLY rescue — gate
+    // SafeNearTeleport runs a synchronous PathGenerator FARFROMPOLY rescue â gate
     // on the per-tick pathfinding budget (low-volume rescue, rarely trips). Already
     // returns Locked on failure so deferral is contract-safe.
     if (!PathBudget::HasBudget(GameTime::GetGameTimeMS())) return Result::Locked;
@@ -3198,7 +3199,7 @@ Result API::toggle_pvp()
 Result API::add_friend(std::string const& name, std::string const& note)
 {
     // Mirrors HandleAddFriendOpcode but synchronous (no async DB callback for
-    // GM-permission lookup — bots use the cached AccountId directly).
+    // GM-permission lookup â bots use the cached AccountId directly).
     if (!p_) return Result::Other;
     std::string normalized = name;
     if (!normalizePlayerName(normalized)) return Result::InvalidTarget;
@@ -3217,7 +3218,7 @@ Result API::add_friend(std::string const& name, std::string const& note)
 
 Result API::remove_friend(ObjectGuid friend_guid)
 {
-    // Mirrors HandleDelFriendOpcode. RemoveFromSocialList is permissive — if
+    // Mirrors HandleDelFriendOpcode. RemoveFromSocialList is permissive â if
     // the guid isn't on the list it's a no-op. Returns Ok for both branches.
     if (!p_) return Result::Other;
     if (friend_guid.IsEmpty()) return Result::InvalidTarget;
@@ -3254,7 +3255,7 @@ Result API::mail_send_money(std::string const& recipient_name, uint64 copper,
 {
     // Mirrors HandleSendMail's money-only path. Sender bears the 30c flat
     // postage fee; total = postage + copper. Bot must have enough money.
-    // Recipient is resolved via CharacterCache (cache miss → InvalidTarget).
+    // Recipient is resolved via CharacterCache (cache miss â InvalidTarget).
     if (!p_) return Result::Other;
     std::string normalized = recipient_name;
     if (!normalizePlayerName(normalized)) return Result::InvalidTarget;
@@ -3346,7 +3347,7 @@ Result API::mail_send_item(std::string const& recipient_name, ObjectGuid item_gu
         if (!attachment)
         {
             CharacterDatabase.CommitTransaction(trans);  // releases the empty txn
-            p_->ModifyMoney(static_cast<int64>(cost));   // refund — clone failed
+            p_->ModifyMoney(static_cast<int64>(cost));   // refund â clone failed
             return Result::Other;
         }
         item->SetCount(item->GetCount() - count);
@@ -3503,7 +3504,7 @@ Result API::raid_chat(std::string const& text)
 namespace {
 // SC-P3a: resolve the racial language for spoken SAY/YELL so bot chatter
 // renders in faction script (Common/Orcish, garbled cross-faction) exactly
-// like a real player's — instead of LANG_UNIVERSAL, which every faction can
+// like a real player's â instead of LANG_UNIVERSAL, which every faction can
 // read and which the client tags as GM/system speech. A team-based default
 // is used (every member of a faction knows that faction's base language and
 // passes the core HasSkill check): Alliance -> Common, Horde -> Orcish.
@@ -3553,7 +3554,7 @@ Result API::release_corpse()
     if (!p_) return Result::Other;
     if (p_->IsAlive())
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} already alive — noop",
+        TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} already alive â noop",
             p_->GetName());
         return Result::Ok;
     }
@@ -3606,12 +3607,12 @@ Result API::release_corpse()
                         p_->GetMotionMaster()->MovePoint(0, nearest->GetPositionX(), nearest->GetPositionY(), nearest->GetPositionZ(), /*generatePath*/ true);
                 }
             }
-            TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} already released (ghost + corpse) — noop",
+            TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} already released (ghost + corpse) â noop",
                 p_->GetName());
             return Result::Ok;
         }
         TC_LOG_INFO("playerbot.api",
-            "[API::release_corpse] {} dead with STALE corpse at ({:.1f},{:.1f},{:.1f}) map {} and no ghost state — "
+            "[API::release_corpse] {} dead with STALE corpse at ({:.1f},{:.1f},{:.1f}) map {} and no ghost state â "
             "retiring bones and repopping",
             p_->GetName(),
             p_->GetCorpseLocation().GetPositionX(),
@@ -3620,11 +3621,11 @@ Result API::release_corpse()
             uint32(p_->GetCorpseLocation().GetMapId()));
         p_->SpawnCorpseBones();
     }
-    TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} releasing — BuildPlayerRepop + RepopAtGraveyard from ({:.1f},{:.1f},{:.1f})",
+    TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} releasing â BuildPlayerRepop + RepopAtGraveyard from ({:.1f},{:.1f},{:.1f})",
         p_->GetName(), p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ());
     p_->BuildPlayerRepop();
     p_->RepopAtGraveyard();
-    TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} after release — alive={} hasCorpse={} pos=({:.1f},{:.1f},{:.1f})",
+    TC_LOG_DEBUG("playerbot.api", "[API::release_corpse] {} after release â alive={} hasCorpse={} pos=({:.1f},{:.1f},{:.1f})",
         p_->GetName(), p_->IsAlive(), p_->HasCorpse(),
         p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ());
     return Result::Ok;
@@ -3635,12 +3636,12 @@ Result API::revive_at_corpse()
     if (!p_) return Result::Other;
     if (p_->IsAlive())
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::revive_at_corpse] {} already alive — noop", p_->GetName());
+        TC_LOG_DEBUG("playerbot.api", "[API::revive_at_corpse] {} already alive â noop", p_->GetName());
         return Result::Ok;
     }
     if (!p_->HasCorpse())
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::revive_at_corpse] {} no corpse — Locked. pos=({:.1f},{:.1f},{:.1f})",
+        TC_LOG_DEBUG("playerbot.api", "[API::revive_at_corpse] {} no corpse â Locked. pos=({:.1f},{:.1f},{:.1f})",
             p_->GetName(), p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ());
         return Result::Locked;
     }
@@ -3648,7 +3649,7 @@ Result API::revive_at_corpse()
         p_->GetName(), p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ());
     // Mirror WorldSession::HandleReclaimCorpse: 50% restore (retail corpse-
     // run penalty) and SpawnCorpseBones to retire the corpse object. The old
-    // code skipped SpawnCorpseBones, so the corpse SURVIVED the revival — and
+    // code skipped SpawnCorpseBones, so the corpse SURVIVED the revival â and
     // on the bot's NEXT death release_corpse saw HasCorpse() and no-op'd
     // forever (BuildPlayerRepop also refuses while a same-map corpse exists),
     // leaving the bot wedged in dead:waiting_release for hours (verified
@@ -3661,27 +3662,27 @@ Result API::revive_at_corpse()
 // Mirrors WorldSession::HandleReclaimCorpse (MiscHandler.cpp:417). Called
 // from State_Dead's corpse-run path when the bot has walked back to its
 // corpse and is within reclaim radius. ResurrectPlayer is invoked with
-// applySickness=false (the default) — the corpse-run is the canonical
+// applySickness=false (the default) â the corpse-run is the canonical
 // no-sickness path. SpawnCorpseBones cleans up the corpse marker.
 Result API::reclaim_corpse()
 {
     if (!p_) return Result::Other;
     if (p_->IsAlive())
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} already alive — noop", p_->GetName());
+        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} already alive â noop", p_->GetName());
         return Result::Ok;
     }
     if (p_->InArena()) return Result::Locked;
     if (!p_->HasPlayerFlag(PLAYER_FLAGS_GHOST))
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} not ghost (release_corpse first) — Locked",
+        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} not ghost (release_corpse first) â Locked",
             p_->GetName());
         return Result::Locked;
     }
     Corpse* corpse = p_->GetCorpse();
     if (!corpse)
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} no corpse — Locked", p_->GetName());
+        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} no corpse â Locked", p_->GetName());
         return Result::Locked;
     }
     const bool pvp = corpse->GetType() == CORPSE_RESURRECTABLE_PVP;
@@ -3692,7 +3693,7 @@ Result API::reclaim_corpse()
     }
     // Distinguish cross-Map corpse from same-map-too-far. The previous
     // "0.0y > 39y" log line was the symptom of bot+corpse on the same
-    // map_id but different Map* (continent ↔ instance with same parent
+    // map_id but different Map* (continent â instance with same parent
     // map_id, e.g., Stormwind sewers / Naxx / etc), which IsWithinDistInMap
     // rejects because Map* pointers differ. The State_Dead cross-map
     // gate only compares map_id so this case slips through. Returning
@@ -3700,14 +3701,14 @@ Result API::reclaim_corpse()
     if (corpse->GetMap() != p_->GetMap())
     {
         TC_LOG_DEBUG("playerbot.api",
-            "[API::reclaim_corpse] {} corpse on different Map* (mapId={}↔{}) — OutOfRange",
+            "[API::reclaim_corpse] {} corpse on different Map* (mapId={}â{}) â OutOfRange",
             p_->GetName(), p_->GetMapId(), corpse->GetMapId());
         return Result::OutOfRange;
     }
     if (!corpse->IsWithinDistInMap(p_, CORPSE_RECLAIM_RADIUS, true))
     {
         const float d = p_->GetDistance2d(corpse);
-        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} corpse too far ({:.1f}y > {}y) — OutOfRange",
+        TC_LOG_DEBUG("playerbot.api", "[API::reclaim_corpse] {} corpse too far ({:.1f}y > {}y) â OutOfRange",
             p_->GetName(), d, CORPSE_RECLAIM_RADIUS);
         return Result::OutOfRange;
     }
@@ -3774,14 +3775,14 @@ Result API::enter_area_trigger(uint32 area_trigger_id)
 // real corpse-run impractical. applySickness=true applies the standard
 // resurrection sickness (level-scaled; none below 11), and DurabilityLossAll
 // matches the 25% gear hit a real spirit-healer rez incurs. We skip the
-// SpiritHealerActivate NPC validation — State_Dead has already chosen this
+// SpiritHealerActivate NPC validation â State_Dead has already chosen this
 // path; there's no NPC to interact with for a headless bot.
 Result API::spirit_resurrect()
 {
     if (!p_) return Result::Other;
     if (p_->IsAlive())
     {
-        TC_LOG_DEBUG("playerbot.api", "[API::spirit_resurrect] {} already alive — noop", p_->GetName());
+        TC_LOG_DEBUG("playerbot.api", "[API::spirit_resurrect] {} already alive â noop", p_->GetName());
         return Result::Ok;
     }
     // Ensure the bot has released first; the spirit-healer flow assumes the
@@ -3842,7 +3843,7 @@ Result API::accept_summon()
     // once per pending request.
     p_->SummonIfPossible(true);
     // Post-summon snap. SummonIfPossible teleports to the summoner's
-    // last-reported position — which may sit slightly off-mesh (summoner
+    // last-reported position â which may sit slightly off-mesh (summoner
     // moved between the summon cast and the bot accept) or inside an
     // instance portal that hasn't fully geometry-resolved. The probe is
     // cheap when the landing is fine.
@@ -4034,10 +4035,10 @@ Result API::invite_to_group(ObjectGuid target_player)
     if (!invitee) return Result::InvalidTarget;
     // Faction gate matches HandlePartyInviteOpcode unless cross-faction
     // grouping is enabled server-wide. We're conservative and refuse the
-    // cross-faction case rather than relying on the world config — bot
+    // cross-faction case rather than relying on the world config â bot
     // packs that party with opposing faction would be a PvP-server bug.
     if (p_->GetTeam() != invitee->GetTeam()) return Result::InvalidTarget;
-    // Already-grouped target → server would reject; surface up-front.
+    // Already-grouped target â server would reject; surface up-front.
     if (invitee->GetGroup() || invitee->GetGroupInvite())
         return Result::Locked;
     if (invitee->GetSocial() &&
@@ -4057,7 +4058,7 @@ Result API::invite_to_group(ObjectGuid target_player)
     }
     else
     {
-        // No group yet — create one with the bot as leader-invitee. Same
+        // No group yet â create one with the bot as leader-invitee. Same
         // shape as the player path: not committed to DB until the invitee
         // accepts. Memory leaked back to the heap if the invitee declines
         // is reclaimed via Group::RemoveAllInvites + delete in that path.
@@ -4212,9 +4213,9 @@ Result API::accept_guild_invite()
 Result API::decline_guild_invite()
 {
     // Mirrors HandleGuildDeclineInvitation: clearing GuildIdInvited drops the
-    // pending invite. Idempotent — already-cleared state still returns Ok.
+    // pending invite. Idempotent â already-cleared state still returns Ok.
     if (!p_) return Result::Other;
-    if (p_->GetGuildId()) return Result::Ok;  // Already in a guild — invite is moot.
+    if (p_->GetGuildId()) return Result::Ok;  // Already in a guild â invite is moot.
     p_->SetGuildIdInvited(UI64LIT(0));
     return Result::Ok;
 }
@@ -4389,7 +4390,7 @@ Result API::pet_cast(uint32 spell_id, ObjectGuid target)
     }
     SpellInfo const* spell = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
     if (!spell) return Result::Other;
-    // Pet must actually know the spell — otherwise the cast just fails
+    // Pet must actually know the spell â otherwise the cast just fails
     // silently server-side. HasSpell on the pet checks both the inherited
     // creature template spells and any taught (Hunter/DK) abilities.
     if (!pet->HasSpell(spell_id)) return Result::Locked;
@@ -4401,7 +4402,7 @@ Result API::pet_cast(uint32 spell_id, ObjectGuid target)
         victim = ObjectAccessor::GetUnit(*p_, target);
         if (!victim) return Result::InvalidTarget;
     }
-    // Cast as the pet's caster — interrupts (Spell Lock) require a target;
+    // Cast as the pet's caster â interrupts (Spell Lock) require a target;
     // self-buffs / pet abilities don't.
     SpellCastTargets targets;
     if (victim) targets.SetUnitTarget(victim);
@@ -4432,11 +4433,11 @@ Result API::dismiss_pet()
 // ---- Hunter pet stable -------------------------------------------------
 //
 // Background: in retail Cataclysm-onwards, the stable owns three flavors of
-// pet — active (in slots 0..MAX_ACTIVE_PETS-1), stabled (slots
+// pet â active (in slots 0..MAX_ACTIVE_PETS-1), stabled (slots
 // PET_SAVE_FIRST_STABLE_SLOT..PET_SAVE_LAST_STABLE_SLOT-1), and unslotted
 // (PET_SAVE_NOT_IN_SLOT, kept around for re-summon by spell). The gossip /
 // stablemaster flow validates an interact range with the stable NPC. The
-// bot path here intentionally bypasses the NPC range check — when running
+// bot path here intentionally bypasses the NPC range check â when running
 // autonomously we want the AI to swap pets based on encounter (e.g. swap
 // to a stabled tank pet for a tough pull) without first dragging the bot
 // to a stablemaster. All other invariants (HUNTER_PET-only, exotic-tame
@@ -4469,7 +4470,7 @@ Result API::swap_pet_to_slot(uint32 pet_number, uint8 dst_slot)
     const bool dstStabled = IsStabledPetSlot(dstSlotMode);
     if (srcActive != IsActivePetSlot(dstSlotMode))
     {
-        // Cross-region swap will despawn the active pet — must be alive.
+        // Cross-region swap will despawn the active pet â must be alive.
         if (Pet* live = p_->GetPet())
             if (!live->IsAlive() && (srcActive || dstStabled))
                 return Result::ServerRefused;
@@ -4500,7 +4501,7 @@ Result API::delete_stabled_pet(uint32 pet_number)
     PetStable* stable = p_->GetPetStable();
     if (!stable) return Result::NotKnown;
 
-    // Refuse to delete the currently summoned pet — caller must dismiss
+    // Refuse to delete the currently summoned pet â caller must dismiss
     // first. Without this guard, DeletePetFromDB would yank the row from
     // under a live Pet*, leaving a dangling summon that crashes on the
     // next pet-tick (CharmInfo lookup against a deleted row).
@@ -4510,7 +4511,7 @@ Result API::delete_stabled_pet(uint32 pet_number)
                 return Result::Locked;
 
     // Also refuse if the pet is the current ActivePet entry (even if not
-    // physically summoned right now — e.g. unsummoned for flying mount).
+    // physically summoned right now â e.g. unsummoned for flying mount).
     // In that case the summon path would re-resurrect a deleted DB row.
     if (PetStable::PetInfo const* current = stable->GetCurrentPet())
         if (current->PetNumber == pet_number)
@@ -4534,10 +4535,10 @@ Result API::summon_pet_by_number(uint32 pet_number)
     if (p_->HasUnitState(UNIT_STATE_CASTING)) return Result::ServerRefused;
     PetStable* stable = p_->GetPetStable();
     if (!stable) return Result::NotKnown;
-    // A pet is already up — caller must dismiss first.
+    // A pet is already up â caller must dismiss first.
     if (p_->GetPet()) return Result::Locked;
 
-    // Locate pet across active slots only — stabled pets must be moved
+    // Locate pet across active slots only â stabled pets must be moved
     // to an active slot first via swap_pet_to_slot. This matches the
     // CALL_PET_SPELL_ID semantics: it loads from active-slot bank.
     auto [srcPet, srcSlot] = Pet::GetLoadPetInfo(*stable, 0, pet_number, {});
@@ -4579,7 +4580,7 @@ Result API::feed_pet(uint32 food_item_entry)
     // Note: pet level vs food level happiness math lives in
     // SPELL_EFFECT_FEED_PET; we don't pre-gate it here. Casting Feed Pet
     // on too-low food still consumes the item but yields zero happiness,
-    // matching live behavior — caller is responsible for filtering food
+    // matching live behavior â caller is responsible for filtering food
     // by ItemTemplate::ItemLevel vs Pet::GetLevel before issuing.
 
     // Cast Feed Pet on the pet itself; the spell handler consumes the
@@ -4600,7 +4601,7 @@ Result API::abandon_pet()
     if (pet->getPetType() != HUNTER_PET) return Result::InvalidTarget;
     if (p_->IsInCombat()) return Result::ServerRefused;
 
-    // PET_SAVE_AS_DELETED is the canonical untame path — RemovePet handles
+    // PET_SAVE_AS_DELETED is the canonical untame path â RemovePet handles
     // updatefield purge, character_pet row delete, and tame-skill bookkeeping.
     p_->RemovePet(pet, PET_SAVE_AS_DELETED);
     return Result::Ok;
@@ -4614,7 +4615,7 @@ Result API::pet_set_react_state(uint8 state)
     if (state > REACT_ASSIST) return Result::InvalidTarget;
     // Pet inherits Creature::SetReactState (Unit-level state), and PetAI
     // re-reads it on the next tick. CharmInfo doesn't store react state in
-    // 12.0 — the master copy is on Unit (UnitAI::ReactState).
+    // 12.0 â the master copy is on Unit (UnitAI::ReactState).
     pet->SetReactState(static_cast<ReactStates>(state));
     return Result::Ok;
 }
@@ -4707,7 +4708,7 @@ Result API::pet_set_command_state(uint8 command)
             // Use pet_attack(target) for the actual attack-with-target
             // semantics. Setting the command without a target is a no-op
             // mirror of the pet bar's attack button when nothing is
-            // selected — surface InvalidTarget so the caller routes
+            // selected â surface InvalidTarget so the caller routes
             // through pet_attack instead.
             return Result::InvalidTarget;
         default:
@@ -4754,49 +4755,49 @@ static bool BotWantsTradeGoodsSubclass(Player const* p, uint32 subclass)
     auto has = [p](uint32 skill) { return p->HasSkill(uint16(skill)); };
     switch (subclass)
     {
-        // PARTS / EXPLOSIVES / DEVICES / EXPLOSIVES_DEVICES — Engineering
+        // PARTS / EXPLOSIVES / DEVICES / EXPLOSIVES_DEVICES â Engineering
         case 1: case 2: case 3: case 17:
             return has(202);
-        // JEWELCRAFTING (gems) — Jewelcrafting
+        // JEWELCRAFTING (gems) â Jewelcrafting
         case 4:
             return has(755);
-        // CLOTH — Tailoring (First Aid was removed in BfA)
+        // CLOTH â Tailoring (First Aid was removed in BfA)
         case 5:
             return has(197);
-        // LEATHER — Leatherworking
+        // LEATHER â Leatherworking
         case 6:
             return has(165);
-        // METAL_AND_STONE — Mining/Blacksmithing/Engineering/Jewelcrafting
+        // METAL_AND_STONE â Mining/Blacksmithing/Engineering/Jewelcrafting
         case 7:
             return has(186) || has(164) || has(202) || has(755);
-        // MEAT — Cooking. Includes raw fish (TC classifies raw fish meat
+        // MEAT â Cooking. Includes raw fish (TC classifies raw fish meat
         // as TRADE_GOODS subclass 8; cooked fish meals are CONSUMABLE
         // class entirely and never reach this filter). Cooking is granted
         // to every bot at L10+ in DoLearnProfessions, so this branch
         // mostly returns true.
         case 8:
             return has(185);
-        // HERB — Herbalism/Alchemy/Inscription
+        // HERB â Herbalism/Alchemy/Inscription
         case 9:
             return has(182) || has(171) || has(773);
-        // ELEMENTAL — multiple crafting professions; conservative-keep when
+        // ELEMENTAL â multiple crafting professions; conservative-keep when
         // any is trained.
         case 10:
             return has(164) || has(165) || has(171) || has(197) || has(202) ||
                    has(333) || has(755) || has(773);
-        // ENCHANTING (dust / essence / shard) — Enchanting. Subclass 12
+        // ENCHANTING (dust / essence / shard) â Enchanting. Subclass 12
         // (ITEM_SUBCLASS_ENCHANTING). Subclass 15 is
-        // WEAPON_ENCHANTMENT (oils, sharpening stones) — those are
+        // WEAPON_ENCHANTMENT (oils, sharpening stones) â those are
         // enchanting outputs / general consumables, not enchanter mats,
         // so we don't auto-keep them on enchanter classes.
         case 12:
             return has(333);
-        // INSCRIPTION (pigment / ink) — Inscription
+        // INSCRIPTION (pigment / ink) â Inscription
         case 16:
             return has(773);
         // 0 GENERIC, 11 TRADE_GOODS_OTHER, 13 MATERIAL, 14 ENCHANTMENT,
         // 15 WEAPON_ENCHANTMENT, 17+ EXPLOSIVES_DEVICES / OPTIONAL_REAGENT
-        // — no specific profession ownership; default keep.
+        // â no specific profession ownership; default keep.
         default:
             return true;
     }
@@ -4804,7 +4805,7 @@ static bool BotWantsTradeGoodsSubclass(Player const* p, uint32 subclass)
 
 // Count empty inventory slots across the backpack (INVENTORY_SLOT_ITEM_*) and
 // the equipped bags (INVENTORY_SLOT_BAG_*). Profession bags only count free
-// slots that the candidate item could actually occupy is NOT modelled here —
+// slots that the candidate item could actually occupy is NOT modelled here â
 // this is a coarse "how tight are bags" gauge used to gate the BoE-clearance
 // branch below, not a precise can-store test (SellItemToVendor / the rule do
 // that). A non-bag backpack slot that is empty counts; a bag's empty cells
@@ -4823,12 +4824,12 @@ static uint32 CountFreeBagSlots(Player const* p)
 
 // True when a Bind-on-Equip uncommon armor/weapon in the bag is "clearly
 // vendor trash" for THIS bot and may be sold under bag pressure when no
-// auctioneer is reachable. Conservative by construction — every protection
+// auctioneer is reachable. Conservative by construction â every protection
 // the backlog calls out is enforced here:
-//   * quest items            (class QUEST / BIND_QUEST / StartQuest) — kept
-//   * heirlooms / account-bound (any BIND_*ACCOUNT*, ITEM_QUALITY_HEIRLOOM) — kept
-//   * current upgrades       (would beat or fill the bot's equipped slot) — kept
-//   * anything bound that's an upgrade — kept (the upgrade test runs regardless
+//   * quest items            (class QUEST / BIND_QUEST / StartQuest) â kept
+//   * heirlooms / account-bound (any BIND_*ACCOUNT*, ITEM_QUALITY_HEIRLOOM) â kept
+//   * current upgrades       (would beat or fill the bot's equipped slot) â kept
+//   * anything bound that's an upgrade â kept (the upgrade test runs regardless
 //     of bind state; BoP-but-better never reaches this branch because it's an
 //     upgrade, and we only consider BoE here anyway)
 // Only genuine low-ilvl greens the bot has clearly outgrown clear out.
@@ -4836,7 +4837,7 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
 {
     if (!p || !it || !tmpl) return false;
 
-    // Only Uncommon (green) — Rare/Epic BoE are real AH/bank candidates, never
+    // Only Uncommon (green) â Rare/Epic BoE are real AH/bank candidates, never
     // auto-vendored by this branch.
     if (tmpl->GetQuality() != ITEM_QUALITY_UNCOMMON)
         return false;
@@ -4861,7 +4862,7 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
         tmpl->GetStartQuest() != 0)
         return false;
 
-    // Heirloom / account-bound protection — mail to alts, never vendor.
+    // Heirloom / account-bound protection â mail to alts, never vendor.
     if (tmpl->GetQuality() == ITEM_QUALITY_HEIRLOOM ||
         tmpl->GetBonding() == BIND_BNET_ACCOUNT ||
         tmpl->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED ||
@@ -4881,7 +4882,7 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
     // // empty slots.
     int32 const new_ilvl = static_cast<int32>(tmpl->GetBaseItemLevel());
 
-    // Upgrade protection — the decisive gate. Resolve which equip slot this
+    // Upgrade protection â the decisive gate. Resolve which equip slot this
     // item would land in for THIS bot; if the slot is empty (would be a strict
     // gain) or the candidate scores at least as well as / out-ilvls the current
     // item, it is NOT trash. Mirrors ScoreQuestReward's slot-resolution path.
@@ -4895,7 +4896,7 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
         {
             Item const* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, equip_slot);
             if (!cur)
-                return false;                      // empty usable slot — keep, it's a gain
+                return false;                      // empty usable slot â keep, it's a gain
             ItemTemplate const* cur_tmpl = cur->GetTemplate();
             int32 const cur_ilvl =
                 cur_tmpl ? static_cast<int32>(cur_tmpl->GetBaseItemLevel()) : 0;
@@ -4904,13 +4905,13 @@ static bool BotShouldVendorBoeGreen(Player* p, Item* it, ItemTemplate const* tmp
             // marginal sidegrades safe.
             constexpr int32 kIlvlSlack = 10;
             if (new_ilvl >= cur_ilvl - kIlvlSlack)
-                return false;                      // potential upgrade / sidegrade — keep
+                return false;                      // potential upgrade / sidegrade â keep
         }
-        // equip_slot out of range — falls through to "vendor" (can't be worn).
+        // equip_slot out of range â falls through to "vendor" (can't be worn).
     }
     // CanEquipNewItem != OK: the bot physically can't wear it (wrong class /
     // armor type / level). A green it can never equip and can't AH (no
-    // auctioneer) is bag rot — clear it.
+    // auctioneer) is bag rot â clear it.
 
     return true;
 }
@@ -4931,7 +4932,7 @@ static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_ti
     {
         return true;
     }
-    // Soulbound BoP weapons/armor the bot can't equip — bag rot.
+    // Soulbound BoP weapons/armor the bot can't equip â bag rot.
     // Quest rewards offer 2-3 slots, bot picks one, but loot rolls
     // on BoP items the bot is ineligible for still accumulate (per
     // ITEM_VENDOR_SYSTEM_PLAN.md). These can never be auctioned
@@ -4945,7 +4946,7 @@ static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_ti
     // ITEM_QUALITY_HEIRLOOM, equivalent in modern client) are
     // account-bound and should be preserved for alts. If the bot
     // can't use it now, mailing it to alts via the JIT mail system
-    // is the right disposition — never vendor. Audit 2026-05-22:
+    // is the right disposition â never vendor. Audit 2026-05-22:
     // current code would happily vendor a class-wrong heirloom
     // because it passes the `IsSoulBound() && CanUseItem != OK`
     // check.
@@ -4960,7 +4961,7 @@ static bool IsBagRot(Player* p, Item* it, ItemTemplate const* tmpl, bool bags_ti
              && tmpl->GetBonding() != BIND_WOW_ACCOUNT
              && tmpl->GetBonding() != BIND_QUEST)
     {
-        // Only sell ITEMS IN BAGS, never equipped slots — same gate
+        // Only sell ITEMS IN BAGS, never equipped slots â same gate
         // the inventory iterator already implies (Inventory location)
         // but explicit for clarity.
         return true;
@@ -4982,13 +4983,13 @@ Result API::sell_trash(ObjectGuid npc)
     if (!vendor) return Result::InvalidTarget;
 
     // Iterate inventory and main bags. Sell:
-    //   1) Every Poor (grey) item — vendor trash baseline.
+    //   1) Every Poor (grey) item â vendor trash baseline.
     //   2) Trade-goods (item class 7) of any quality where the subclass
     //      doesn't match a profession the bot trained. A Mining bot in
     //      possession of Light Leather has no use for it; freeing that
     //      bag slot for ore is the right call. Quality bound at COMMON
     //      (white) so we don't accidentally vendor an Uncommon+ mat that
-    //      a teammate might want — those go to the auction house path
+    //      a teammate might want â those go to the auction house path
     //      when that lands.
     //   4) Under BAG PRESSURE only: Bind-on-Equip Uncommon (green) gear the
     //      bot has clearly outgrown and can't equip, when bags are tight and
@@ -4998,11 +4999,11 @@ Result API::sell_trash(ObjectGuid npc)
     // Quest-flagged items are skipped (vendor refuses them anyway).
     //
     // Bag-pressure gate for branch (4). Greens are real AH money, so we only
-    // vendor them when the bot is genuinely cramped — otherwise it keeps them
+    // vendor them when the bot is genuinely cramped â otherwise it keeps them
     // for the auction-house disposition. Threshold: 3 or fewer free slots.
     //
     // // L-P2a: needs an "auctioneer reachable / AH-flagged" signal to fully
-    // // honour the "no auctioneer accessible" condition — that lives in the V2
+    // // honour the "no auctioneer accessible" condition â that lives in the V2
     // // rule layer (AuctionRules), not on the live Player. sell_trash only
     // // receives a vendor NPC, so we approximate with bag pressure: the rule
     // // layer only invokes the BoE-clearance path when it has already decided
@@ -5080,12 +5081,12 @@ Result API::repair_all(ObjectGuid npc, bool from_guild_bank)
 {
     if (!p_) return Result::Other;
     // Self-repair (empty npc): no repair vendor required. Used by the dungeon
-    // gear-readiness rule — instances have NO repair NPC, yet a tank whose
+    // gear-readiness rule â instances have NO repair NPC, yet a tank whose
     // durability breaks mid-run (every death strips 10%) degrades into paper
     // (0% durability ~ halved armor/stats) and death-spirals (observed
     // 2026-06-28: Deadmines tank 38 deaths, durability 16264->12976 HP, never
     // reached the boss). Bots are AI and the player-money branch below already
-    // grants the shortfall as a stipend, so a self-repair is effectively free —
+    // grants the shortfall as a stipend, so a self-repair is effectively free â
     // exactly the intended "gold self-repair on dungeon staging/running".
     if (!npc.IsEmpty())
     {
@@ -5108,7 +5109,7 @@ Result API::repair_all(ObjectGuid npc, bool from_guild_bank)
     // item and, if the bot can't afford the whole bill, silently repairs NOTHING
     // (Player.cpp ~4827 `if (!HasEnoughMoney(totalCost)) return;`). A fresh, poor
     // low-level bot almost never affords a full repair, so that all-or-nothing
-    // gate stranded bots at 0% gear forever — a death spiral (broken gear -> can't
+    // gate stranded bots at 0% gear forever â a death spiral (broken gear -> can't
     // fight -> can't earn -> still can't afford the full repair). Observed:
     // Bramwell (L5, 224c) parked on top of Godric Rothgar, firing
     // idle:critical_repair every tick with durability never moving off 0%.
@@ -5136,15 +5137,15 @@ Result API::repair_all(ObjectGuid npc, bool from_guild_bank)
     std::sort(repairables.begin(), repairables.end(),
               [](auto const& a, auto const& b) { return a.second < b.second; });
 
-    // Repair-reserve top-up — SAME stipend pattern as the flight reserve at
+    // Repair-reserve top-up â SAME stipend pattern as the flight reserve at
     // fly_to_node (owner directive 2026-06-21). Bots are perpetually broke
     // (Morthan: 0% gear, ~20 silver); a poor low-level bot can't afford a full
     // repair, so the affordable-partial loop below leaves its costliest slots at
-    // 0% forever — the poverty death-spiral (broken gear -> can't fight -> can't
+    // 0% forever â the poverty death-spiral (broken gear -> can't fight -> can't
     // earn -> still can't repair). Grant the shortfall so a broke bot can always
     // fully repair (bots are AI; a free repair is fine and far cheaper than the
     // leveling time lost to a bot stranded at 0% gear). Solvent bots are
-    // unaffected — they already cover the bill, so no money is added.
+    // unaffected â they already cover the bill, so no money is added.
     {
         uint64 total_cost = 0;
         for (auto const& pr : repairables) total_cost += pr.second;
@@ -5167,7 +5168,7 @@ Result API::repair_all(ObjectGuid npc, bool from_guild_bank)
     return any ? Result::Ok : Result::Locked;
 }
 
-// Cast an item's ON_USE effect via Player::CastItemUseSpell — the same path
+// Cast an item's ON_USE effect via Player::CastItemUseSpell â the same path
 // HandleUseItemOpcode uses. Going through cast_spell here would fail because
 // item-trigger spells (e.g. Food = 433 on Conjured Bread) aren't in the
 // player's spellbook, and cast_spell rejects them with NotKnown. The item
@@ -5194,7 +5195,7 @@ static Result UseItemImpl(Player* p, Item* item, ObjectGuid target)
         if (Unit* tu = ObjectAccessor::GetUnit(*p, target))
         {
             // Spellclick NPCs: when the quest target is a UNIT_NPC_FLAG_SPELLCLICK
-            // creature, "using the item on it" is, on a real client, a CMSG_SPELL_CLICK —
+            // creature, "using the item on it" is, on a real client, a CMSG_SPELL_CLICK â
             // Unit::HandleSpellClick both casts the click spell AND fires the creature's
             // OnSpellClick AI. That AI is what credits this whole class of quests
             // (e.g. Q26118: spellclick Ambassador Slaghammer 42146 -> SmartAI
@@ -5282,7 +5283,7 @@ Result API::loot_corpse(ObjectGuid corpse)
         return Result::Ok;
     }
 
-    // Solo / FFA — directly transfer items the bot is allowed to take.
+    // Solo / FFA â directly transfer items the bot is allowed to take.
     ObjectGuid lootOwnerGuid = loot->GetOwnerGUID();
     uint32 dbg_items = uint32(loot->items.size());
     uint32 dbg_stored = 0, dbg_blocked = 0, dbg_looted = 0, dbg_nofit = 0, dbg_nullitem = 0;
@@ -5291,7 +5292,7 @@ Result API::loot_corpse(ObjectGuid corpse)
         // ROOT CAUSE of the loot/skin hot-loop (4-day forensics): free-for-all
         // (FFA) loot items track their looted state PER PLAYER in `ffaItem`, NOT
         // in the shared `it->is_looted` (Player::StoreLootItem only sets the
-        // shared flag for non-FFA items — `if (!item->freeforall)`). The old call
+        // shared flag for non-FFA items â `if (!item->freeforall)`). The old call
         // omitted the ffaItem out-param, so the bot never saw that it had already
         // taken its own FFA copy and re-looted the SAME FFA items every tick: the
         // shared is_looted never flipped, the corpse never fully cleared, never
@@ -5357,7 +5358,7 @@ Result API::loot_corpse(ObjectGuid corpse)
         "[loot_drain] bot={} corpse={} items={} stored={} blocked={} prelooted={} nofit={} nullitem={} after_isLooted={}",
         p_->GetGUID().GetCounter(), corpse.GetCounter(), dbg_items, dbg_stored, dbg_blocked,
         dbg_looted, dbg_nofit, dbg_nullitem, loot->isLooted() ? 1 : 0);
-    // CRITICAL: SendLootRelease() only sends the client a packet — it does NOT
+    // CRITICAL: SendLootRelease() only sends the client a packet â it does NOT
     // run the server-side release. The real release (WorldSession::DoLootRelease)
     // is what clears UNIT_DYNFLAG_LOOTABLE (removes the corpse "glitter") and,
     // for a fully-looted creature corpse, calls AllLootRemovedFromCorpse() which
@@ -5376,7 +5377,7 @@ Result API::hearth()
 {
     if (!p_) return Result::Other;
     if (p_->IsInCombat()) return Result::Locked;
-    // Hearthstone is an ITEM (entry 6948) — players obtain it from any
+    // Hearthstone is an ITEM (entry 6948) â players obtain it from any
     // innkeeper after binding their home location, then USE the item to
     // cast its hearth spell. Spell 8690 is the *triggered* spell inside the
     // item; calling cast_spell(8690) rejects with "not in spellbook" since
@@ -5397,7 +5398,7 @@ Result API::interact_with_npc(ObjectGuid npc)
     if (p_->IsInCombat()) return Result::Locked;
     // Mirrors WorldSession::HandleGossipHelloOpcode (NPCHandler.cpp). Same
     // interact-range / NPC-flag check; same cancel-of-Interacting auras;
-    // same pause-on-talk; same OnGossipHello → PrepareGossipMenu →
+    // same pause-on-talk; same OnGossipHello â PrepareGossipMenu â
     // SendPreparedGossip pipeline. Only the packet read/write is omitted
     // because we're invoking from server side.
     Creature* unit = p_->GetNPCIfCanInteractWith(npc, UNIT_NPC_FLAG_GOSSIP, UNIT_NPC_FLAG_2_NONE);
@@ -5481,20 +5482,20 @@ Result API::use_game_object(ObjectGuid go_guid)
     // the server then attaches it. A bot has NO client, so standing on the deck
     // does nothing (observed live: bots at dist 0.0 with on_transport=0 forever).
     // We attach/detach server-side instead. Treated as a toggle so we can reuse
-    // the existing UseObjectIntent (no new intent type — the IntentBody variant
+    // the existing UseObjectIntent (no new intent type â the IntentBody variant
     // is at its MSVC heap limit): not aboard + in range => board; already aboard
     // => disembark (drops the bot at its current world position, i.e. on the dock
     // deck at the destination).
     //
     // Resolve as a TransportBase, which covers BOTH transport flavours:
-    //   * GAMEOBJECT_TYPE_MAP_OBJ_TRANSPORT (15) — cross-map ships/zeppelins, and
-    //   * GAMEOBJECT_TYPE_TRANSPORT (11) — local animated lifts (the Orgrimmar
+    //   * GAMEOBJECT_TYPE_MAP_OBJ_TRANSPORT (15) â cross-map ships/zeppelins, and
+    //   * GAMEOBJECT_TYPE_TRANSPORT (11) â local animated lifts (the Orgrimmar
     //     zeppelin-tower elevators, Undercity/city lifts, etc).
     // The previous code resolved via Map::GetTransport(), which returns ONLY
     // type-15 (guid.IsMOTransport()). Every type-11 elevator therefore fell
     // through the whole branch and AddPassenger NEVER fired for one (verified
     // live: ADDPASSENGER 0 fleet-wide while a bot looped boarding an elevator,
-    // dist growing 11→18y as the platform cycled away un-attached). Map::
+    // dist growing 11â18y as the platform cycled away un-attached). Map::
     // GetGameObject() finds both flavours and GameObject::ToTransportBase()
     // yields the passenger interface for each; the type-11 GO is relocated live
     // by its animation frames, so GetPosition() is the current platform height.
@@ -5503,7 +5504,7 @@ Result API::use_game_object(ObjectGuid go_guid)
         GameObject* go = tmap->GetGameObject(go_guid);
         if (TransportBase* tr = go ? go->ToTransportBase() : nullptr)
         {
-            // DISEMBARK: already aboard → step off. The caller (idle ride-guard)
+            // DISEMBARK: already aboard â step off. The caller (idle ride-guard)
             // only emits this when the ship is STOPPED at the destination dock,
             // so RemovePassenger leaves the bot standing on the deck at the dock
             // and its normal rules walk it onto land next tick.
@@ -5513,7 +5514,7 @@ Result API::use_game_object(ObjectGuid go_guid)
                 p_->SetFallInformation(0, p_->GetPositionZ());
 
                 // ELEVATOR step-off (type-11). A ship (type-15) drops the bot on
-                // its stationary dock deck, which is real navmesh — nothing more to
+                // its stationary dock deck, which is real navmesh â nothing more to
                 // do. A type-11 lift, however, leaves the bot standing on the
                 // PLATFORM CENTRE at the arrival floor, which for an upper stop is
                 // open air over the shaft (the moving platform is carved OUT of the
@@ -5547,7 +5548,7 @@ Result API::use_game_object(ObjectGuid go_guid)
                             ledge.GetPositionX(), ledge.GetPositionY(), ledge.GetPositionZ());
                         return Result::Ok;
                     }
-                    // No walkable ledge within reach — fall through to the plain
+                    // No walkable ledge within reach â fall through to the plain
                     // log. The bot detaches in place (pre-existing behaviour); the
                     // WARN flags a lift whose disembark floor has no navmesh nearby
                     // (data gap worth investigating).
@@ -5563,8 +5564,8 @@ Result API::use_game_object(ObjectGuid go_guid)
                     p_->GetName(), go->GetEntry(), p_->GetMapId());
                 return Result::Ok;
             }
-            // BOARD — V1-proven recipe. A bot has no client to send the board
-            // movement packet, so we attach server-side — but it WALKS onto the
+            // BOARD â V1-proven recipe. A bot has no client to send the board
+            // movement packet, so we attach server-side â but it WALKS onto the
             // deck like a player, we never snap/teleport it on. Two requirements
             // V1 honoured and the first V2 cut missed:
             //   1) Only board a transport that is STOPPED at its dock. Boarding a
@@ -5579,7 +5580,7 @@ Result API::use_game_object(ObjectGuid go_guid)
             // ELEVATOR / already-on-deck fast path. If the bot is standing
             // essentially ON the transport (within ~7y 3D), attach IMMEDIATELY at
             // its current spot. This covers (a) a vertical elevator platform that
-            // has cycled down to the bot's floor — elevators move CONTINUOUSLY so
+            // has cycled down to the bot's floor â elevators move CONTINUOUSLY so
             // the stationary gate below never passes for them, but the bot is
             // physically on the platform so boarding now is correct; and (b) a ship
             // deck the bot already walked onto (the V1 path below leads here). The
@@ -5631,7 +5632,7 @@ Result API::use_game_object(ObjectGuid go_guid)
             }
             if (now_ms - track.second < 2000)
             {
-                // Still sailing / just pulling in — wait at the dock, don't chase a
+                // Still sailing / just pulling in â wait at the dock, don't chase a
                 // moving deck. Locked holds the bot; the idle wait_for_transport
                 // rule keeps it on the pier until the ship settles, then this
                 // re-fires and boards.
@@ -5640,7 +5641,7 @@ Result API::use_game_object(ObjectGuid go_guid)
 
             // Docked and stationary. Walk onto the deck and attach once standing
             // on it (the bot visibly walks aboard, as V1 did). The deck height
-            // above the transport pivot varies per ship — most boats deck ~2y
+            // above the transport pivot varies per ship â most boats deck ~2y
             // above the waterline pivot, but some have a raised deck reached by
             // entrance stairs (e.g. Stormwind's Pride / Valiance-Keep icebreaker,
             // deck ~z9.4 over a z0 pivot). Use an operator-provided per-entry deck
@@ -5650,9 +5651,9 @@ Result API::use_game_object(ObjectGuid go_guid)
             // TravelNode.cpp generateTransportNodes exit offsets): the zeppelin
             // pivot hangs ~17y above its gondola deck (= the tower deck it docks
             // at), and the Deeprun Tram car ("Subway") pivot sits 10y above the
-            // car floor. The rider cannot walk onto the pivot X/Y there — the
+            // car floor. The rider cannot walk onto the pivot X/Y there â the
             // gondola / car floor is not navmesh and hangs off the tower edge /
-            // over the track — so for these the bot walks as close as the mesh
+            // over the track â so for these the bot walks as close as the mesh
             // allows and steps aboard from within a few yards of the deck.
             bool deckBelowPivot = false;
             switch (go->GetEntry())
@@ -5693,7 +5694,7 @@ Result API::use_game_object(ObjectGuid go_guid)
         }
     }
     GameObject* obj = p_->GetGameObjectIfCanInteractWith(go_guid);
-    // [bg_use_diag] TEMP — verify BG flag/node use (pickup vs cap).
+    // [bg_use_diag] TEMP â verify BG flag/node use (pickup vs cap).
     if (Map* dmap2 = p_->GetMap())
         if (GameObject* raw = dmap2->GetGameObject(go_guid))
         {
@@ -5794,7 +5795,7 @@ Result API::use_game_object(ObjectGuid go_guid)
     // Auto-loot for lootable GO types (CHEST, GOOBER with loot, etc.).
     // GameObject::Use opens the loot window server-side (m_loot is
     // populated, GO state transitions to ACTIVATED) but for headless
-    // bots — and for self-AI bots without auto-loot enabled — there's
+    // bots â and for self-AI bots without auto-loot enabled â there's
     // no client to send CMSG_LOOT_ITEM. The chest stays open with the
     // items inside untaken, the quest objective never progresses, and
     // the bot moves on or hearths after stuck-detection.
@@ -5803,7 +5804,7 @@ Result API::use_game_object(ObjectGuid go_guid)
     // off it, got stuck on the objective.
     //
     // Mirrors API::loot_corpse: walk loot.items, store each. Skip the
-    // group / master-loot path (chests are FFA by default — TC's
+    // group / master-loot path (chests are FFA by default â TC's
     // ROLL_NEED_BEFORE_GREED and master-loot apply only to creature
     // corpses).
     if (Loot* loot = obj->GetLootForPlayer(p_))
@@ -5815,7 +5816,7 @@ Result API::use_game_object(ObjectGuid go_guid)
             {
                 // Same FFA fix as API::loot_corpse: chests are FFA, so a looted
                 // item's state lives in the per-player ffaItem, not the shared
-                // it->is_looted — without checking it the bot re-loots the chest
+                // it->is_looted â without checking it the bot re-loots the chest
                 // every tick and the GO never reaches GO_JUST_DEACTIVATED.
                 NotNormalLootItem* ffaItem = nullptr;
                 LootItem* it = loot->LootItemInSlot(slot, p_, &ffaItem);
@@ -5871,8 +5872,8 @@ Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
     if (!p_->CanInteractWithQuestGiver(object))         { log_reject("out_of_range");         return Result::OutOfRange; }
     // Junk-quest accept-gate (R2, defense-in-depth). A quest with ZERO
     // objectives AND no creature/GO turn-in NPC is structurally unfinishable
-    // and unturnable — accepting it parks the bot forever (current_quest_id=0
-    // → [picker_none]). The snapshot offer-scan already filters these, but a
+    // and unturnable â accepting it parks the bot forever (current_quest_id=0
+    // â [picker_none]). The snapshot offer-scan already filters these, but a
     // shared-quest / gossip path could still reach here. (q55660 "Time Trials"
     // was held by 13,641 bots fleet-wide.) Mirrors IsBotJunkQuest in the V2
     // module; checked inline to avoid a cross-library dependency.
@@ -5917,9 +5918,9 @@ Result API::accept_quest(ObjectGuid quest_giver, uint32 quest_id)
 
 // Score a single choice-reward item from a completable quest. Higher score wins.
 // Decision tree (matches QUEST_SYSTEM_PLAN.md L1.A):
-//   1. Item not usable by bot at all (CanUseItem != OK) → vendor value only.
-//   2. Item is equippable for an empty equipment slot → ilvl * 100.
-//   3. Item is equippable, slot already occupied → (delta_ilvl) * 100 + (delta_quality) * 10.
+//   1. Item not usable by bot at all (CanUseItem != OK) â vendor value only.
+//   2. Item is equippable for an empty equipment slot â ilvl * 100.
+//   3. Item is equippable, slot already occupied â (delta_ilvl) * 100 + (delta_quality) * 10.
 //      Negative deltas allowed; the comparison still produces a score we can rank.
 //   4. Tabards / shirts (cosmetic): cap at vendor value (no equip-bonus weight).
 // Vendor value is item->GetSellPrice() * count; clamped to int32 to keep score
@@ -5936,7 +5937,7 @@ static int32 ScoreQuestReward(Player* bot, Quest const* quest, uint32 choice_ind
     ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(item_id);
     if (!tmpl) return 0;
 
-    // Vendor base — used as a tiebreaker plus the floor for un-equippable items.
+    // Vendor base â used as a tiebreaker plus the floor for un-equippable items.
     // SellPrice is in copper; cast to int32 first so a 0-stack is just 0 not UB.
     int32 const vendor_value = static_cast<int32>(tmpl->GetSellPrice()) *
                                static_cast<int32>(count > 0 ? count : 1);
@@ -5964,10 +5965,10 @@ static int32 ScoreQuestReward(Player* bot, Quest const* quest, uint32 choice_ind
     if (equip_slot >= EQUIPMENT_SLOT_END) return vendor_value;
 
     // Item level for ranking. Use the LEVEL-SCALED effective ilvl the bot will
-    // actually wear the item at — TC 12.0 scales many items via a curve, so the
+    // actually wear the item at â TC 12.0 scales many items via a curve, so the
     // static base ilvl can be wildly off (a base-120 reward collapsing to
     // effective ilvl 5 at L16). The old code used GetBaseItemLevel() despite the
-    // comment promising scaled — fixed 2026-06-17 (under-gearing campaign) so
+    // comment promising scaled â fixed 2026-06-17 (under-gearing campaign) so
     // quest-reward picks match what the bot wears.
     int32 const new_ilvl = ::Playerbot::Gear::EffectiveItemLevelForLevel(tmpl, bot->GetLevel());
     int32 const new_qual = static_cast<int32>(tmpl->GetQuality());
@@ -5990,7 +5991,7 @@ static int32 ScoreQuestReward(Player* bot, Quest const* quest, uint32 choice_ind
     }
 
     ItemTemplate const* cur_tmpl = cur->GetTemplate();
-    // Effective ilvl of the equipped item (live item → real scaled value).
+    // Effective ilvl of the equipped item (live item â real scaled value).
     int32 const cur_ilvl = static_cast<int32>(cur->GetItemLevel(bot));
     int32 const cur_qual = cur_tmpl ? static_cast<int32>(cur_tmpl->GetQuality())       : 0;
 
@@ -6138,7 +6139,7 @@ Result API::complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 rewar
         {
             choice_item = quest->RewardChoiceItemId[reward_choice];
         }
-        // reward_choice >= num_choices (and not the sentinel) → choice_item
+        // reward_choice >= num_choices (and not the sentinel) â choice_item
         // stays 0; CanRewardQuest below will reject and return Locked.
     }
 
@@ -6151,7 +6152,7 @@ Result API::complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 rewar
     p_->RewardQuest(quest, LootItemType::Item, choice_item, object);
     // Verify the reward actually landed in bag. RewardQuest can fail to
     // place items silently when bag space is tight enough that AutoStore
-    // can't find a slot — those items go to mail. Log both presence in
+    // can't find a slot â those items go to mail. Log both presence in
     // bag and mail-deferred outcome so the operator can distinguish
     // "reward never arrived" (genuine bug) from "reward arrived but in
     // mail" (bag full, recoverable via mailbox visit).
@@ -6191,10 +6192,10 @@ Result API::complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 rewar
         fixed_summary);
 
     // Same-NPC follow-up auto-accept. Scripted escort NPCs (Tarindrella for
-    // quest chain 28725→28726→28727→28728 in Shadowthread Cave) often despawn
+    // quest chain 28725â28726â28727â28728 in Shadowthread Cave) often despawn
     // a few seconds after a turn-in via their SmartAI OOC timer. The
     // post-RewardQuest world tick gives the AI ~1 snapshot to re-probe
-    // CanTakeQuest and emit accept_quest before the giver vanishes — that
+    // CanTakeQuest and emit accept_quest before the giver vanishes â that
     // window can close before the bot's accept intent dispatches, producing
     // the "giver_not_found" / "giver_lost_relation" reject pair observed for
     // Uraimus 2026-05-21 (quest 28728 "Signs of Things to Come").
@@ -6260,11 +6261,11 @@ Result API::lfg_queue(uint32 dungeon_id, uint8 roles)
     lfg::LfgDungeonSet dungeons;
     dungeons.insert(dungeon_id);
     sLFGMgr->JoinLfg(p_, roles, dungeons);
-    // Verify JoinLfg actually queued us — if state didn't transition to
+    // Verify JoinLfg actually queued us â if state didn't transition to
     // QUEUED, an LFG-side gate fired silently (RBAC, deserter aura, gear
     // ilvl, level mismatch, freeze debuff, group membership, etc.). This
     // is the diagnostic that lets us answer "filler queued 4, only 2 in
-    // queue — why?" without grepping LFGMgr internals.
+    // queue â why?" without grepping LFGMgr internals.
     lfg::LfgState const post_state = sLFGMgr->GetState(p_->GetGUID());
     if (post_state != lfg::LFG_STATE_QUEUED &&
         post_state != lfg::LFG_STATE_ROLECHECK &&
@@ -6333,7 +6334,7 @@ Result API::equip_item(uint8 from_bag, uint8 from_slot, uint8 to_slot)
     // Server-refusal backoff. The caller (EquipUpgradeFire) re-issues this
     // every eligible tick while the item is still in the bag. If a prior
     // attempt was refused (and the item therefore never left the bag), skip
-    // the swap until the backoff expires — otherwise we re-run CanEquipItem
+    // the swap until the backoff expires â otherwise we re-run CanEquipItem
     // and emit a phantom "Ok" every tick, which makes /diag report an equip
     // that will never land. Keyed on (item-entry, dest-slot).
     uint32 const efail_now = GameTime::GetGameTimeMS();
@@ -6352,7 +6353,7 @@ Result API::equip_item(uint8 from_bag, uint8 from_slot, uint8 to_slot)
         return Result::ServerRefused;
     }
 
-    // ---- Bag destination (slots 30-33) — B-11b ----
+    // ---- Bag destination (slots 30-33) â B-11b ----
     // Containers don't go through CanEquipItem (that path refuses them);
     // Player::SwapItem natively supports "swap an EMPTY bag from inventory
     // with an equipped bag, transferring the equipped bag's contents into
@@ -6366,11 +6367,11 @@ Result API::equip_item(uint8 from_bag, uint8 from_slot, uint8 to_slot)
         if (!src_bag)
         {
             NoteEquipFail(p_, efail_key, efail_now);
-            return Result::ServerRefused;          // not a container — rule bug
+            return Result::ServerRefused;          // not a container â rule bug
         }
         // SwapItem's content-exchange branch only runs when the INCOMING bag
         // is empty (a freshly looted / quest-rewarded bag always is). A bag
-        // the bot has stored items into is a transient state — skip, the
+        // the bot has stored items into is a transient state â skip, the
         // periodic re-check retries after the bag empties.
         if (!src_bag->IsEmpty())
             return Result::Locked;
@@ -6406,7 +6407,7 @@ Result API::equip_item(uint8 from_bag, uint8 from_slot, uint8 to_slot)
     // Pre-validate the equip the same way Player::SwapItem will internally,
     // so we can return a TRUTHFUL result instead of an unconditional Ok.
     // SwapItem returns void and only SendEquipError's the client on failure,
-    // leaving the item in the bag — invisible to the API caller. CanEquipItem
+    // leaving the item in the bag â invisible to the API caller. CanEquipItem
     // with swap=true mirrors the swap case (destination slot may be occupied;
     // the current item gets swapped back into the source slot). This is the
     // exact gate SwapItem applies, so a non-OK result here means SwapItem
@@ -6481,7 +6482,7 @@ Result API::vendor_buy_by_category(ObjectGuid npc, uint8 item_class, uint8 item_
     // can actually use. For most vendors there's a single food entry per
     // level bracket so this resolves cleanly; when multiple match (Algari
     // Travel Ration vs Loose-Leaf Tea) we'd happily buy whichever shows up
-    // highest — both restore the same well-fed buff.
+    // highest â both restore the same well-fed buff.
     uint32 best_slot = items->GetItemCount();
     int32 best_required_level = -1;
     uint32 best_buy_count = 1;     // fallback if BuyCount is 0 (older data)
@@ -6523,7 +6524,7 @@ Result API::vendor_buy_by_category(ObjectGuid npc, uint8 item_class, uint8 item_
 
 Result API::vendor_buy_by_entry(ObjectGuid npc, uint32 item_entry, uint32 count)
 {
-    // Convenience wrapper around vendor_buy_by_slot — walks the vendor's
+    // Convenience wrapper around vendor_buy_by_slot â walks the vendor's
     // inventory looking for the matching item entry, then issues the buy.
     // Useful when callers know the item ID (script integrations, recipe
     // reagent lookup) but not the slot index.
@@ -6570,10 +6571,10 @@ Result API::jump(float forward)
     // facing nearly always launches INTO whatever wedged it (the bot was
     // walking toward its goal when it jammed, so it's still pointing at the
     // wall / ledge / closed door). TryUnstickJump tries the current facing,
-    // then ±90°, then 180° (reverse out of a dead-end pocket), and launches
+    // then Â±90Â°, then 180Â° (reverse out of a dead-end pocket), and launches
     // the first bearing whose landing has real ground and a clear arc chord.
     // It faces the chosen bearing before MoveJump so the arc travels that
-    // way. Returns false only when every bearing is blocked / groundless —
+    // way. Returns false only when every bearing is blocked / groundless â
     // refuse rather than launch the bot into geometry / the void.
     if (!BotMovement::TryUnstickJump(p_, forward))
         return Result::Locked;
@@ -6604,7 +6605,7 @@ Result API::mail_take_money(ObjectGuid mailbox, uint64 mail_id)
 
     // ModifyMoney with the strict overflow guard. Returns false when the
     // bot is over the gold cap, in which case we surface NotEnoughResource
-    // rather than mutating mail state — mirrors EQUIP_ERR_TOO_MUCH_GOLD.
+    // rather than mutating mail state â mirrors EQUIP_ERR_TOO_MUCH_GOLD.
     if (!p_->ModifyMoney(m->money, false))
         return Result::NotEnoughResource;
 
@@ -6617,7 +6618,7 @@ Result API::mail_take_money(ObjectGuid mailbox, uint64 mail_id)
     // picked up by the next player save (Player::_SaveMail walks the mail
     // vector unconditionally when m_mailsUpdated is set). _SaveMail is
     // protected on Player and not friend-accessible from this module, so we
-    // can't co-commit it inside our own transaction — relying on the
+    // can't co-commit it inside our own transaction â relying on the
     // periodic save tick for mail durability is the same pattern Trinity
     // uses for the in-game UI mail-money take button.
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
@@ -6683,7 +6684,7 @@ Result API::mail_take_item(ObjectGuid mailbox, uint64 mail_id, uint64 item_guid_
     p_->MoveItemToInventory(dest, item, true);
     p_->SaveInventoryAndGoldToDB(trans);
     // _SaveMail is protected; rely on m_mailsUpdated for the next periodic
-    // save (same rationale as mail_take_money — see comment there).
+    // save (same rationale as mail_take_money â see comment there).
     CharacterDatabase.CommitTransaction(trans);
     return Result::Ok;
 }
@@ -6709,7 +6710,7 @@ Result API::bind_homebind(ObjectGuid innkeeper)
     if (p_->GetMap() && p_->GetMap()->Instanceable()) return Result::Locked;
     Creature* npc = p_->GetNPCIfCanInteractWith(innkeeper, UNIT_NPC_FLAG_INNKEEPER, UNIT_NPC_FLAG_2_NONE);
     if (!npc) return Result::InvalidTarget;
-    // Spell 3286 = Bind. Cast from the NPC at the bot — the spell handler
+    // Spell 3286 = Bind. Cast from the NPC at the bot â the spell handler
     // updates the homebind row.
     npc->CastSpell(p_, /*Bind*/ 3286, true);
     return Result::Ok;
@@ -6722,7 +6723,7 @@ Result API::loot_roll(ObjectGuid loot_object, uint8 loot_list_id, uint8 vote_typ
     if (!roll) return Result::Locked;
     // RollVote enum values match the wire protocol: Pass=0, Need=1,
     // Greed=2, Disenchant=3. Anything outside that range is forced to
-    // Pass (safe default — never accidentally take loot).
+    // Pass (safe default â never accidentally take loot).
     RollVote vote = RollVote::Pass;
     switch (vote_type)
     {
@@ -6776,7 +6777,7 @@ std::vector<CuratedTraitEntry> ParseCuratedBuild(std::string const& text)
 }
 
 // Look up a curated build row in playerbot_v2_talent_build, with fallback
-// from (class, spec, context) → (class, spec, Default). Returns the
+// from (class, spec, context) â (class, spec, Default). Returns the
 // `entries_json` text (despite the column name, we use a CSV format).
 // Empty string means no curated row found.
 std::string LookupCuratedBuildRow(uint32 classId, uint32 specId, uint8 context)
@@ -6796,7 +6797,7 @@ std::string LookupCuratedBuildRow(uint32 classId, uint32 specId, uint8 context)
     return {};
 }
 
-// Leveling spec per class (the DPS spec the baseline APLs are tuned for —
+// Leveling spec per class (the DPS spec the baseline APLs are tuned for â
 // mirrors ApRegistry::DefaultSpecForClass). Used to promote a bot off the
 // class's INITIAL placeholder specialization, which 92% of the L10+ fleet
 // was still on: the Initial spec has no Combat TraitConfig, so every talent
@@ -6825,7 +6826,7 @@ uint32 LevelingSpecForClass(uint8 cls)
 
 // Promote the bot to a REAL specialization if it still sits on the class's
 // Initial placeholder. ActivateTalentGroup learns spec spells + mastery and
-// creates/activates the matching Combat TraitConfig — the precondition for
+// creates/activates the matching Combat TraitConfig â the precondition for
 // any talent application. Returns false when no spec could be resolved.
 bool EnsureRealSpec(Player* p)
 {
@@ -6833,7 +6834,7 @@ bool EnsureRealSpec(Player* p)
     if (::Playerbot::Classic::IsSingleSpecClass(p->GetClass()))
         return true;
     if (p->GetLevel() < 10)
-        return false;  // retail unlocks specialization at L10 — nothing to do yet
+        return false;  // retail unlocks specialization at L10 â nothing to do yet
     ChrSpecializationEntry const* initial =
         sDB2Manager.GetDefaultChrSpecializationForClass(p->GetClass());
     const uint32 cur = uint32(AsUnderlyingType(p->GetPrimarySpecialization()));
@@ -6850,7 +6851,7 @@ bool EnsureRealSpec(Player* p)
     return true;
 }
 
-// Count purchased ranks in the bot's ACTIVE trait config — the ground-truth
+// Count purchased ranks in the bot's ACTIVE trait config â the ground-truth
 // "talents actually applied" signal (the legacy GetTalentMap is never
 // written by the 12.0 trait system).
 uint32 CountActiveTraitRanks(Player* p)
@@ -6872,7 +6873,7 @@ Result API::apply_talent_build(uint8 context)
     if (::Playerbot::Classic::IsSingleSpecClass(p_->GetClass()))
         return apply_classic_talents();
 
-    // Promote off the Initial placeholder spec first — without a real spec
+    // Promote off the Initial placeholder spec first â without a real spec
     // there is no Combat TraitConfig and this path silently no-op'd for 92%
     // of the L10+ fleet (audit B05/B06).
     if (!EnsureRealSpec(p_)) return Result::NotKnown;
@@ -6885,7 +6886,7 @@ Result API::apply_talent_build(uint8 context)
     const uint32 specId  = uint32(AsUnderlyingType(p_->GetPrimarySpecialization()));
 
     // Look up curated build. If none, fall back to TraitMgr's starter
-    // build — that's still a valid spec-aware spend (just not optimized
+    // build â that's still a valid spec-aware spend (just not optimized
     // for raid / M+ / PvP).
     std::string curatedCsv = LookupCuratedBuildRow(classId, specId, context);
 
@@ -6912,7 +6913,7 @@ Result API::apply_talent_build(uint8 context)
                 /*requireSpendingAllCurrencies=*/ false,
                 /*removeInvalidEntries=*/ true);
             // A curated build is a MAX-LEVEL spend. removeInvalidEntries only
-            // strips STRUCTURALLY-invalid nodes — it does NOT trim for talent-
+            // strips STRUCTURALLY-invalid nodes â it does NOT trim for talent-
             // currency overflow, so an under-level bot's config still holds the
             // full endgame node set and ValidateConfig returns an error (e.g.
             // NotEnoughTalentsInPrimaryTree) WITHOUT pruning. The old code
@@ -6924,7 +6925,7 @@ Result API::apply_talent_build(uint8 context)
             {
                 // withCastTime=false: bots have no client to animate the 1.5s
                 // "Applying Talents" commit cast for, and leveling bots move
-                // constantly — the interruptible cast was the reason commits
+                // constantly â the interruptible cast was the reason commits
                 // never landed fleet-wide (audit B05). Verify the result.
                 p_->UpdateTraitConfig(std::move(new_cfg), 0, /*withCastTime*/ false);
                 const uint32 ranks = CountActiveTraitRanks(p_);
@@ -6937,7 +6938,7 @@ Result API::apply_talent_build(uint8 context)
         }
     }
 
-    // No curated build → starter build. Same as apply_starter_talents.
+    // No curated build â starter build. Same as apply_starter_talents.
     TraitMgr::InitializeStarterBuildTraitConfig(new_cfg, p_);
     new_cfg.CombatConfigFlags |= TraitCombatConfigFlags::StarterBuild;
     p_->UpdateTraitConfig(std::move(new_cfg), 0, /*withCastTime*/ false);
@@ -6959,7 +6960,7 @@ Result API::apply_starter_talents()
 
     // Promote off the Initial placeholder spec first (audit B06): without a
     // real spec there is no Combat TraitConfig and this path returned
-    // NotKnown silently for 92% of the L10+ fleet — 13K+ bots at 0 talents.
+    // NotKnown silently for 92% of the L10+ fleet â 13K+ bots at 0 talents.
     if (!EnsureRealSpec(p_)) return Result::NotKnown;
 
     int32 const active_id = p_->m_activePlayerData->ActiveCombatTraitConfigID;
@@ -6968,7 +6969,7 @@ Result API::apply_starter_talents()
 
     // Build a writable copy of the active config, then ask TraitMgr to fill
     // it with the curated starter selections. This is the same code path
-    // the client triggers when the player toggles "Starter Build" — the
+    // the client triggers when the player toggles "Starter Build" â the
     // resulting config is a complete, valid trait spend for the spec.
     WorldPackets::Traits::TraitConfig new_cfg(*active);
     TraitMgr::InitializeStarterBuildTraitConfig(new_cfg, p_);
@@ -6977,7 +6978,7 @@ Result API::apply_starter_talents()
     // withCastTime=false (audit B05): the 1.5s "Applying Talents" commit
     // cast exists for client presentation; leveling bots move constantly,
     // the cast was interrupted, the result was never checked, and the
-    // fire-once idle rule never retried — so commits never landed anywhere.
+    // fire-once idle rule never retried â so commits never landed anywhere.
     // Commit immediately and VERIFY by re-reading the active config.
     p_->UpdateTraitConfig(std::move(new_cfg), 0, /*withCastTime*/ false);
     const uint32 ranks = CountActiveTraitRanks(p_);
@@ -7296,7 +7297,7 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
 {
     if (!p_) return Result::Other;
     // Empty battlemaster GUID signals the UI-equivalent path (PVP browser /
-    // queue-from-anywhere) — no NPC interaction required. Bot-driven queues
+    // queue-from-anywhere) â no NPC interaction required. Bot-driven queues
     // (BotQueueFiller, /bg whisper, JIT spawn) use this path because the bot
     // isn't always standing at a battlemaster. Non-empty GUID still validates
     // NPC range as before for /bg via NPC click.
@@ -7344,7 +7345,7 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
     // category (BattlegroundQueueIdType::Arena) keyed by team size; the
     // BG category is HARDCODED-teamSize-0. `arena_type` (2/3/5) selects
     // the skirmish bracket; we also treat any arena-flagged template as
-    // an arena even if the caller passed 0 (defensive — a bot should
+    // an arena even if the caller passed 0 (defensive â a bot should
     // never end up BG-queued onto an arena map). rated=false: bots run
     // SKIRMISH arenas (no arena-team / MMR dependency), mirroring
     // HandleBattlemasterJoinArena with arena teams disabled.
@@ -7432,17 +7433,17 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
             "[bg_queue] {} queued GROUP of {} for bg_type_id={} (arena_type={} premade={})",
             p_->GetName(), grp->GetMembersCount(), bg_type_id, uint32(arena_type),
             isPremade ? 1 : 0);
-        // Fill the rest of the match (both factions — most importantly the
+        // Fill the rest of the match (both factions â most importantly the
         // OPPOSING team, which nothing else provides for a bot premade).
         // The module's hook handler lets bot GROUP LEADERS through for
         // exactly this purpose (audit B25). For arenas the opposing team is
         // an independently-seeded bot group (SeedArenaMatches forms one per
         // faction every cycle), so this BG-fill hook is BG-only.
         if (!is_arena)
-            Playerbot::Hooks::OnPlayerJoinedBgQueue(p_, bg_type_id, bracket->GetBracketId());
+            Playerbot::V2::Module::instance().OnPlayerJoinedBgQueue(p_, bg_type_id, bracket->GetBracketId());
         return Result::Ok;
     }
-    // SOLO path below. Arenas have no solo queue — they require a full
+    // SOLO path below. Arenas have no solo queue â they require a full
     // arena_type-sized group whose leader queues (the GROUP branch above).
     // A solo arena request can only come from a mis-emitted intent (the
     // group dissolved before the deferred queue fired); reject it cleanly
@@ -7456,7 +7457,7 @@ Result API::bg_queue(ObjectGuid battlemaster, uint16 bg_type_id, uint8 arena_typ
     if (p_->IsDeserter())
     { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: deserter", p_->GetName()); return Result::Locked; }
     if (p_->GetBattlegroundQueueIndex(qid) < PLAYER_MAX_BATTLEGROUND_QUEUES)
-        return Result::Ok;   // already queued — idempotent
+        return Result::Ok;   // already queued â idempotent
     if (!p_->HasFreeBattlegroundQueueId())
     { TC_LOG_INFO("playerbot.v2", "[bg_queue] {} reject: no_free_queue_slot", p_->GetName()); return Result::Locked; }
 
@@ -7495,7 +7496,7 @@ Result API::lfg_proposal_respond(uint32 proposal_id, bool accept)
 {
     if (!p_) return Result::Other;
     if (proposal_id == 0) return Result::Locked;
-    // sLFGMgr->UpdateProposal silently no-ops on missing proposal — re-check
+    // sLFGMgr->UpdateProposal silently no-ops on missing proposal â re-check
     // via the read-only accessor so we surface the state to the caller.
     if (sLFGMgr->GetActiveProposalIdForPlayer(p_->GetGUID()) != proposal_id)
         return Result::Locked;
@@ -7512,7 +7513,7 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
     // hooks can race a second intent through after a successful port; the
     // RemovePlayerAtLeave + SendToBattleground sequence below then re-enters
     // Map::RemovePlayerFromMap while the bot is mid-teleport, hitting the
-    // ASSERT at Map.cpp:935 ("remove" — player not in grid).
+    // ASSERT at Map.cpp:935 ("remove" â player not in grid).
     if (accept && p_->InBattleground())
     {
         if (Battleground const* cur = p_->GetBattleground())
@@ -7526,7 +7527,7 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
             }
         }
     }
-    // Also reject when the bot's not in a grid — mid-teleport or pending
+    // Also reject when the bot's not in a grid â mid-teleport or pending
     // logout. Map::RemovePlayerFromMap would fire the same ASSERT in this
     // window. The caller will retry on a later tick once the teleport
     // settles.
@@ -7615,7 +7616,7 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
 
         // Seething Shore (BG_SS = 894) post-port fix. SS uses a transport
         // (airship) for initial player placement. Bots porting via this
-        // API don't always attach to the transport correctly — they land
+        // API don't always attach to the transport correctly â they land
         // in mid-air at the airship's spawn coord, fall into water and
         // drown before the snapshot can react. Manually teleport them to
         // a known-safe inland coord on solid ground (Air Supply landing
@@ -7623,8 +7624,8 @@ Result API::bg_port(uint16 bg_type_id, bool accept)
         if (bgTypeId == BATTLEGROUND_SS)
         {
             // Team-specific safe coords (mirror SeethingShoreScript home_base).
-            // Horde:    Air Supply 3 area  — (1226.99, 2825.09, 39.26)
-            // Alliance: Air Supply 1 area  — (1398.72, 2728.05, 28.02)
+            // Horde:    Air Supply 3 area  â (1226.99, 2825.09, 39.26)
+            // Alliance: Air Supply 1 area  â (1398.72, 2728.05, 28.02)
             WorldLocation safe(/*mapId*/ 1803,
                 Position(1398.72f, 2728.05f, 28.02f, 0.f));
             if (ginfo.Team == HORDE)
@@ -7671,7 +7672,7 @@ Result API::bg_leave()
         }
         return Result::Ok;
     }
-    // Not in BG — drop from any active queues. Walk the per-player queue
+    // Not in BG â drop from any active queues. Walk the per-player queue
     // slot table and remove each registered queue.
     bool any = false;
     for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
@@ -7701,7 +7702,7 @@ Result API::auction_sell_item(ObjectGuid auctioneer, ObjectGuid item_guid,
     Creature* npc = p_->GetNPCIfCanInteractWith(auctioneer, UNIT_NPC_FLAG_AUCTIONEER, UNIT_NPC_FLAG_2_NONE);
     if (!npc) return Result::InvalidTarget;
 
-    // Mirror the live handler's price gating: silver-aligned, > 0, ≤ cap.
+    // Mirror the live handler's price gating: silver-aligned, > 0, â¤ cap.
     if (min_bid == 0 && buyout == 0) return Result::Locked;
     if (min_bid > MAX_MONEY_AMOUNT || buyout > MAX_MONEY_AMOUNT) return Result::Locked;
     if ((min_bid % SILVER) != 0 || (buyout % SILVER) != 0) return Result::Locked;
@@ -7739,7 +7740,7 @@ Result API::auction_sell_item(ObjectGuid auctioneer, ObjectGuid item_guid,
     auction.Owner        = p_->GetGUID();
     // OwnerAccount: bots don't carry an account-guid value the same way
     // sessions do; the live handler reads GetAccountGUID() (the bnet acc
-    // guid). For bot-owned auctions we leave it Empty — outbid/sold mail
+    // guid). For bot-owned auctions we leave it Empty â outbid/sold mail
     // resolution falls back to Owner.
     auction.OwnerAccount = ObjectGuid::Empty;
     auction.MinBid       = min_bid;
@@ -7851,7 +7852,7 @@ Result API::auction_cancel(ObjectGuid auctioneer, uint32 auction_id)
     if (!auction->Bidder.IsEmpty())
     {
         // Live handler debits 5% of the active bid as a cancel fee, refunds
-        // bid via mail. Reject up-front when we can't afford the fee — the
+        // bid via mail. Reject up-front when we can't afford the fee â the
         // auction stays alive untouched.
         uint64 cancel_cost = CalculatePct(auction->BidAmount, 5u);
         if (!p_->HasEnoughMoney(cancel_cost)) return Result::NotEnoughResource;
@@ -7921,7 +7922,7 @@ Result API::auction_buyout(ObjectGuid auctioneer, uint32 auction_id, uint64 max_
     if (auction->Owner == p_->GetGUID()) return Result::Locked;
 
     const uint64 buyout = auction->BuyoutOrUnitPrice;
-    if (buyout == 0) return Result::NotKnown;   // bid-only listing — use auction_bid
+    if (buyout == 0) return Result::NotKnown;   // bid-only listing â use auction_bid
 
     // Caller-supplied price guard: refuse if the LIVE buyout exceeds what the
     // economy rule agreed to (the snapshot-observed price). Protects against a
@@ -8010,7 +8011,7 @@ Result API::auction_bid(ObjectGuid auctioneer, uint32 auction_id, uint64 bid)
 
     if (can_buyout && bid == auction->BuyoutOrUnitPrice)
     {
-        // Bid hit the buyout — complete the sale.
+        // Bid hit the buyout â complete the sale.
         std::map<uint32, AuctionPosting>::node_type removed = auction_house->RemoveAuction(trans, auction);
         auction_house->SendAuctionSold(&removed.mapped(), nullptr, trans);
         auction_house->SendAuctionWon(&removed.mapped(), p_, trans);
@@ -8052,7 +8053,7 @@ Result API::auction_buy_commodity(ObjectGuid auctioneer, uint32 item_entry,
     // we create a quote over the cheapest non-self listings, validate the
     // total against the caller's slippage guard + the bot's gold, then commit
     // BuyCommodity in one synchronous character-DB transaction (no client
-    // confirm round-trip — quote+buy are atomic for a server-driven bot).
+    // confirm round-trip â quote+buy are atomic for a server-driven bot).
     if (!p_) return Result::Other;
     if (quantity == 0) return Result::NotKnown;
     Creature* npc = p_->GetNPCIfCanInteractWith(auctioneer, UNIT_NPC_FLAG_AUCTIONEER, UNIT_NPC_FLAG_2_NONE);
@@ -8072,7 +8073,7 @@ Result API::auction_buy_commodity(ObjectGuid auctioneer, uint32 item_entry,
     // listings, sums unit prices for `quantity` units, and stashes the quote
     // keyed by the bot's GUID (consumed by BuyCommodity::extract below). Null
     // means: no template, no bucket, not enough quantity listed, or the bot
-    // can't afford the total — collapse all to NotKnown (no buyable supply).
+    // can't afford the total â collapse all to NotKnown (no buyable supply).
     CommodityQuote const* quote = auction_house->CreateCommodityQuote(p_, item_entry, quantity);
     if (!quote)
         return Result::NotKnown;
@@ -8098,7 +8099,7 @@ Result API::auction_buy_commodity(ObjectGuid auctioneer, uint32 item_entry,
 
     // Commit. BuyCommodity re-walks the bucket, re-validates total <= quoted
     // (allows a LOWER price if cheaper listings appeared), debits the bot,
-    // mails the items to the bot, and removes the consumed listings — all
+    // mails the items to the bot, and removes the consumed listings â all
     // appended onto `trans`. delayForNextAction is the throttle delay echoed
     // back in the result packet; immaterial for a bot, pass 0ms.
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
@@ -8188,14 +8189,14 @@ Result API::craft_fulfill_order(uint64 order_id, uint32 spell_id, uint32 item_en
 
     // Stage the product as a standalone item owned by the requester and mail
     // it. We create it directly (not into the crafter's bags) so the delivery
-    // doesn't depend on the crafter having free bag space — mirroring the
+    // doesn't depend on the crafter having free bag space â mirroring the
     // clone-and-save path in mail_send_item. Respect the item's max stack by
     // splitting into multiple attachments / mails as needed.
     const uint32 max_stack = std::max<uint32>(1u, tmpl->GetMaxStackSize());
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
     uint32 remaining = qty;
     bool any_mailed = false;
-    // Bound the number of attachments per mail (MAX_MAIL_ITEMS) — start a new
+    // Bound the number of attachments per mail (MAX_MAIL_ITEMS) â start a new
     // mail when full. For typical small craft orders this is a single mail.
     while (remaining > 0)
     {
@@ -8271,7 +8272,7 @@ uint64 API::gold_cost_estimate_reagent_buy(uint32 reagent_entry, uint32 desired_
     const uint32 need = desired_total - have;
 
     // Vendor price is per BuyCount-sized stack; bots pay BuyPrice per stack,
-    // so per-unit = BuyPrice / BuyCount (round up to be conservative — the
+    // so per-unit = BuyPrice / BuyCount (round up to be conservative â the
     // affordability gate should never under-estimate).
     const uint32 buy_count = std::max<uint32>(tmpl->GetBuyCount(), 1u);
     const uint64 stack_price = tmpl->GetBuyPrice();
@@ -8303,7 +8304,7 @@ Result API::discover_taxi_node(ObjectGuid flight_master)
                             unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(),
                             unit->GetMapId(), p_->GetTeam());
     if (!node) return Result::NotKnown;
-    // SetTaximaskNode returns false when the node was already known —
+    // SetTaximaskNode returns false when the node was already known â
     // surface that as Ok (idempotent), false-from-an-unknown-node would
     // be Other but isn't reachable since the node was just resolved.
     p_->m_taxi.SetTaximaskNode(node);
@@ -8358,7 +8359,7 @@ Result API::fly_to_node(ObjectGuid flight_master, uint32 to_node)
         return Result::Locked;
     }
     // Bots are perpetually broke (a fresh L3 has ~67 copper), and
-    // ActivateTaxiPathTo charges the taxi fare — so flights silently failed and
+    // ActivateTaxiPathTo charges the taxi fare â so flights silently failed and
     // the bot ran back and forth at the FM forever. Cover the fare: top the bot
     // up to a flight reserve so it can always afford the hop (bots are AI; a free
     // ride is fine, and this is far cheaper than the leveling time lost to a bot
@@ -8378,7 +8379,7 @@ Result API::fly_to_node(ObjectGuid flight_master, uint32 to_node)
 
 // Mirrors WorldSession::CanUseBank without the session-only "command source"
 // path. Bots always interact via a real banker NPC; we just verify range
-// + the BANKER flag (account bank also accepted — newer clients allow both).
+// + the BANKER flag (account bank also accepted â newer clients allow both).
 static Creature* ResolveBanker(Player* p, ObjectGuid banker)
 {
     if (!p) return nullptr;
@@ -8401,7 +8402,7 @@ Result API::bank_deposit_item(ObjectGuid banker, uint8 from_bag, uint8 from_slot
     InventoryResult msg = p_->CanBankItem(NULL_BAG, NULL_SLOT, dest, item, false);
     if (msg != EQUIP_ERR_OK) return Result::InventoryFull;
     // CanBankItem can resolve to "stays where it is" (dest == src). The
-    // live handler treats that as CANT_SWAP — surface Locked so the caller
+    // live handler treats that as CANT_SWAP â surface Locked so the caller
     // knows further attempts will fail too.
     if (dest.size() == 1 && dest[0].pos == item->GetPos()) return Result::Locked;
 
@@ -8456,7 +8457,7 @@ Result API::guild_bank_deposit_money(ObjectGuid banker, uint64 amount)
     if (!guild) return Result::InvalidTarget;
     if (!p_->HasEnoughMoney(amount)) return Result::NotEnoughResource;
 
-    // HandleMemberDepositMoney is void — it logs and broadcasts but doesn't
+    // HandleMemberDepositMoney is void â it logs and broadcasts but doesn't
     // signal failure. Sample bot gold before/after to detect rank-permission
     // refusal (rank 0 always permitted; lower ranks may be blocked). The
     // Guild API will not deduct money on failure, so a no-change after the
@@ -8495,10 +8496,10 @@ Result API::guild_bank_deposit_item(ObjectGuid banker, uint8 tab, uint8 bank_slo
     Item* item = p_->GetItemByPos(player_bag, player_slot);
     if (!item) return Result::NotKnown;
 
-    // SwapItemsWithInventory(toChar=false) deposits inventory→bank. The
+    // SwapItemsWithInventory(toChar=false) deposits inventoryâbank. The
     // function logs internally and is silent on failure. Compare item-
     // presence at the source slot before/after to confirm the swap landed.
-    // For mergeable stacks the source might still hold a partial — accept
+    // For mergeable stacks the source might still hold a partial â accept
     // any change as success; only an unchanged source is failure.
     uint32 before_count = item->GetCount();
     guild->SwapItemsWithInventory(p_, /*toChar=*/false, tab, bank_slot, player_bag, player_slot, count);
@@ -8535,17 +8536,17 @@ Result API::share_quest_with_party(uint32 quest_id)
     {
         Player* receiver = itr.GetSource();
         if (!receiver || receiver == p_) continue;
-        // Already mid-share or dead — skip silently. The live handler does
+        // Already mid-share or dead â skip silently. The live handler does
         // SendPushToPartyResponse for diagnostics but our caller doesn't
         // need that level of detail.
         if (!receiver->GetPlayerSharingQuest().IsEmpty()) continue;
         if (!receiver->IsAlive()) continue;
-        // Status gates — already on / done.
+        // Status gates â already on / done.
         QuestStatus status = receiver->GetQuestStatus(quest_id);
         if (status == QUEST_STATUS_REWARDED ||
             status == QUEST_STATUS_INCOMPLETE ||
             status == QUEST_STATUS_COMPLETE) continue;
-        // Eligibility gates — match HandlePushQuestToParty's Satisfy ladder.
+        // Eligibility gates â match HandlePushQuestToParty's Satisfy ladder.
         if (!receiver->SatisfyQuestLog(false))         continue;
         if (!receiver->SatisfyQuestDay(quest, false))  continue;
         if (!receiver->SatisfyQuestMinLevel(quest, false)) continue;
@@ -8574,7 +8575,7 @@ Result API::guild_bank_withdraw_item(ObjectGuid banker, uint8 tab, uint8 bank_sl
     if (!Player::IsInventoryPos(player_bag, player_slot) &&
         player_slot != NULL_SLOT) return Result::InvalidTarget;
 
-    // SwapItemsWithInventory(toChar=true) withdraws bank→inventory. Compare
+    // SwapItemsWithInventory(toChar=true) withdraws bankâinventory. Compare
     // the destination slot before/after; the destination should now hold an
     // item it didn't before (or a strictly-larger stack).
     Item* dst_before = (player_slot == NULL_SLOT) ? nullptr : p_->GetItemByPos(player_bag, player_slot);
@@ -8605,7 +8606,7 @@ Result API::trainer_buy_all_available(ObjectGuid trainer_npc,
     Trainer::Trainer const* trainer = sObjectMgr->GetTrainer(trainer_id);
     if (!trainer) return Result::NotKnown;
 
-    // TeachSpell internally re-checks CanTeachSpell — we don't need to
+    // TeachSpell internally re-checks CanTeachSpell â we don't need to
     // pre-filter. Bots may carry insufficient gold partway through the
     // batch; that surfaces as a NotEnoughMoney teach-failure for that
     // spell only and the loop continues with the next.
@@ -8627,7 +8628,7 @@ Result API::trainer_buy_all_available(ObjectGuid trainer_npc,
         else if (out_skipped) ++*out_skipped;
     }
     // "Nothing learned + nothing already known + nothing offered" is
-    // unusual — surface as Ok (trainer simply has no spells for the bot).
+    // unusual â surface as Ok (trainer simply has no spells for the bot).
     if (!any_learned && spells.empty()) return Result::Ok;
     if (!any_learned && out_already && *out_already == 0) return Result::ServerRefused;
     return Result::Ok;
@@ -9053,12 +9054,12 @@ Result API::trainer_buy_spell(ObjectGuid trainer_npc, uint32 spell_id)
     Creature* npc = p_->GetNPCIfCanInteractWith(trainer_npc, UNIT_NPC_FLAG_TRAINER, UNIT_NPC_FLAG_2_NONE);
     if (!npc) return Result::InvalidTarget;
 
-    // Idempotent — caller may re-issue across snapshot ticks if the
+    // Idempotent â caller may re-issue across snapshot ticks if the
     // first buy raced with a snapshot rebuild. Already-known is success.
     if (p_->HasSpell(spell_id)) return Result::Ok;
 
     // Resolve trainer template id from the creature entry. NPCs without
-    // a registered trainer (rare — usually means data isn't loaded) get
+    // a registered trainer (rare â usually means data isn't loaded) get
     // NotKnown so callers can fall back to another trainer.
     uint32 const trainer_id = sObjectMgr->GetCreatureDefaultTrainer(npc->GetEntry());
     if (!trainer_id) return Result::NotKnown;

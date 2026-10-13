@@ -30,7 +30,6 @@
 #include "Item.h"
 #include "LFGMgr.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "Util.h"
 #include "Loot.h"
 #include "MapManager.h"
@@ -920,13 +919,6 @@ void Group::SendUpdateToPlayer(Player* player, MemberSlot const* slot /*= nullpt
     }
 
     WorldPacket const* packet = partyUpdate.Write();
-    // human recipients only: a raid would log 40 lines per bot per update
-    if (!player->GetSession()->IsBot())
-        PROBE_LOG("[party_update] to {}: flags {:#x} index {} type {} myIndex {} seq {} members {} leader {} loot {} difficulty {} bytes {} wire opcode {:#x} (build70291 {})",
-                    player->GetName(), uint32(partyUpdate.PartyFlags), uint32(partyUpdate.PartyIndex), uint32(partyUpdate.PartyType), partyUpdate.MyIndex,
-                    partyUpdate.SequenceNum, uint32(partyUpdate.PlayerList.size()), partyUpdate.LeaderGUID.ToString(), partyUpdate.LootSettings.has_value(),
-                    partyUpdate.DifficultySettings.has_value(), packet->size(), ClassicOpcodes::TranslateServerOpcode(SMSG_PARTY_UPDATE),
-                    ClassicOpcodes::IsBuild70291OrLater());
     player->SendDirectMessage(packet);
 }
 

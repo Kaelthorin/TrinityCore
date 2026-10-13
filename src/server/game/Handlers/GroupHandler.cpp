@@ -24,7 +24,6 @@
 #include "GroupMgr.h"
 #include "LFG.h"
 #include "Log.h"
-#include "Playerbot/DiagProbes.h"
 #include "Loot.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
@@ -75,9 +74,6 @@ void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClien
             if (size_t const dash = packet.TargetName.find('-'); dash != std::string::npos && dash > 0)
                 invitedPlayer = ObjectAccessor::FindPlayerByName(std::string_view(packet.TargetName).substr(0, dash));
     }
-    PROBE_LOG("[invite_probe] {} invites name '{}' realm '{}' guid {}: {}", invitingPlayer ? invitingPlayer->GetName() : "?", packet.TargetName,
-                packet.TargetRealm, packet.TargetGUID.ToString(),
-                invitedPlayer ? (invitedPlayer->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
 
     // no player
     if (!invitedPlayer)

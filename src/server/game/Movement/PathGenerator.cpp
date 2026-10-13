@@ -28,7 +28,6 @@
 #include "Metric.h"
 #include "PhasingHandler.h"
 #include "Player.h"
-#include "PlayerbotMovement.h"
 #include "WorldSession.h"
 #include <array>
 #include <mutex>
@@ -87,43 +86,24 @@ PathGenerator::~PathGenerator()
     TC_LOG_DEBUG("maps.mmaps", "++ PathGenerator::~PathGenerator() for {}", _source->GetGUID().ToString());
 }
 
-// A bot in a capital keeps out of canals: when the first route touches liquid, a land-only route is searched (water polygons
-// excluded) and used when it exists and is dry; otherwise the first route is kept and IsWetRoute() says so (the caller refuses
-// it for town life and lets a follower go on). Sampling is along the whole path, not only its corners.
+PathGenerator::LiquidRouteCheck PathGenerator::_liquidRouteCheck = nullptr;
+
+// A source that keeps out of liquid (the LiquidRouteCheck says so): when the first route touches liquid, a land-only route is
+// searched (water polygons excluded) and used when it exists and is dry; otherwise the first route is kept and IsWetRoute() says so.
 bool PathGenerator::CalculatePath(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest)
 {
     _wetRoute = false;
     bool ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);
-    if (!ok || (_type & PATHFIND_NOPATH) || !Playerbot::BotMovement::g_LiquidPathPolicy)
-        return ok;
-    Player* player = const_cast<Player*>(_source->ToPlayer());
-    if (!player || !player->GetSession() || !player->GetSession()->IsBot())
-        return ok;
-    if (Playerbot::BotMovement::g_LiquidPathPolicy(player) == Playerbot::BotMovement::LiquidPolicy::None || !PathTouchesLiquid())
+    if (!ok || (_type & PATHFIND_NOPATH) || !_liquidRouteCheck || !_liquidRouteCheck(_source, _pathPoints))
         return ok;
     _avoidWater = true;
-    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH) && !PathTouchesLiquid();
+    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH) && !_liquidRouteCheck(_source, _pathPoints);
     _avoidWater = false;
     if (dry)
         return true;
     ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);   // restore the first route
     _wetRoute = true;
     return ok;
-}
-
-bool PathGenerator::PathTouchesLiquid() const
-{
-    Player* player = const_cast<Player*>(_source->ToPlayer());
-    if (!player)
-        return false;
-    std::vector<Playerbot::BotMovement::PathPoint> pts;
-    pts.reserve(_pathPoints.size());
-    for (G3D::Vector3 const& v : _pathPoints)
-        pts.push_back({ v.x, v.y, v.z });
-    return Playerbot::BotMovement::PathTouchesLiquid(pts, [player](float x, float y, float z)
-    {
-        return Playerbot::BotMovement::ClassifyDestinationLiquid(player, x, y, z) != Playerbot::BotMovement::LiquidVerdict::Dry;
-    });
 }
 
 bool PathGenerator::CalculatePathImpl(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest)
