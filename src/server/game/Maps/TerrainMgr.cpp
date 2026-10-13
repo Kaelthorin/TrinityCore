@@ -77,7 +77,7 @@ namespace
     void ApplyHandcraftedRoadsIfNeeded(uint32 mapId, uint32 instanceId)
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
-        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", true))
+        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", false))
             return;
 
         std::vector<HandcraftedRoadSegment> const& segs = HandcraftedRoadStorage::GetForMap(mapId);
@@ -151,7 +151,7 @@ namespace TerrainMgrDetail
     std::size_t ApplyHandcraftedRoadsToAllLoadedMaps()
     {
 #if defined(TRINITY_HANDCRAFTED_ROADS)
-        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", true))
+        if (!sConfigMgr->GetBoolDefault("HandcraftedRoads.Enable", false))
             return 0;
 
         // We collect mapIds first (deduplicated) so the inner apply pass

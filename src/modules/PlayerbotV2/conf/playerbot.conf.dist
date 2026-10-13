@@ -42,6 +42,13 @@ Logger.playerbot.api=3,Playerbot CrashRing
 # Slope-aware path cost (worldserver.conf, Pathfinding.SlopeCoefficient): each segment costs 1 + slope degrees * value / 100.
 Pathfinding.SlopeCoefficient = 1.0
 
+# Handcrafted roads (worldserver.conf, HandcraftedRoads.Enable): tag the handcrafted_road segments of the shared database on each
+# map's navmesh, so paths prefer them.
+HandcraftedRoads.Enable = 1
+
+# Road routing (worldserver.conf, RoadGraph.Enable and RoadGraph.*): bots follow the handcrafted road polylines on long ground trips.
+RoadGraph.Enable = 1
+
 #-----------------------------------------------------------------------------
 # Core / threading
 #-----------------------------------------------------------------------------

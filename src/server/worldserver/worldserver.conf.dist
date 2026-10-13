@@ -434,7 +434,6 @@ mmap.enablePathFinding = 1
 #                     each <map>_<y>_<x>.map). Polygons without a road
 #                     tag are unaffected — old extracted mmaps without
 #                     .road files behave identically to before.
-#                     See src/modules/PlayerbotV2/docs/ROAD_AWARE_PATHFINDING_PLAN.md.
 #        Default:     0 - (Disabled, neutral cost for road polygons)
 #                     1 - (Enabled, road polygons cost less to traverse)
 
@@ -490,10 +489,11 @@ Pathfinding.SlopeCoefficient = 0.0
 #    HandcraftedRoads.Enable
 #        Description: Apply operator-curated road segments from the handcrafted_road table
 #                     to each map's navmesh at load time.  Tagged polys get the road-bias in
-#                     PathGenerator (slope-aware road bonus). Set to 0 to disable for debugging.
-#        Default:     1
+#                     PathGenerator (slope-aware road bonus). The bot module's playerbot.conf sets 1.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 ###################################################################################################
-HandcraftedRoads.Enable = 1
+HandcraftedRoads.Enable = 0
 
 ###################################################################################################
 # Handcrafted road centerline routing (bots)
@@ -503,7 +503,9 @@ HandcraftedRoads.Enable = 1
 #                     bots FOLLOW the authored road polylines for long ground trips (via a waypoint
 #                     spline) instead of only getting the NAV_AREA_ROAD area-cost nudge. The
 #                     area-cost bias (HandcraftedRoads.Enable above) remains the fallback.
-#        Default:     1 (enabled)
+#                     The bot module's playerbot.conf sets 1.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
 #
 #    RoadGraph.MinDistance
 #        Description: Minimum straight-line distance (yards) before road routing is considered.
@@ -526,7 +528,7 @@ HandcraftedRoads.Enable = 1
 #                     shared junction node when building the graph.
 #        Default:     3.0
 ###################################################################################################
-RoadGraph.Enable = 1
+RoadGraph.Enable = 0
 RoadGraph.MinDistance = 150.0
 RoadGraph.MaxDetourRatio = 1.6
 RoadGraph.MaxEntryDistance = 120.0
@@ -1250,11 +1252,6 @@ Instance.MoltenCoreHoundsLinked = 0
 Instance.MoltenCoreSkipRunes = 0
 
 #
-#    Instance.CombatResurrectionLimit
-#        Description: Retail rule: during a raid boss encounter a resurrection spell needs a combat
-#                     resurrection charge (one charge, refilled on a timer). Classic has no such limit:
-#                     off, any resurrection works at any time, also with the boss still in combat.
-#        Default:     0 - (Disabled, the classic way)
 #    Instance.CombatResurrectionLimit
 #        Description: Limit resurrections during a boss encounter to the encounter's combat
 #                     resurrection charges. Classic has no such limit.
@@ -4861,6 +4858,3 @@ Discord.Channel.Enable = 0
 #        Default:     "Discord"
 
 Discord.Channel.Name = "Discord"
-#
-###################################################################################################
-
