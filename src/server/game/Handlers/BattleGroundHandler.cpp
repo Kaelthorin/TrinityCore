@@ -340,7 +340,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Player not in queue!",
             GetPlayerInfo(), battlefieldPort.Ticket.Id, uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite));
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*not_in_queue*/ 1, 0);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*not in queue*/ 1, 0);
         return;
     }
 
@@ -386,7 +386,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Invalid queueSlot!",
             GetPlayerInfo(), battlefieldPort.Ticket.Id, uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite));
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*invalid_queue_slot*/ 2, 0);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*invalid queue slot*/ 2, 0);
         if (!battlefieldPort.AcceptedInvite)
             leaveAllQueues();
         return;
@@ -400,7 +400,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Player not in queue (No player Group Info)!",
             GetPlayerInfo(), battlefieldPort.Ticket.Id, uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite));
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*no_group_info*/ 3, 0);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*no group info*/ 3, 0);
         if (!battlefieldPort.AcceptedInvite)
             leaveAllQueues();
         return;
@@ -410,7 +410,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Player is not invited to any bg!",
             GetPlayerInfo(), battlefieldPort.Ticket.Id, uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite));
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*ginfo_not_invited*/ 4, 0);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*not invited*/ 4, 0);
         return;
     }
 
@@ -431,7 +431,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Cant find BG with id {}!",
             GetPlayerInfo(), battlefieldPort.Ticket.Id, uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite), ginfo.IsInvitedToBGInstanceGUID);
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*bg_instance_gone*/ 5, ginfo.IsInvitedToBGInstanceGUID);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*instance gone*/ 5, ginfo.IsInvitedToBGInstanceGUID);
         return;
     }
     else if (bg)
@@ -444,8 +444,7 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
     PVPDifficultyEntry const* bracketEntry = DB2Manager::GetBattlegroundBracketByLevel(mapId, _player->GetLevel());
     if (!bracketEntry)
     {
-        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*no_bracket_entry*/ 6,
-            ginfo.IsInvitedToBGInstanceGUID);
+        sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*no bracket*/ 6, ginfo.IsInvitedToBGInstanceGUID);
         return;
     }
 
@@ -476,15 +475,13 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
         // check Freeze debuff
         if (_player->HasAura(9454))
         {
-            sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*freeze_debuff*/ 7,
-                ginfo.IsInvitedToBGInstanceGUID);
+            sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*frozen*/ 7, ginfo.IsInvitedToBGInstanceGUID);
             return;
         }
 
         if (!_player->IsInvitedForBattlegroundQueueType(bgQueueTypeId))
         {
-            sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*invite_flag_cleared*/ 8,
-                ginfo.IsInvitedToBGInstanceGUID);
+            sScriptMgr->OnPlayerBattlegroundPortFailed(_player, /*invite no longer valid*/ 8, ginfo.IsInvitedToBGInstanceGUID);
             return;                                 // cheating?
         }
 

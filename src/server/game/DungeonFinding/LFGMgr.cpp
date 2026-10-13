@@ -33,6 +33,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "RBAC.h"
 #include "SharedDefines.h"
 #include "SocialMgr.h"
