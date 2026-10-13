@@ -38,14 +38,10 @@ void WorldSession::HandleInspectOpcode(WorldPackets::Inspect::Inspect& inspect)
     TC_LOG_DEBUG("network", "WorldSession::HandleInspectOpcode: Target {}.", inspect.Target.ToString());
 
     if (!GetPlayer()->IsWithinDistInMap(player, INSPECT_DISTANCE, false))
-    {
         return;
-    }
 
     if (GetPlayer()->IsValidAttackTarget(player))
-    {
         return;
-    }
 
     WorldPackets::Inspect::InspectResult inspectResult;
     inspectResult.DisplayInfo.Initialize(player);

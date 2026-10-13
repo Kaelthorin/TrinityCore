@@ -1998,37 +1998,17 @@ void Map::SendObjectUpdates()
 {
     UpdateDataMapType update_players;
 
-
     while (!_updateObjects.empty())
     {
         BaseEntity* obj = *_updateObjects.begin();
         _updateObjects.erase(_updateObjects.begin());
 
-        // PLAYERBOT FIX: Multiple safety checks for race condition prevention
-        //
-        // Race condition scenarios:
-        // 1. BaseEntity::RemoveFromWorld() sets m_inWorld=false before ClearUpdateMask removes from set
-        // 2. Bot marked for removal (SetDestroyedObject) but still in _updateObjects due to re-add
-        // 3. Object freed but memory not yet overwritten - partial corruption
-        //
-        // Check 1: Skip objects not in world
-        if (!obj->IsInWorld())
-        {
-            TC_LOG_DEBUG("maps", "Map::SendObjectUpdates: Skipping object not in world");
+        // Skipped instead of asserting: a bot being removed can still be in _updateObjects after RemoveFromWorld cleared m_inWorld,
+        // or after it was marked for destruction (SetDestroyedObject) and re-added
+        if (!obj->IsInWorld() || obj->IsDestroyedObject())
             continue;
-        }
-
-        // Check 2: Skip objects marked for destruction (prevents use-after-free)
-        // This catches objects that passed IsInWorld() but are being destroyed
-        if (obj->IsDestroyedObject())
-        {
-            TC_LOG_DEBUG("maps", "Map::SendObjectUpdates: Skipping destroyed object");
-            continue;
-        }
-
 
         obj->BuildUpdate(update_players);
-
     }
 
     WorldPacket packet;                                     // here we allocate a std::vector with a size of 0x10000

@@ -1060,7 +1060,6 @@ class TC_GAME_API WorldSession
         uint32 GetClientBuild() const { return _clientBuild; }
         ClientBuild::VariantId const& GetClientBuildVariant() const { return _clientBuildVariant; }
 
-
         // A session without a client, run by a module (bots): no socket, shares its owner's account.
         bool IsBot() const { return _isBot; }
 
@@ -2141,11 +2140,8 @@ class TC_GAME_API WorldSession
 
         ConnectToKey _instanceConnectKey;
 
-        bool _isBot;
-
         WorldSession(WorldSession const& right) = delete;
         WorldSession& operator=(WorldSession const& right) = delete;
 };
-
 
 #endif

@@ -27,7 +27,6 @@
 #include "Map.h"
 #include "NPCHandler.h"
 #include "ObjectAccessor.h"
-#include "Config.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "QueryPackets.h"

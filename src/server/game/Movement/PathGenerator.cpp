@@ -28,7 +28,6 @@
 #include "Metric.h"
 #include "PhasingHandler.h"
 #include "Player.h"
-#include "WorldSession.h"
 #include <array>
 #include <mutex>
 
