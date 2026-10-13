@@ -16,15 +16,12 @@
  */
 
 #include "MovementPackets.h"
-#include "Log.h"
 #include "MoveSpline.h"
 #include "MoveSplineFlag.h"
 #include "MovementTypedefs.h"
 #include "PacketOperators.h"
 #include "UnitDefines.h"
 #include "Util.h"
-#include <atomic>
-#include <cmath>
 
 ByteBuffer& operator<<(ByteBuffer& data, MovementInfo::TransportInfo const& transportInfo)
 {
@@ -670,46 +667,6 @@ void MonsterMove::InitializeSplineData(::Movement::MoveSpline const& moveSpline)
             }
         }
     }
-}
-
-Optional<ZeroLengthSegment> FindZeroLengthSegment(MonsterMove const& packet, float minLength)
-{
-    MovementSpline const& spline = packet.SplineData.Move;
-    if (spline.Points.empty())
-        return {};
-
-    std::vector<Position> nodes;
-    nodes.reserve(1 + spline.Points.size() + spline.PackedDeltas.size());
-    nodes.push_back(packet.Pos.Pos);
-    if (spline.PackedDeltas.empty())
-    {
-        for (TaggedPosition<Position::XYZ> const& point : spline.Points)
-            nodes.push_back(point.Pos);
-    }
-    else
-    {
-        // compressed path: the wire carries the last point and, for every point in between, middle - point quantized to 1/4 yard
-        // (11/11/10 bit two's complement, truncated toward zero), middle being the centre of start and last point
-        Position const& last = spline.Points.front().Pos;
-        float const mx = (packet.Pos.Pos.GetPositionX() + last.GetPositionX()) * 0.5f;
-        float const my = (packet.Pos.Pos.GetPositionY() + last.GetPositionY()) * 0.5f;
-        float const mz = (packet.Pos.Pos.GetPositionZ() + last.GetPositionZ()) * 0.5f;
-        for (TaggedPosition<Position::PackedXYZ> const& delta : spline.PackedDeltas)
-            nodes.emplace_back(mx - QuantizePackedDelta(delta.Pos.GetPositionX(), 11), my - QuantizePackedDelta(delta.Pos.GetPositionY(), 11),
-                mz - QuantizePackedDelta(delta.Pos.GetPositionZ(), 10));
-        nodes.push_back(last);
-    }
-
-    for (uint32 i = 0; i + 1 < nodes.size(); ++i)
-    {
-        float const dx = nodes[i + 1].GetPositionX() - nodes[i].GetPositionX();
-        float const dy = nodes[i + 1].GetPositionY() - nodes[i].GetPositionY();
-        float const dz = nodes[i + 1].GetPositionZ() - nodes[i].GetPositionZ();
-        float const length = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (!(length >= minLength))
-            return ZeroLengthSegment{ i, uint32(nodes.size()), length };
-    }
-    return {};
 }
 
 WorldPacket const* MonsterMove::Write()

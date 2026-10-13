@@ -43,8 +43,6 @@
 #include "ProcessPriority.h"
 #include "RASession.h"
 #include "RealmList.h"
-#include "Realm.h"
-#include "ClassicOpcodes.h"
 #include "ScriptLoader.h"
 #include "ScriptMgr.h"
 #include "ScriptReloadMgr.h"
@@ -131,7 +129,6 @@ void StopDB();
 void WorldUpdateLoop();
 void ClearOnlineAccounts(uint32 realmId);
 void PruneCrashFiles(size_t keep);
-void LogStartupSelfCheck(Realm const& realm);
 void AddModuleScripts();                             // generated from src/modules, empty when no module is built
 void AddAllScripts() { AddScripts(); AddModuleScripts(); }
 struct ShutdownTCSoapThread { void operator()(std::thread* thread) const; };
@@ -339,7 +336,6 @@ int main(int argc, char** argv)
         return 1;
 
     PruneCrashFiles(5);
-    LogStartupSelfCheck(*realm);
 
     // Set server offline (not connectable)
     LoginDatabase.DirectPExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", Trinity::Legacy::REALM_FLAG_OFFLINE, realmId);
@@ -703,20 +699,6 @@ void StopDB()
     LoginDatabase.Close();
 
     MySQL::Library_End();
-}
-
-/// One block at every start: which build runs, with which protocol numbering and the settings that decided
-/// a test run. Read it first when a log is handed over.
-void LogStartupSelfCheck(Realm const& realm)
-{
-    auto value = [](char const* key) { return sConfigMgr->GetStringDefault(key, "(default)"); };
-
-    TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {})", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate());
-    TC_LOG_INFO("server.worldserver", "[startup] realm {} (id {}) build {}: client numbering {}", realm.Name, realm.Id.Realm, realm.Build,
-        ClassicOpcodes::IsBuild70291OrLater() ? "70291" : "70245");
-    TC_LOG_INFO("server.worldserver", "[startup] network: EnterEncryptedModeDelay={} SkipBuildAuthKeyCheck={}", value("Network.EnterEncryptedModeDelay"),
-        value("Network.SkipBuildAuthKeyCheck"));
-    TC_LOG_INFO("server.worldserver", "[startup] classic: GuildFinder={} OfficialFeatureFlags={}", value("Classic.GuildFinder"), value("Classic.OfficialFeatureFlags"));
 }
 
 /// Clear 'online' status for all accounts with characters in this realm

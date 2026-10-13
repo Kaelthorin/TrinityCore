@@ -21,8 +21,6 @@
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
-#include "ClassicOpcodes.h"
-#include "Config.h"
 #include "Formulas.h"
 #include "GameObject.h"
 #include "GameTime.h"
@@ -30,7 +28,6 @@
 #include "Item.h"
 #include "LFGMgr.h"
 #include "Log.h"
-#include "Util.h"
 #include "Loot.h"
 #include "MapManager.h"
 #include "MiscPackets.h"
@@ -925,8 +922,7 @@ void Group::SendUpdateToPlayer(Player* player, MemberSlot const* slot /*= nullpt
         partyUpdate.LfgInfos->MyKickVoteCount = 0;
     }
 
-    WorldPacket const* packet = partyUpdate.Write();
-    player->SendDirectMessage(packet);
+    player->SendDirectMessage(partyUpdate.Write());
 }
 
 void Group::SendUpdateDestroyGroupToPlayer(Player* player) const

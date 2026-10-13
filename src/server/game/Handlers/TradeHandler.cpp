@@ -38,7 +38,6 @@ void WorldSession::SendTradeStatus(WorldPackets::Trade::TradeStatus& info)
     info.Clear();   // reuse packet
     Player* trader = _player->GetTrader();
     info.PartnerIsSameBnetAccount = trader && trader->GetSession()->GetBattlenetAccountId() == GetBattlenetAccountId();
-    // Every status sent, with its value: a trade window that never opens is diagnosed from what each side was told.
     SendPacket(info.Write());
 }
 
