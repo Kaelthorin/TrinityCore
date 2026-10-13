@@ -33,11 +33,6 @@ char const* GitRevision::GetBranch()
     return TRINITY_GIT_COMMIT_BRANCH;
 }
 
-char const* GitRevision::GetUpstreamPin()
-{
-    return FOREVER_UPSTREAM_PIN;
-}
-
 char const* GitRevision::GetCMakeCommand()
 {
     return TRINITY_BUILD_CMAKE_COMMAND;

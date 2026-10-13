@@ -770,14 +770,13 @@ void PruneCrashFiles(size_t keep)
         TC_LOG_INFO("server.worldserver", "[startup] removed {} old crash sets from {} (kept the newest {})", byAge.size() - keep, folder.string(), keep);
 }
 
-/// One block at every start: which build runs, against which upstream, with which protocol numbering and the settings that decided
+/// One block at every start: which build runs, with which protocol numbering and the settings that decided
 /// a test run. Read it first when a log is handed over.
 void LogStartupSelfCheck(Realm const& realm)
 {
     auto value = [](char const* key) { return sConfigMgr->GetStringDefault(key, "(default)"); };
 
-    TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {}), upstream pin {}", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate(),
-        GitRevision::GetUpstreamPin());
+    TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {})", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate());
     TC_LOG_INFO("server.worldserver", "[startup] realm {} (id {}) build {}: client numbering {}", realm.Name, realm.Id.Realm, realm.Build,
         ClassicOpcodes::CurrentBuild() == ClassicOpcodes::Build::Build70291 ? "70291" : "70245");
     TC_LOG_INFO("server.worldserver", "[startup] network: EnterEncryptedModeDelay={} SkipBuildAuthKeyCheck={}", value("Network.EnterEncryptedModeDelay"),
