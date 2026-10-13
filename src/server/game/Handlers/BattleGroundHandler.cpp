@@ -29,7 +29,6 @@
 #include "DB2Stores.h"
 #include "DisableMgr.h"
 #include "GameTime.h"
-#include "GossipDef.h"
 #include "Group.h"
 #include "Language.h"
 #include "Log.h"
@@ -108,7 +107,7 @@ void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
     if (!bgTemplate)
     {
         TC_LOG_ERROR("bg.battleground", "Battleground: no battleground_template for type {}, join by {} ignored", uint32(bgTypeId), _player->GetName());
-        ChatHandler(this).PSendSysMessage("This battleground is not available on this server.");
+        ChatHandler(this).SendSysMessage("This battleground is not available on this server.");
         return;
     }
 
@@ -117,7 +116,7 @@ void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
     if (!bracketEntry)
     {
         TC_LOG_ERROR("bg.battleground", "Battleground: no level bracket for map {} at level {}, join by {} ignored", bgTemplate->MapIDs.front(), uint32(_player->GetLevel()), _player->GetName());
-        ChatHandler(this).PSendSysMessage("No level bracket exists for this battleground at your level.");
+        ChatHandler(this).SendSysMessage("No level bracket exists for this battleground at your level.");
         return;
     }
 
@@ -232,9 +231,6 @@ void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
         uint32 queueSlot = _player->AddBattlegroundQueueId(bgQueueTypeId);
 
         WorldPackets::Battleground::BattlefieldStatusQueued battlefieldStatus;
-        // The ticket time must be the one the invite and port statuses use (Player::GetBattlegroundQueueJoinTime, in seconds). The group's
-        // JoinTime is in milliseconds, so the queued and the invite status looked like two different tickets to the 70205 client: two
-        // Warsong Gulch entries, and Enter on the invite did nothing.
         BattlegroundMgr::BuildBattlegroundStatusQueued(&battlefieldStatus, _player, queueSlot, _player->GetBattlegroundQueueJoinTime(bgQueueTypeId), bgQueueTypeId, avgTime, false);
         SendPacket(battlefieldStatus.Write());
 
@@ -266,14 +262,14 @@ void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
 
         if (err)
         {
-            // The client closes the join window on a failed status without saying why; say it in chat as well.
+            // the client closes the join window on a failed status without saying why
             Player const* culprit = errorGuid.IsEmpty() ? nullptr : ObjectAccessor::FindPlayer(errorGuid);
             ChatHandler(this).SendSysMessage(Trinity::StringFormat("Cannot join the battleground queue as a group: {} (error {}).{}",
                 err == ERR_BATTLEGROUND_JOIN_RANGE_INDEX ? "group members are in different level brackets" :
                 err == ERR_GROUP_JOIN_BATTLEGROUND_DESERTERS ? "a group member is a deserter" :
                 err == ERR_BATTLEGROUND_TOO_MANY_QUEUES ? "a group member has no free queue slot" : "a group member is not eligible",
                 uint32(err), culprit ? " Check " + culprit->GetName() + "." : std::string()));
-            TC_LOG_ERROR("bg.battleground", "Battleground: group queue of {} rejected, error {}, member {}", _player->GetName(), uint32(err), errorGuid.ToString());
+            TC_LOG_DEBUG("bg.battleground", "Battleground: group queue of {} rejected, error {}, member {}", _player->GetName(), uint32(err), errorGuid.ToString());
         }
 
         for (GroupReference const& itr : grp->GetMembers())
@@ -335,7 +331,6 @@ void WorldSession::HandleBattlefieldListOpcode(WorldPackets::Battleground::Battl
 
 void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::BattlefieldPort& battlefieldPort)
 {
-
     if (!_player->InBattlegroundQueue())
     {
         TC_LOG_DEBUG("bg.battleground", "CMSG_BATTLEFIELD_PORT {} Slot: {}, Unk: {}, Time: {}, AcceptedInvite: {}. Player not in queue!",
@@ -540,29 +535,14 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
         if (!bgQueue.GetQueueId().TeamSize)
             sBattlegroundMgr->ScheduleQueueUpdate(ginfo.ArenaMatchmakerRating, bgQueueTypeId, bracketEntry->GetBracketId());
 
-        // The leave-queue branch must not require a live Battleground
-        // instance. The early-return at the top of this function only
-        // discards the case `!bg && AcceptedInvite` — a leave-queue port
-        // (AcceptedInvite=false) is allowed to proceed with bg=null when
-        // the BG instance has been destroyed since the queue entry was
-        // created (typical paths: instance timed out before anyone ported,
-        // last member departed, BATTLEGROUND_AA queue with no live arena).
-        // All the actual cleanup above (queue removal, status packet,
-        // schedule update) is correct without bg; only this debug log was
-        // dereferencing it unconditionally. Use the queue's logical type
-        // (bgTypeId is derived from bgQueueTypeId.BattlemasterListId at
-        // the top of the function) — it's the correct identifier for the
-        // queue the player was leaving, regardless of instance liveness.
-        BattlegroundTypeId const loggedBgType = bg ? bg->GetTypeID() : bgTypeId;
         TC_LOG_DEBUG("bg.battleground", "Battleground: player {} ({}) left queue for bgtype {}, queue {{ BattlemasterListId: {}, Type: {}, Rated: {}, TeamSize: {} }}.",
-            _player->GetName(), _player->GetGUID().ToString(), loggedBgType,
+            _player->GetName(), _player->GetGUID().ToString(), bg ? bg->GetTypeID() : bgTypeId,
             bgQueueTypeId.BattlemasterListId, uint32(bgQueueTypeId.Type), bgQueueTypeId.Rated ? "true" : "false", uint32(bgQueueTypeId.TeamSize));
     }
 }
 
 void WorldSession::HandleBattlefieldLeaveOpcode(WorldPackets::Battleground::BattlefieldLeave& /*battlefieldLeave*/)
 {
-
     // not allow leave battleground in combat
     if (_player->IsInCombat())
         if (Battleground* bg = _player->GetBattleground())

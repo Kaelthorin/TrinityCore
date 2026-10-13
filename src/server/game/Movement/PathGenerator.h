@@ -27,19 +27,9 @@
 
 class WorldObject;
 
-// number_of_points*interval = max_path_len. Stock 74 → smooth-path cap 74*4.0f =
-// 296y; any longer path returns PATHFIND_INCOMPLETE (PathGenerator.cpp:609).
-// HISTORY: raising this to 256 (2026-06-16) to fix the travel-graph from_attach=0
-// (FMs at 300-600y came back INCOMPLETE) WORKED for route_ok (18%→~52% with the
-// flight-learn fix) BUT caused a WORLD-THREAD FREEZE: the snapshot-build phase
-// runs UnifiedTravelGraph::FindRoute → sourceWalkable per-node Detour path builds,
-// and at 256 polys each build does ~3.5x more navmesh A* work; under sustained
-// load a single map's build task exceeded the 60s FreezeDetector and crashed the
-// server (run_and_wait hang; 21:22 dump). REVERTED to stock 74 for stability —
-// the global cap was the wrong lever (it makes EVERY build-phase route probe
-// expensive). The from_attach fix belongs in a CHEAP reachability check inside
-// sourceWalkable (e.g. navmesh raycast / bounded poly probe), NOT a global cap
-// raise. Do NOT re-raise this without bounding the build-phase probe cost.
+// 74*4.0f=296y number_of_points*interval = max_path_len
+// this is way more than actual evade range
+// I think we can safely cut those down even more
 #define MAX_PATH_LENGTH         74
 #define MAX_POINT_PATH_LENGTH   74
 
