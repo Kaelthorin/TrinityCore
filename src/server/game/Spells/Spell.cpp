@@ -6986,38 +6986,10 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                     return SPELL_FAILED_DONT_REPORT;
                 }
 
-                // Classic: no mounting indoors (BG start rooms, caves, buildings). The 70205 client spell data does not carry
-                // SPELL_ATTR0_ONLY_OUTDOORS on its mount spells, so the generic check in CheckCast never fired for them.
-                // Battlegrounds are decided by the single rule below (Battleground::GetMountRefusal).
-                if (!IsTriggered() && unitCaster->GetTypeId() == TYPEID_PLAYER && !unitCaster->IsOutdoors() &&
-                    !(unitCaster->ToPlayer()->GetBattleground() && !unitCaster->ToPlayer()->GetBattleground()->isArena()) &&
-                    VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
-                    return SPELL_FAILED_ONLY_OUTDOORS;
-
-                // Battlegrounds: one rule (Battleground::GetMountRefusal), no distance radius. Every refusal logs its reason.
-                if (!IsTriggered() && unitCaster->GetTypeId() == TYPEID_PLAYER)
-                    if (Battleground const* bg = unitCaster->ToPlayer()->GetBattleground())
-                        if (char const* why = bg->GetMountRefusal(unitCaster->ToPlayer()))
-                        {
-                            thread_local std::unordered_map<uint64, uint32> s_mountLogMs;
-                            uint32& lastLog = s_mountLogMs[unitCaster->GetGUID().GetCounter()];
-                            if (lastLog == 0 || getMSTime() - lastLog >= 20000u)
-                            {
-                                lastLog = getMSTime();
-                            }
-                            return SPELL_FAILED_ONLY_OUTDOORS;
-                        }
-                        else if (WorldSession const* mountSession = unitCaster->ToPlayer()->GetSession(); mountSession && !mountSession->IsBot())
-                        {
-                            // A real player's mount is allowed here: log the terrain evidence for it (Karrz, WSG 2026-10-11: a mount was
-                            // allowed inside the Horde flag room). One line per 5 s.
-                            thread_local std::unordered_map<uint64, uint32> s_mountOkMs;
-                            uint32& lastOk = s_mountOkMs[unitCaster->GetGUID().GetCounter()];
-                            if (lastOk == 0 || getMSTime() - lastOk >= 5000u)
-                            {
-                                lastOk = getMSTime();
-                            }
-                        }
+                // Classic: no mounting indoors, nor in a closed battleground start room
+                if (!IsTriggered())
+                    if (Player const* player = unitCaster->ToPlayer(); player && player->IsMountRestrictedHere(true))
+                        return SPELL_FAILED_ONLY_OUTDOORS;
                 break;
             }
             case SPELL_AURA_RANGED_ATTACK_POWER_ATTACKER_BONUS:
@@ -7484,9 +7456,7 @@ void Spell::CheckDst()
 
 SpellCastResult Spell::CheckRange(bool strict) const
 {
-    // A trap object picked its target by its own trigger radius (GameObject::Update). The effect spell's own range is 0 for the Explosive and Frost
-    // Trap effects (the effect is an area around the trap): checking it against the unit that walked in turned every hit that was not on the exact
-    // spot into SPELL_FAILED_OUT_OF_RANGE, and the trap despawned having done nothing.
+    // A trap picked its target by its own trigger radius; the effect spells of some traps have range 0
     if (GameObject const* trap = m_caster->ToGameObject(); trap && trap->GetGoType() == GAMEOBJECT_TYPE_TRAP)
         return SPELL_CAST_OK;
 
@@ -8590,13 +8560,9 @@ SpellEvent::~SpellEvent()
     if (m_Spell->getState() != SPELL_STATE_FINISHED)
         m_Spell->cancel();
 
-
-    // BUGFIX: Clear spell mod taking spell before destruction to prevent assertion failure (Spell.cpp:603)
-    // When KillAllEvents() is called (logout, map change, instance reset), spell events are destroyed
-    // without going through the normal delayed handler that clears m_spellModTakingSpell.
-    // This causes ASSERT(m_caster->ToPlayer()->m_spellModTakingSpell != this) to fail in ~Spell()
-    if (m_Spell->GetCaster() && m_Spell->GetCaster()->GetTypeId() == TYPEID_PLAYER)
-        m_Spell->GetCaster()->ToPlayer()->SetSpellModTakingSpell(m_Spell.get(), false);
+    // events killed on logout or map change skip the handler that clears the spell mod owner's taking spell
+    if (Player* modOwner = m_Spell->GetCaster()->ToPlayer())
+        modOwner->SetSpellModTakingSpell(m_Spell.get(), false);
 
     if (!m_Spell->IsDeletable())
     {

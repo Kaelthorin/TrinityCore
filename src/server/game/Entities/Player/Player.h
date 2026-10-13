@@ -876,6 +876,10 @@ enum class BagSlotFlags : uint32
     PriorityReagents    = 0x0080,
     ExpansionCurrent    = 0x0100,
     ExpansionLegacy     = 0x0200,
+
+    // server only, kept in characters.inventoryBagFlags: the bag sort direction settings (ActivePlayerData)
+    SortBagsRightToLeft     = 0x10000000,
+    InsertItemsLeftToRight  = 0x20000000,
 };
 
 DEFINE_ENUM_FLAG(BagSlotFlags);
@@ -2506,6 +2510,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // These methods are used to periodically update certain area and aura based mechanics used in Heartbeat and Movement
         void UpdateZoneAndAreaId();
         void UpdateIndoorsOutdoorsAuras();
+        bool IsMountRestrictedHere(bool checkStartArea) const;
         void UpdateTavernRestingState();
 
         static Team TeamForRace(uint8 race);

@@ -769,25 +769,13 @@ public:
         uint32 const maxTime = _owner.GetGOInfo()->controlZone.maxTime;
         uint32 const maxSuperiority = _owner.GetGOInfo()->controlZone.maxSuperiority;
 
-        // Superiority beyond maxSuperiority caps the capture speed at
-        // minTime — it must NOT keep extrapolating the line. Unclamped,
-        // EotS tower data (minSup 1, maxSup 5, minTime 90, maxTime 180 →
-        // slope -22.5) hits timeNeeded == 0 at delta 9 (zone freezes via
-        // the ==0 guard) and goes NEGATIVE past it, INVERTING the gain
-        // direction.
-        delta = std::min<uint32>(delta, maxSuperiority);
+        // superiority above maxSuperiority captures at minTime, the line must not be extrapolated past it
+        uint32 const cappedDelta = std::min(delta, std::max(maxSuperiority, minSuperiority));
 
-        // minTime and maxTime are uint32: subtracting them BEFORE the float
-        // cast underflows to ~2^32 whenever minTime < maxTime (always),
-        // turning the slope into +2^30 instead of -22.5. Live-proven
-        // 2026-06-11 via per-heartbeat gain logging in EotS: gain came out
-        // 100/(delta*2^30 - 2^30) — 2.33e-08 at delta 5, 7.76e-09 at
-        // delta 13 — i.e. towers froze for any superiority >= 2, and a
-        // lone player needed ~192s instead of 180s. Cast each operand
-        // first so the subtraction happens in float.
+        // subtract as float, minTime - maxTime in uint32 underflows
         float const slope = (static_cast<float>(minTime) - static_cast<float>(maxTime)) / static_cast<float>(std::max<uint32>(maxSuperiority - minSuperiority, 1));
         float const intercept = static_cast<float>(maxTime) - slope * static_cast<float>(minSuperiority);
-        return slope * static_cast<float>(delta) + intercept;
+        return slope * static_cast<float>(cappedDelta) + intercept;
     }
 
     void HandleUnitEnterExit(std::vector<Player*> const& newTargetList)

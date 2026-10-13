@@ -3321,7 +3321,7 @@ void InstanceMap::UpdateInstanceLock(UpdateBossStateSaveDataEvent const& updateS
                 player->GetSession()->SendCalendarRaidLockoutAdded(newLock);
             }
 
-            // Classic raid info panel only refreshes from SMSG_INSTANCE_INFO, so push it after every boss kill
+            // the Classic raid info panel only refreshes from SMSG_INSTANCE_INFO
             player->SendRaidInfo();
         }
 

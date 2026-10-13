@@ -1464,8 +1464,7 @@ void Group::SetLfgRoles(ObjectGuid guid, uint8 roles)
     if (slot == m_memberSlots.end())
         return;
 
-    // Unchanged roles need no SMSG_PARTY_UPDATE: every send makes each member's
-    // client rebuild its whole party/raid frame roster.
+    // unchanged roles need no party update
     if (slot->roles == roles)
         return;
 

@@ -781,18 +781,10 @@ void CollectionMgr::AddItemAppearance(ItemModifiedAppearanceEntry const* itemMod
     {
         if (IsSetCompleted(set->ID))
         {
+            // the quest reward can grant the set again and call back into here
             if (Quest const* quest = sObjectMgr->GetQuestTemplate(set->TrackingQuestID))
-            {
-                // Idempotency guard: a tracking-quest reward fires display
-                // spells that may re-grant the set's items via transmog
-                // effects, which calls back into AddItemAppearance. Without
-                // this check, RewardQuest -> displaySpell -> AddTransmogSet
-                // -> AddItemAppearance -> RewardQuest cycles to stack
-                // overflow (e.g. heritage armor lines like Quest 53846
-                // "Legacy of the Bronzebeard" with display spell 286946).
                 if (owner->GetQuestStatus(set->TrackingQuestID) != QUEST_STATUS_REWARDED)
                     owner->RewardQuest(quest, LootItemType::Item, 0, owner, false);
-            }
 
             owner->UpdateCriteria(CriteriaType::CollectTransmogSetFromGroup, set->TransmogSetGroupID);
         }

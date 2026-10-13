@@ -344,8 +344,8 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
         return;
     }
 
-    // A leave request whose ticket slot names no queue of ours (the 70205 client keeps its own idea of which queue it joined) removes the
-    // player from the queues they really are in instead of leaving them stuck in a queue the client cannot leave.
+    // a leave whose ticket slot names none of our queues removes the player from the queues he really is in,
+    // otherwise he stays stuck in a queue the client cannot leave
     auto leaveAllQueues = [&]
     {
         for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
@@ -353,32 +353,39 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
             BattlegroundQueueTypeId queued = _player->GetBattlegroundQueueTypeId(i);
             if (queued == BATTLEGROUND_QUEUE_NONE)
                 continue;
+
             WorldPackets::Battleground::BattlefieldStatusNone battlefieldStatus;
             battlefieldStatus.Ticket = battlefieldPort.Ticket;
             battlefieldStatus.Ticket.Id = i;
             SendPacket(battlefieldStatus.Write());
+
             _player->RemoveBattlegroundQueueId(queued);
             sBattlegroundMgr->GetBattlegroundQueue(queued).RemovePlayer(_player->GetGUID(), true);
         }
     };
 
-    // An accept whose ticket slot is not the invited queue (2026-10-07: the client listed two Warsong Gulch entries, only one with Enter,
-    // and Enter did nothing) is pointed at the queue the player was really invited from.
+    // an accept with a ticket slot that is not the invited queue is pointed at the queue the player was really invited from
     if (battlefieldPort.AcceptedInvite)
     {
         auto isInvited = [&](BattlegroundQueueTypeId queued)
         {
             GroupQueueInfo info;
-            return queued != BATTLEGROUND_QUEUE_NONE && sBattlegroundMgr->GetBattlegroundQueue(queued).GetPlayerGroupInfoData(_player->GetGUID(), &info)
+            return queued != BATTLEGROUND_QUEUE_NONE
+                && sBattlegroundMgr->GetBattlegroundQueue(queued).GetPlayerGroupInfoData(_player->GetGUID(), &info)
                 && info.IsInvitedToBGInstanceGUID;
         };
+
         if (!isInvited(_player->GetBattlegroundQueueTypeId(battlefieldPort.Ticket.Id)))
+        {
             for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
+            {
                 if (isInvited(_player->GetBattlegroundQueueTypeId(i)))
                 {
                     battlefieldPort.Ticket.Id = i;
                     break;
                 }
+            }
+        }
     }
 
     BattlegroundQueueTypeId bgQueueTypeId = _player->GetBattlegroundQueueTypeId(battlefieldPort.Ticket.Id);

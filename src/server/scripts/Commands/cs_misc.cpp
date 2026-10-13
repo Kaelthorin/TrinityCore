@@ -659,8 +659,7 @@ public:
         if (!handler->extractPlayerTarget((char*)args, &target, &targetGuid))
             return false;
 
-        // A dead GM typing a bare `.revive` means himself: with a living player selected (a raid bot clicked on) the command would
-        // revive that player and do nothing for the caller (Karrz, MC 2026-10-08: ".revive does nothing" while dead).
+        // a dead GM with a living player selected and no name given revives himself
         if (target && (!args || !*args) && handler->GetSession())
             if (Player* self = handler->GetSession()->GetPlayer(); self && !self->IsAlive() && target != self && target->IsAlive())
                 target = self;

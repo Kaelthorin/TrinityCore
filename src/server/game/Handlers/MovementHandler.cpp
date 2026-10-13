@@ -231,13 +231,9 @@ void WorldSession::HandleMoveWorldportAck()
     TransferAbortParams const denied = newMap ? newMap->CannotEnter(player) : TransferAbortParams(TRANSFER_ABORT_ERROR);
     if (!newMap || denied)
     {
-        // The reason is the whole diagnosis: MAX_PLAYERS (a full raid, or an owning group that is not the player's), ZONE_IN_COMBAT
-        // (encounter in progress), a lock error, or no map at all.
-        TC_LOG_ERROR("network", "Map {} ({}) could not be created for player {} ({}), porting player to homebind: reason {} arg {}{}",
+        TC_LOG_ERROR("network", "Map {} ({}) could not be created for player {} ({}), porting player to homebind (reason {} arg {})",
             loc.Location.GetMapId(), newMap ? newMap->GetMapName() : "Unknown", player->GetGUID().ToString(), player->GetName(),
-            uint32(denied.Reason), uint32(denied.Arg),
-            newMap ? Trinity::StringFormat(" (instance {} players {} group {})", newMap->GetInstanceId(), newMap->GetPlayersCountExceptGMs(),
-                player->GetGroup() ? (player->GetGroup()->isRaidGroup() ? "raid" : "party") : "none") : std::string());
+            uint32(denied.Reason), uint32(denied.Arg));
         player->TeleportTo(player->m_homebind);
         return;
     }

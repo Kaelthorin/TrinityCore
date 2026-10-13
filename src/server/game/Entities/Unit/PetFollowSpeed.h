@@ -1,16 +1,31 @@
-// PetFollowSpeed - a pet following its owner scales its run speed with the gap to the owner (up to +30%) so it can catch up. The
-// scale moves a little with every step the pair takes, and PetAI recomputes it on every update, so each pet sent the nearby players
-// a speed packet (spline run speed + flight speed) several times a second: with a few hundred bots and pets, 43 packets a second
-// to one client. A catch-up change smaller than this is not worth a packet; the pet keeps the speed it has. Tested in
-// tests/game/ClassicPetFollowSpeed.cpp.
+/*
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
 
-#pragma once
+#ifndef TRINITYCORE_PET_FOLLOW_SPEED_H
+#define TRINITYCORE_PET_FOLLOW_SPEED_H
 
-#include <cmath>
+// A pet following its owner scales its run speed with the gap to the owner (up to +30%) to catch up. The scale moves a little
+// with every step and is recomputed on every update, so each small change sent the nearby players a speed packet several times
+// a second. A catch-up change smaller than this is not sent; the pet keeps the speed it has.
+constexpr float PET_CATCH_UP_SPEED_HYSTERESIS = 0.08f;
 
-constexpr float kPetCatchUpSpeedHysteresis = 0.08f;
-
-constexpr bool PetCatchUpSpeedWorthSending(float current_rate, float wanted_rate)
+constexpr bool PetCatchUpSpeedWorthSending(float currentRate, float wantedRate)
 {
-    return (wanted_rate > current_rate ? wanted_rate - current_rate : current_rate - wanted_rate) >= kPetCatchUpSpeedHysteresis;
+    return (wantedRate > currentRate ? wantedRate - currentRate : currentRate - wantedRate) >= PET_CATCH_UP_SPEED_HYSTERESIS;
 }
+
+#endif // TRINITYCORE_PET_FOLLOW_SPEED_H

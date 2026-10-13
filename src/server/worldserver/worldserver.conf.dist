@@ -1177,6 +1177,15 @@ CastUnstuck = 1
 Instance.IgnoreLevel = 0
 
 #
+#    Instance.IgnoreAttunement
+#        Description: Ignore attunement item and quest requirements when entering instances
+#                     (access_requirement item and quest columns).
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+Instance.IgnoreAttunement = 0
+
+#
 #    Instance.IgnoreRaid
 #        Description: Ignore raid group requirement when entering instances.
 #        Default:     0 - (Disabled)
@@ -1207,16 +1216,6 @@ Instance.BindOnEntry = 0
 #                     1 - (Enabled)
 
 Instance.PersistRaidTrash = 0
-
-#
-#    Instance.IgnoreAttunement
-#        Description: Optional server-owner option. The attunement item and quest of an instance
-#                     (access_requirement item / quest columns: Molten Core, Onyxia, Blackwing Lair,
-#                     Naxxramas ...) are not required to enter. Level limits are Instance.IgnoreLevel.
-#        Default:     0 - (Disabled, Blizzlike)
-#                     1 - (Enabled)
-
-Instance.IgnoreAttunement = 0
 
 #
 #    Instance.AhnQirajGatesOpen
@@ -1256,6 +1255,10 @@ Instance.MoltenCoreSkipRunes = 0
 #                     resurrection charge (one charge, refilled on a timer). Classic has no such limit:
 #                     off, any resurrection works at any time, also with the boss still in combat.
 #        Default:     0 - (Disabled, the classic way)
+#    Instance.CombatResurrectionLimit
+#        Description: Limit resurrections during a boss encounter to the encounter's combat
+#                     resurrection charges. Classic has no such limit.
+#        Default:     0 - (Disabled, resurrection works at any time)
 #                     1 - (Enabled)
 
 Instance.CombatResurrectionLimit = 0
@@ -4803,6 +4806,15 @@ Classic.ClientMainGroupInsertIndex = 315
 #                     0 - (Disabled)
 
 Classic.OfficialFeatureFlags = 1
+
+#    Classic.MountIndoorsRules
+#        Description: Vanilla mount rules: no mounting indoors (buildings, caves), walking indoors dismounts, and no mounting
+#                     in the Warsong Gulch start rooms while the doors are closed. The indoor test uses the WMO flags of
+#                     the vmaps (needs vmap.enableLOS).
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+Classic.MountIndoorsRules = 1
 
 #    Classic.Shop.Enabled
 #        Description: In-game Store: shop points, products from world.shop_* (.shop reload), the Gold Market, character

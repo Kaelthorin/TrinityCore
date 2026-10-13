@@ -184,6 +184,16 @@ namespace WorldPackets
             uint32 Amount = 0;
         };
 
+        class SellAllJunkItems final : public ClientPacket
+        {
+        public:
+            explicit SellAllJunkItems(WorldPacket&& packet) : ClientPacket(CMSG_SELL_ALL_JUNK_ITEMS, std::move(packet)) { }
+
+            void Read() override;
+
+            ObjectGuid VendorGUID;
+        };
+
         class ItemTimeUpdate final : public ServerPacket
         {
         public:
@@ -611,16 +621,6 @@ namespace WorldPackets
             void Read() override;
 
             bool Enable = false;
-        };
-
-        class SellAllJunkItems final : public ClientPacket
-        {
-        public:
-            explicit SellAllJunkItems(WorldPacket&& packet) : ClientPacket(CMSG_SELL_ALL_JUNK_ITEMS, std::move(packet)) { }
-
-            void Read() override;
-
-            ObjectGuid VendorGUID;
         };
 
         class AddItemPassive final : public ServerPacket

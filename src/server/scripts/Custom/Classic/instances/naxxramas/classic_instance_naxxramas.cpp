@@ -878,7 +878,7 @@ void classic_instance_naxxramas_InstanceScript::SetData(uint32 uiType, uint32 ui
             UpdateManualDoor(GO_ARAC_ANUB_GATE, uiData);
             break;
         case TYPE_FAERLINA:
-            // A Faerlina that resets alive brings back the Worshippers and Followers killed in the failed attempt.
+            // a Faerlina that resets alive brings back the Worshippers and Followers killed in the failed attempt
             if (m_auiEncounter[uiType] == IN_PROGRESS && (uiData == NOT_STARTED || uiData == FAIL))
                 ClassicRespawnBossPack(instance, NPC_FAERLINA, { NPC_NaxxramasFollower, NPC_NaxxramasWorshipper });
             m_auiEncounter[uiType] = uiData;

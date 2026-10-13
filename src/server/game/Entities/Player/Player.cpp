@@ -152,6 +152,8 @@
 #include "VMapFactory.h"
 #include "VMapManager.h"
 #include "VignettePackets.h"
+#include "VMapFactory.h"
+#include "VMapManager.h"
 #include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -994,7 +996,17 @@ void Player::Update(uint32 p_time)
 
     UpdatePvPFlag(now);
 
-    UpdateComboTarget();
+    // Classic 1.60: combo points are lost when their target dies or is gone
+    if (ObjectGuid comboTarget = GetClassicComboTarget(); !comboTarget.IsEmpty())
+    {
+        Unit* target = ObjectAccessor::GetUnit(*this, comboTarget);
+        if (!target || !target->IsAlive())
+        {
+            SetPower(POWER_COMBO_POINTS, 0);
+            if (!GetClassicComboTarget().IsEmpty())
+                SetClassicComboTarget(ObjectGuid::Empty);
+        }
+    }
 
     UpdateContestedPvP(p_time);
 
@@ -1340,10 +1352,7 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
     if (duel && GetMapId() != teleportLocation.Location.GetMapId() && GetMap()->GetGameObject(m_playerData->DuelArbiter))
         DuelComplete(DUEL_FLED);
 
-    // A near teleport needs a player standing in a map's grid. One that is out of the world (removed from its map for a far
-    // teleport that then failed, e.g. the worldport ack porting it to homebind on the map it just left) still reports its old map
-    // id; as a near teleport it would be acked into Map::PlayerRelocation and assert on RemoveFromGrid. It takes the far path,
-    // which already handles "no old map".
+    // a player out of the world (after a failed far teleport) still reports its old map id but is in no grid: take the far path
     if (IsInWorld() && GetMapId() == teleportLocation.Location.GetMapId() && (!teleportLocation.InstanceId || GetInstanceId() == teleportLocation.InstanceId))
     {
         SetTeleportState(TeleportState::Initiated);
@@ -6920,9 +6929,22 @@ void Player::UpdateIndoorsOutdoorsAuras()
     if (sWorld->getBoolConfig(CONFIG_VMAP_INDOOR_CHECK))
         RemoveAurasWithAttribute(IsOutdoors() ? SPELL_ATTR0_ONLY_INDOORS : SPELL_ATTR0_ONLY_OUTDOORS);
 
-    // Classic: walking into a building or cave dismounts (see Spell::CheckCast, SPELL_AURA_MOUNTED).
-    if (!IsOutdoors() && HasAuraType(SPELL_AURA_MOUNTED) && VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
+    // Classic: walking indoors dismounts
+    if (HasAuraType(SPELL_AURA_MOUNTED) && IsMountRestrictedHere(false))
         RemoveAurasByType(SPELL_AURA_MOUNTED);
+}
+
+// Classic.MountIndoorsRules: the mount spells of the client data do not carry SPELL_ATTR0_ONLY_OUTDOORS
+bool Player::IsMountRestrictedHere(bool checkStartArea) const
+{
+    if (!sWorld->getBoolConfig(CONFIG_CLASSIC_MOUNT_INDOORS_RULES))
+        return false;
+
+    if (Battleground const* bg = GetBattleground(); bg && !bg->isArena())
+        return bg->IsMountRefused(this, checkStartArea);
+
+    // the indoor state comes from the wmo data of the vmaps
+    return !IsOutdoors() && VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled();
 }
 
 void Player::UpdateTavernRestingState()
@@ -14004,33 +14026,31 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     }
 }
 
+// cancels a trade whose partner is gone or out of range, a stale trade would block any new one until relog
 void Player::UpdateTradeState()
 {
     if (!m_trade)
         return;
+
     Player* trader = m_trade->GetTrader();
-    TradeStatus why = TRADE_STATUS_CANCELLED;
-    char const* reason = nullptr;
-    if (!trader || !trader->IsInWorld() || !IsInWorld())
-        reason = "partner gone";
-    else if (!trader->m_trade || trader->m_trade->GetTrader() != this)
-        reason = "partner is not in this trade";
-    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
-    {
-        reason = "out of range";
-        why = TRADE_STATUS_TOO_FAR_AWAY;
-    }
-    if (!reason)
+
+    // a partner on another map is updated by another thread, a new trade request or a logout clears that trade
+    if (trader->IsInWorld() && trader->GetMap() != GetMap())
         return;
-    if (trader && trader->m_trade && trader->m_trade->GetTrader() == this)
-        TradeCancel(true, why);
-    else
+
+    if (!trader->m_trade || trader->m_trade->GetTrader() != this)
     {
-        // The partner's side is gone or unrelated: drop only ours.
-        GetSession()->SendCancelTrade(why);
+        // the partner is no longer in this trade, only our side is left
+        GetSession()->SendCancelTrade(TRADE_STATUS_CANCELLED);
         delete m_trade;
         m_trade = nullptr;
+        return;
     }
+
+    if (!trader->IsInWorld())
+        TradeCancel(true);
+    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
+        TradeCancel(true, TRADE_STATUS_TOO_FAR_AWAY);
 }
 
 void Player::InitiateTrade(Player* trader)
@@ -16552,8 +16572,7 @@ bool Player::SatisfyQuestRace(Quest const* qInfo, bool msg) const
 bool Player::SatisfyQuestMinReputation(Quest const* qInfo, bool msg) const
 {
     uint32 fIdMin = qInfo->GetRequiredMinRepFaction();      //Min required rep
-    // Classic 1.60: quest_template carries later-expansion factions (e.g. #922, #967) missing from the
-    // client data; look them up as an entry (unknown = 0 standing, same result) so quest scans don't flood the error log
+    // looked up as an entry: factions missing from the client data count as 0 standing without logging an error
     if (fIdMin && GetReputationMgr().GetReputation(sFactionStore.LookupEntry(fIdMin)) < qInfo->GetRequiredMinRepValue())
     {
         if (msg)
@@ -19126,6 +19145,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     SetInventorySlotCount(fields.inventorySlots);
     SetBackpackAutoSortDisabled(fields.inventoryBagFlags.HasFlag(BagSlotFlags::DisableAutoSort));
     SetBackpackSellJunkDisabled(fields.inventoryBagFlags.HasFlag(BagSlotFlags::ExcludeJunkSell));
+    SetSortBagsRightToLeft(fields.inventoryBagFlags.HasFlag(BagSlotFlags::SortBagsRightToLeft));
+    SetInsertItemsLeftToRight(fields.inventoryBagFlags.HasFlag(BagSlotFlags::InsertItemsLeftToRight));
     for (uint32 bagIndex = 0; bagIndex < fields.bagSlotFlags.size(); ++bagIndex)
         ReplaceAllBagSlotFlags(bagIndex, fields.bagSlotFlags[bagIndex]);
     SetBankBagSlotCount(fields.bankSlots);
@@ -19444,9 +19465,7 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     if (player_at_bg)
     {
-        // Back in a running battleground after a reconnect: the saved bgTeam was read straight into m_bgData, but the ArenaFaction
-        // update field (which the client uses for friend / foe inside a BG) is only written by SetBGTeam, so it stayed 0 = Horde
-        // (Karrz, WSG 2026-10-08: an Alliance player came back with the Horde shown green and friendly while they killed him).
+        // the loaded bgTeam does not set the ArenaFaction field the client uses for friend / foe
         SetBGTeam(GetBGTeam());
         map->ToBattlegroundMap()->GetBG()->AddPlayer(this, m_bgData.queueId);
     }
@@ -21001,7 +21020,6 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
                     LevelMax = ar->levelMax;
             }
 
-            // Instance.IgnoreAttunement: the attunement item and quest of the instance are not required (optional server option)
             if (!sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_ATTUNEMENT))
             {
                 if (ar->item)
@@ -21382,6 +21400,10 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
                 inventoryFlags |= BagSlotFlags::DisableAutoSort;
             if (m_activePlayerData->BackpackSellJunkDisabled)
                 inventoryFlags |= BagSlotFlags::ExcludeJunkSell;
+            if (m_activePlayerData->SortBagsRightToLeft)
+                inventoryFlags |= BagSlotFlags::SortBagsRightToLeft;
+            if (m_activePlayerData->InsertItemsLeftToRight)
+                inventoryFlags |= BagSlotFlags::InsertItemsLeftToRight;
             return AsUnderlyingType(inventoryFlags);
         }());
         for (uint32 bagSlotFlag : m_activePlayerData->BagSlotFlags)
@@ -21507,6 +21529,10 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
                 inventoryFlags |= BagSlotFlags::DisableAutoSort;
             if (m_activePlayerData->BackpackSellJunkDisabled)
                 inventoryFlags |= BagSlotFlags::ExcludeJunkSell;
+            if (m_activePlayerData->SortBagsRightToLeft)
+                inventoryFlags |= BagSlotFlags::SortBagsRightToLeft;
+            if (m_activePlayerData->InsertItemsLeftToRight)
+                inventoryFlags |= BagSlotFlags::InsertItemsLeftToRight;
             return AsUnderlyingType(inventoryFlags);
         }());
         for (uint32 bagSlotFlag : m_activePlayerData->BagSlotFlags)
@@ -22520,8 +22546,6 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
             stmt->setFloat(6, storedLocation.Loc.GetOrientation());
             trans->Append(stmt);
 
-            // Mark persisted so an unchanged location isn't DELETE+INSERTed on
-            // every subsequent 90s save (redundant writes amplified fleet-wide).
             storedLocation.State = StoredAuraTeleportLocation::UNCHANGED;
         }
 
@@ -23299,8 +23323,7 @@ void Player::Whisper(std::string_view text, Language language, Player* target, b
 
     WorldPackets::Chat::Chat packet;
     packet.Initialize(CHAT_MSG_WHISPER, language, this, this, _text);
-    // Both names travel with a whisper line (stock leaves them to the client's name cache): the Forever client showed no or
-    // grey whispers with bots (Karrz 2026-10-08); a name in the packet cannot be wrong.
+    // send the names too, the receiver may not have the sender in its name cache
     packet.SenderName = GetName();
     packet.TargetName = GetName();
     target->SendDirectMessage(packet.Write());
@@ -29473,31 +29496,22 @@ void Player::_SaveTransmogOutfits(CharacterDatabaseTransaction trans)
 
 void Player::_SaveBGData(CharacterDatabaseTransaction trans)
 {
-    // A character not in (or queued for) a battleground has no BG data worth
-    // persisting. Re-writing an all-zeros row every 90s save for a mostly-non-BG
-    // fleet produced a DELETE(of-nonexistent-row, gap-lock)+INSERT storm on
-    // character_battleground_data — 87 of the [1213] deadlocks in a 6-min bot run.
-    // Skip the write entirely when there is nothing to save. A stale row left by a
-    // since-ended BG is harmless: on relog the instance no longer exists and the
-    // load path drops it; and re-entering a BG rewrites the row.
-    // NOTE: BattlegroundQueueTypeId::GetPacked() unconditionally OR's in the
-    // 0x1F10000000000000 protocol tag, so it is NEVER 0 — even for
-    // BATTLEGROUND_QUEUE_NONE. A `GetPacked() != 0` test is therefore always true
-    // and silently defeated this skip, letting the all-zeros DELETE+INSERT deadlock
-    // storm continue. Compare against the NONE sentinel via the defaulted operator==.
-    const bool hasBgData =
-        m_bgData.bgInstanceID != 0 ||
-        m_bgData.joinPos.GetMapId() != MAPID_INVALID ||
-        m_bgData.taxiPath[0] != 0 || m_bgData.taxiPath[1] != 0 ||
-        m_bgData.mountSpell != 0 ||
-        m_bgData.queueId != BATTLEGROUND_QUEUE_NONE;
-    if (!hasBgData)
-        return;
+    bool const hasBgData = m_bgData.bgInstanceID != 0
+        || m_bgData.bgTeam != TEAM_OTHER
+        || m_bgData.joinPos.GetMapId() != MAPID_INVALID
+        || m_bgData.taxiPath[0] || m_bgData.taxiPath[1]
+        || m_bgData.mountSpell
+        || m_bgData.queueId != BATTLEGROUND_QUEUE_NONE;
 
-    // Single atomic upsert (REPLACE INTO, keyed on the guid PK) instead of
-    // DELETE-then-INSERT. The old two-statement form gap-locked the non-existent
-    // row on DELETE and then INSERTed, which under concurrent fleet saves produced
-    // the [1213] deadlock storm. REPLACE collapses both into one lock acquisition.
+    // one statement per save: an all-empty row is never written, a row left by earlier data is removed
+    if (!hasBgData)
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_PLAYER_BGDATA);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        trans->Append(stmt);
+        return;
+    }
+
     /* guid, bgInstanceID, bgTeam, x, y, z, o, map, taxi[0], taxi[1], mountSpell */
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_PLAYER_BGDATA);
     stmt->setUInt64(0, GetGUID().GetCounter());
@@ -29840,36 +29854,26 @@ void Player::_SaveTalents(CharacterDatabaseTransaction trans)
         }
     }
 
-    // PvP talents: skip the DELETE+per-group-INSERT entirely for a character with
-    // none in any spec group (the whole leveling fleet) — the unconditional write
-    // of MAX_SPECIALIZATIONS all-zeros rows every save is the same gap-lock
-    // deadlock source as BG data above (23 of the run's [1213] deadlocks). A stale
-    // row is harmless — it's overwritten the moment a real PvP talent is chosen.
-    bool hasPvpTalent = false;
-    for (uint8 group = 0; group < MAX_SPECIALIZATIONS && !hasPvpTalent; ++group)
-    {
-        PlayerPvpTalentMap const& t = GetPvpTalentMap(group);
-        if (t[0] || t[1] || t[2] || t[3])
-            hasPvpTalent = true;
-    }
-    if (hasPvpTalent)
-    {
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
-        stmt->setUInt64(0, GetGUID().GetCounter());
-        trans->Append(stmt);
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    trans->Append(stmt);
 
-        for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
-        {
-            PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
-            stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
-            stmt->setUInt64(0, GetGUID().GetCounter());
-            stmt->setUInt32(1, talents[0]);
-            stmt->setUInt32(2, talents[1]);
-            stmt->setUInt32(3, talents[2]);
-            stmt->setUInt32(4, talents[3]);
-            stmt->setUInt8(5, group);
-            trans->Append(stmt);
-        }
+    for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
+    {
+        PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
+
+        // an empty row loads the same as no row
+        if (std::ranges::all_of(talents, [](uint32 talentId) { return talentId == 0; }))
+            continue;
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        stmt->setUInt32(1, talents[0]);
+        stmt->setUInt32(2, talents[1]);
+        stmt->setUInt32(3, talents[2]);
+        stmt->setUInt32(4, talents[3]);
+        stmt->setUInt8(5, group);
+        trans->Append(stmt);
     }
 }
 

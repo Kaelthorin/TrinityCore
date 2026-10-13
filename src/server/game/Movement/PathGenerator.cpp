@@ -609,42 +609,6 @@ void PathGenerator::BuildPolyPath(G3D::Vector3 const& startPos, G3D::Vector3 con
     BuildPointPath(startPoint, endPoint);
 }
 
-// Drop near-coincident consecutive points (< 0.1y). The smooth-path walker and
-// off-mesh-connection handling can emit two points within rounding distance of each
-// other (typically at an off-mesh entry, but also after Z-normalization snaps two
-// near points to the same height); a sub-0.1y INTERIOR segment makes
-// MoveSplineInitArgs::_checkPathLengths() reject the ENTIRE spline, so
-// MoveSplineInit::Launch() silently returns 0 and the unit never moves -- the root
-// cause of units (bots, creatures AND vehicles) wedged at off-mesh bridge mouths and
-// at the entrance of dungeons whose route comes back as a partial (INCOMPLETE)
-// corridor on freshly-regenerated mmaps. Endpoints are always preserved so the true
-// start/destination are never dropped, and a 2-point path is never collapsed.
-void PathGenerator::RemoveNearCoincidentPathPoints()
-{
-    if (_pathPoints.size() <= 2)
-        return;
-    // In-place compaction (no per-pathfind allocation -- this is a fleet-hot path).
-    // Keep point 0, skip interior points coincident with the last kept point, always
-    // keep the final point.
-    size_t w = 1;
-    for (size_t r = 1; r < _pathPoints.size(); ++r)
-    {
-        const bool isLast = (r + 1 == _pathPoints.size());
-        if (!isLast && (_pathPoints[r] - _pathPoints[w - 1]).squaredLength() < 0.01f)
-            continue;
-        _pathPoints[w++] = _pathPoints[r];
-    }
-    // If the kept endpoint collapsed onto its predecessor, drop the predecessor
-    // (preserve the true destination).
-    if (w >= 3 && (_pathPoints[w - 1] - _pathPoints[w - 2]).squaredLength() < 0.01f)
-    {
-        _pathPoints[w - 2] = _pathPoints[w - 1];
-        --w;
-    }
-    if (w >= 2 && w < _pathPoints.size())
-        _pathPoints.resize(w);
-}
-
 void PathGenerator::BuildPointPath(const float *startPoint, const float *endPoint)
 {
     float pathPoints[MAX_POINT_PATH_LENGTH*VERTEX_SIZE];
@@ -734,9 +698,6 @@ void PathGenerator::BuildPointPath(const float *startPoint, const float *endPoin
 
     NormalizePath();
 
-    // Drop near-coincident consecutive points so MoveSplineInitArgs::
-    // _checkPathLengths() accepts the spline (see RemoveNearCoincidentPathPoints;
-    // the same dedupe is applied to the INCOMPLETE partial-corridor branch above).
     RemoveNearCoincidentPathPoints();
     pointCount = uint32(_pathPoints.size());
 
@@ -769,6 +730,33 @@ void PathGenerator::NormalizePath()
 {
     for (uint32 i = 0; i < _pathPoints.size(); ++i)
         _source->UpdateAllowedPositionZ(_pathPoints[i].x, _pathPoints[i].y, _pathPoints[i].z);
+}
+
+// A segment shorter than 0.1 y makes MoveSplineInitArgs::_checkPathLengths() reject the whole spline and the unit does not move.
+// The smooth path walker and off-mesh links can emit such points, and NormalizePath() can move two near points onto each other.
+// The start and the destination are kept, a 2-point path is left alone.
+void PathGenerator::RemoveNearCoincidentPathPoints()
+{
+    if (_pathPoints.size() <= 2)
+        return;
+
+    size_t kept = 1;
+    for (size_t i = 1; i < _pathPoints.size(); ++i)
+    {
+        bool const isLast = i + 1 == _pathPoints.size();
+        if (!isLast && (_pathPoints[i] - _pathPoints[kept - 1]).squaredLength() < 0.01f)
+            continue;
+        _pathPoints[kept++] = _pathPoints[i];
+    }
+
+    // the destination landed on the point before it: drop that point instead
+    if (kept >= 3 && (_pathPoints[kept - 1] - _pathPoints[kept - 2]).squaredLength() < 0.01f)
+    {
+        _pathPoints[kept - 2] = _pathPoints[kept - 1];
+        --kept;
+    }
+
+    _pathPoints.resize(kept);
 }
 
 void PathGenerator::BuildShortcut()
@@ -1358,15 +1346,7 @@ void PathGenerator::ShortenPathUntilDist(G3D::Vector3 const& target, float dist)
     //   ... settle for a guesstimate since i'm not confident in doing trig on every chase motion tick...
     // (@todo review this)
     _pathPoints[i] += (_pathPoints[i - 1] - _pathPoints[i]).direction() * (dist - (_pathPoints[i] - target).length());
-    // The shortened endpoint can land within <0.1y of its predecessor when the
-    // "too far" vertex [i-1] sits right at the `dist` boundary (the move amount
-    // then ~= the entire last segment). A sub-0.1y final segment makes
-    // MoveSplineInitArgs::_checkPathLengths() reject the WHOLE spline, so the unit
-    // never moves -- root cause of bots/creatures/vehicles wedged mid-chase and
-    // during boss approach on 12.0.7 (a flood of "_checkPathLengths() failed").
-    // Drop the collapsed endpoint, keeping its predecessor as the path end (still
-    // >= 2 points). A 2-point path is never affected: _checkPathLengths only
-    // inspects paths with > 2 points.
+    // the new end can land on _pathPoints[i - 1]; a segment shorter than 0.1 y makes _checkPathLengths() reject the spline
     if (i >= 2 && (_pathPoints[i] - _pathPoints[i - 1]).squaredLength() < 0.01f)
         --i;
     _pathPoints.resize(i+1);

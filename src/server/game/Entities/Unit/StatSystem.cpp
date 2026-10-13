@@ -172,9 +172,8 @@ void Player::ApplySpellPowerBonus(int32 amount, bool apply)
 
 void Player::UpdateSpellDamageAndHealingBonus()
 {
-    // RECURSION GUARD: Prevent infinite loop when player has both
-    // SPELL_AURA_OVERRIDE_ATTACK_POWER_BY_SP_PCT and SPELL_AURA_OVERRIDE_SPELL_POWER_BY_AP_PCT
-    // which causes UpdateSpellDamageAndHealingBonus <-> UpdateAttackPowerAndDamage loop
+    // SPELL_AURA_OVERRIDE_ATTACK_POWER_BY_SP_PCT together with SPELL_AURA_OVERRIDE_SPELL_POWER_BY_AP_PCT make this and
+    // UpdateAttackPowerAndDamage call each other without end
     thread_local bool inSpellDamageUpdate = false;
     if (inSpellDamageUpdate)
         return;

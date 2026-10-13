@@ -608,13 +608,9 @@ void WorldSession::HandleCancelTradeOpcode(WorldPackets::Trade::CancelTrade& /*c
 
 void WorldSession::HandleInitiateTradeOpcode(WorldPackets::Trade::InitiateTrade& initiateTrade)
 {
+    // the client only asks for a trade when it has none open, a trade still held here is stale
     if (GetPlayer()->m_trade)
-    {
-        // A client only sends an initiate when it believes no trade is open, so a trade still held server side is stale (a
-        // partner that never answered, a cancel the client missed): clear it, on both sides, and open the new one. Silently
-        // ignoring it left the player unable to trade with anyone ("already trading") until a relog.
         GetPlayer()->TradeCancel(true);
-    }
 
     WorldPackets::Trade::TradeStatus info;
     if (!GetPlayer()->IsAlive())

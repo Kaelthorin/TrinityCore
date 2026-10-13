@@ -994,8 +994,6 @@ void Channel::SendToAll(Builder& builder, ObjectGuid const& guid, ObjectGuid con
 
     for (PlayerContainer::value_type const& i : _playersStore)
         if (Player* player = ObjectAccessor::FindConnectedPlayer(i.first))
-            // A player mid-logout has already dropped its social list (Player::RemoveSocial) while it still stands in the
-            // channel and in the connected-player map: it has no ignore list left, so it hears the message.
             if (guid.IsEmpty() || !player->GetSocial() || !player->GetSocial()->HasIgnore(guid, accountGuid))
                 localizer(player);
 }
@@ -1028,6 +1026,6 @@ void Channel::SendToAllWithAddon(Builder& builder, std::string const& addonPrefi
 
     for (PlayerContainer::value_type const& i : _playersStore)
         if (Player* player = ObjectAccessor::FindConnectedPlayer(i.first))
-            if (player->GetSession()->IsAddonRegistered(addonPrefix) && (guid.IsEmpty() || !player->GetSocial()->HasIgnore(guid, accountGuid)))
+            if (player->GetSession()->IsAddonRegistered(addonPrefix) && (guid.IsEmpty() || !player->GetSocial() || !player->GetSocial()->HasIgnore(guid, accountGuid)))
                 localizer(player);
 }

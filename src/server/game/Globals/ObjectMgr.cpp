@@ -1361,9 +1361,8 @@ void ObjectMgr::CheckCreatureTemplate(CreatureTemplate const* cInfo)
         const_cast<CreatureTemplate*>(cInfo)->speed_run = 1.14286f;
     }
 
-    // the scale is the creature's (and its summons', guardians', pets') ObjectScale: 0 draws a zero-sized model (client "Model FileData
-    // ... scale:0" assert) and zeroes its bounding radius and combat reach (VMaNGOS uses 0 for "the display's own scale"; the
-    // creature_template_model DisplayScale already gets the same treatment in LoadCreatureTemplateModels).
+    // the scale is the ObjectScale of the creature and of its summons: 0 draws a zero-sized model (client assert) and zeroes its
+    // bounding radius and combat reach
     if (!(cInfo->scale > 0.0f))
     {
         TC_LOG_ERROR("sql.sql", "Creature (Entry: {}) has wrong value ({}) in scale, set to 1.", cInfo->Entry, cInfo->scale);
