@@ -445,7 +445,7 @@ class TC_GAME_API UnitScript : public ScriptObject
         // Called when Spell Damage is being Dealt
         virtual void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo);
 
-        // Called when a unit is killed, before the kill (loot, rewards, death state) is processed
+        // Called when a unit is killed, before the kill (loot, rewards, death state) is processed (map thread)
         virtual void OnUnitDeath(Unit* victim, Unit* killer);
 };
 
@@ -760,7 +760,7 @@ class TC_GAME_API PlayerScript : public ScriptObject
 
         virtual void OnChat(Player* player, uint32 type, uint32 lang, std::string& msg, Channel* channel);
 
-        // The following methods are called after a player's say, yell, whisper, group or guild message was sent.
+        // The following methods are called after a player's say, yell, whisper, group or guild message was sent (map thread).
         virtual void OnChatSent(Player* player, uint32 type, uint32 lang, std::string const& msg);
 
         virtual void OnChatSent(Player* player, uint32 type, uint32 lang, std::string const& msg, Player* receiver);
@@ -769,7 +769,7 @@ class TC_GAME_API PlayerScript : public ScriptObject
 
         virtual void OnChatSent(Player* player, uint32 type, uint32 lang, std::string const& msg, Guild* guild);
 
-        // The following methods are called after a player's addon message was sent as a whisper or to the group.
+        // The following methods are called after a player's addon message was sent as a whisper or to the group (map thread).
         virtual void OnAddonMessageSent(Player* player, uint32 type, std::string const& prefix, std::string const& text, Player* receiver);
 
         virtual void OnAddonMessageSent(Player* player, uint32 type, std::string const& prefix, std::string const& text, Group* group);
@@ -818,7 +818,7 @@ class TC_GAME_API PlayerScript : public ScriptObject
         // Called when a player completes a movie
         virtual void OnMovieComplete(Player* player, uint32 movieId);
 
-        // Called when a looted item was stored in the player's bags
+        // Called when a looted item was stored in the player's bags (map thread)
         virtual void OnLootItem(Player* player, Item* item);
 
         // Called after a player (alone or as group leader) joined a battleground queue
@@ -935,7 +935,7 @@ class TC_GAME_API GroupScript : public ScriptObject
         // Called when a group is disbanded.
         virtual void OnDisband(Group* group);
 
-        // Called when a raid member is moved to another subgroup.
+        // Called when a raid member is moved to another subgroup (map thread).
         virtual void OnSubgroupChange(Group* group, ObjectGuid guid, uint8 subgroup);
 };
 

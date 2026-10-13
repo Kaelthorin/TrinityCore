@@ -12,6 +12,7 @@
 # pulls every sub-lib onto the link line, so circular references between
 # sub-libs are resolved naturally by the multi-archive symbol search.
 
+option(BUILD_PLAYERBOT_V2 "Build the WoW Forever Bots module (Playerbot V2)" 0)
 if(NOT BUILD_PLAYERBOT_V2)
   return()
 endif()

@@ -53,7 +53,7 @@ void WorldSession::HandleLfgJoinOpcode(WorldPackets::LFG::DFJoin& dfJoin)
 
     sLFGMgr->JoinLfg(GetPlayer(), uint8(dfJoin.Roles), newDungeons);
 
-    if (!newDungeons.empty())
+    if (!newDungeons.empty() && sLFGMgr->GetState(GetPlayer()->GetGUID()) != lfg::LFG_STATE_NONE)
         sScriptMgr->OnPlayerLfgJoin(GetPlayer(), *newDungeons.begin(), uint8(dfJoin.Roles));
 }
 
