@@ -24,8 +24,9 @@
 
 namespace
 {
-// Fixed storage: the crash handler reads it without taking a lock or allocating. Log messages reach the appenders one at a time (one
-// strand), so the writer needs no lock either; a line being written while the process dies may come out cut, which is acceptable.
+// Fixed storage: the crash handler reads it without taking a lock or allocating. Appenders can be called from several threads at once
+// (synchronous logging), so each writer reserves its own slot with one atomic increment; a line being written while the process dies,
+// or while the ring wraps onto it, may come out cut, which is acceptable for a crash report.
 char s_lines[AppenderCrashRing::MaxLines][AppenderCrashRing::LineChars];
 std::atomic<uint64> s_written{ 0 };         // total lines ever written
 std::atomic<uint32> s_capacity{ 200 };      // lines kept (configurable, at most MaxLines)
@@ -45,7 +46,7 @@ AppenderCrashRing::AppenderCrashRing(uint8 id, std::string name, LogLevel level,
 
 void AppenderCrashRing::_write(LogMessage const* message)
 {
-    uint64 const index = s_written.load(std::memory_order_relaxed);
+    uint64 const index = s_written.fetch_add(1, std::memory_order_acq_rel);
     char* slot = s_lines[index % s_capacity.load(std::memory_order_relaxed)];
 
     size_t length = std::min<size_t>(message->prefix.size(), LineChars - 1);
@@ -54,8 +55,6 @@ void AppenderCrashRing::_write(LogMessage const* message)
     std::memcpy(slot + length, message->text.data(), textLength);
     length += textLength;
     slot[length] = '\0';
-
-    s_written.store(index + 1, std::memory_order_release);
 }
 
 size_t AppenderCrashRing::Snapshot(char* out, size_t capacity)
@@ -67,8 +66,20 @@ size_t AppenderCrashRing::Snapshot(char* out, size_t capacity)
     uint32 const kept = s_capacity.load(std::memory_order_relaxed);
     uint64 const first = written > kept ? written - kept : 0;
 
+    // the newest lines matter most: walk back from the newest to find how many fit (each line + '\n', plus the final NUL)
+    uint64 start = written;
+    size_t needed = 1;
+    while (start > first)
+    {
+        size_t const length = strnlen(s_lines[(start - 1) % kept], LineChars);
+        if (needed + length + 1 > capacity)
+            break;
+        needed += length + 1;
+        --start;
+    }
+
     size_t used = 0;
-    for (uint64 i = first; i < written; ++i)
+    for (uint64 i = start; i < written; ++i)
     {
         char const* line = s_lines[i % kept];
         size_t const length = strnlen(line, LineChars);

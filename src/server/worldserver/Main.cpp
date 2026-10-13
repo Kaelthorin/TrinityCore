@@ -131,7 +131,10 @@ void StopDB();
 void WorldUpdateLoop();
 void ClearOnlineAccounts(uint32 realmId);
 void PruneCrashFiles(size_t keep);
+<<<<<<< HEAD
 void LogStartupSelfCheck(Realm const& realm);
+=======
+>>>>>>> origin/forever
 void AddModuleScripts();                             // generated from src/modules, empty when no module is built
 void AddAllScripts() { AddScripts(); AddModuleScripts(); }
 struct ShutdownTCSoapThread { void operator()(std::thread* thread) const; };
@@ -339,7 +342,10 @@ int main(int argc, char** argv)
         return 1;
 
     PruneCrashFiles(5);
+<<<<<<< HEAD
     LogStartupSelfCheck(*realm);
+=======
+>>>>>>> origin/forever
 
     // Set server offline (not connectable)
     LoginDatabase.DirectPExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", Trinity::Legacy::REALM_FLAG_OFFLINE, realmId);
@@ -705,9 +711,34 @@ void StopDB()
     MySQL::Library_End();
 }
 
+/// One block at every start: which build runs, with which protocol numbering and the settings that decided
+/// a test run. Read it first when a log is handed over.
+void LogStartupSelfCheck(Realm const& realm)
+{
+    auto value = [](char const* key) { return sConfigMgr->GetStringDefault(key, "(default)"); };
+
+    TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {})", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate());
+    TC_LOG_INFO("server.worldserver", "[startup] realm {} (id {}) build {}: client numbering {}", realm.Name, realm.Id.Realm, realm.Build,
+        ClassicOpcodes::IsBuild70291OrLater() ? "70291" : "70245");
+    TC_LOG_INFO("server.worldserver", "[startup] network: EnterEncryptedModeDelay={} SkipBuildAuthKeyCheck={}", value("Network.EnterEncryptedModeDelay"),
+        value("Network.SkipBuildAuthKeyCheck"));
+    TC_LOG_INFO("server.worldserver", "[startup] classic: GuildFinder={} OfficialFeatureFlags={}", value("Classic.GuildFinder"), value("Classic.OfficialFeatureFlags"));
+}
+
 /// Clear 'online' status for all accounts with characters in this realm
-/// The crash handler writes {hash}_{exe}_[date].dmp / .txt / .log into <exe folder>\Crashes. Keeps the files of the newest `keep`
-/// crashes and removes the rest, so a crash loop cannot fill the disk (each dump is large). Runs at startup, never at crash time.
+void ClearOnlineAccounts(uint32 realmId)
+{
+    // Reset online status for all accounts with characters on the current realm
+    LoginDatabase.DirectPExecute("UPDATE account SET online = 0 WHERE online > 0 AND id IN (SELECT acctid FROM realmcharacters WHERE realmid = {})", realmId);
+
+    // Reset online status for all characters
+    CharacterDatabase.DirectExecute("UPDATE characters SET online = 0 WHERE online <> 0");
+
+    // Battleground instance ids reset at server restart
+    CharacterDatabase.DirectExecute("UPDATE character_battleground_data SET instanceId = 0");
+}
+
+/// Keep only the newest `keep` crash reports (.dmp, .txt and .log of one crash share a name) in the Crashes folder
 void PruneCrashFiles(size_t keep)
 {
     namespace sfs = std::filesystem;
@@ -717,7 +748,7 @@ void PruneCrashFiles(size_t keep)
         return;
 
     struct CrashSet { sfs::file_time_type newest{}; std::vector<sfs::path> files; };
-    std::map<std::string, CrashSet> crashes;        // one set per stem: .dmp, .txt and .log of the same crash
+    std::map<std::string, CrashSet> crashes;
     for (sfs::directory_entry const& entry : sfs::directory_iterator(folder, ec))
     {
         if (!entry.is_regular_file(ec))
@@ -740,33 +771,7 @@ void PruneCrashFiles(size_t keep)
             sfs::remove(file, ec);
 
     if (byAge.size() > keep)
-        TC_LOG_INFO("server.worldserver", "[startup] removed {} old crash sets from {} (kept the newest {})", byAge.size() - keep, folder.string(), keep);
-}
-
-/// One block at every start: which build runs, with which protocol numbering and the settings that decided
-/// a test run. Read it first when a log is handed over.
-void LogStartupSelfCheck(Realm const& realm)
-{
-    auto value = [](char const* key) { return sConfigMgr->GetStringDefault(key, "(default)"); };
-
-    TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {})", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate());
-    TC_LOG_INFO("server.worldserver", "[startup] realm {} (id {}) build {}: client numbering {}", realm.Name, realm.Id.Realm, realm.Build,
-        ClassicOpcodes::IsBuild70291OrLater() ? "70291" : "70245");
-    TC_LOG_INFO("server.worldserver", "[startup] network: EnterEncryptedModeDelay={} SkipBuildAuthKeyCheck={}", value("Network.EnterEncryptedModeDelay"),
-        value("Network.SkipBuildAuthKeyCheck"));
-    TC_LOG_INFO("server.worldserver", "[startup] classic: GuildFinder={} OfficialFeatureFlags={}", value("Classic.GuildFinder"), value("Classic.OfficialFeatureFlags"));
-}
-
-void ClearOnlineAccounts(uint32 realmId)
-{
-    // Reset online status for all accounts with characters on the current realm
-    LoginDatabase.DirectPExecute("UPDATE account SET online = 0 WHERE online > 0 AND id IN (SELECT acctid FROM realmcharacters WHERE realmid = {})", realmId);
-
-    // Reset online status for all characters
-    CharacterDatabase.DirectExecute("UPDATE characters SET online = 0 WHERE online <> 0");
-
-    // Battleground instance ids reset at server restart
-    CharacterDatabase.DirectExecute("UPDATE character_battleground_data SET instanceId = 0");
+        TC_LOG_INFO("server.worldserver", "Removed {} old crash reports from {} (kept the newest {})", byAge.size() - keep, folder.string(), keep);
 }
 
 // Repack setup: the Windows console reader cannot take piped commands, so accounts are created from the command line

@@ -24,7 +24,7 @@
 /// Keeps the last log lines in a fixed block of memory so that a crash report can print what the server was doing right before it
 /// died (no file to flush, no allocation at crash time). Config: `Appender.CrashRing=4,3,7` (type 4, info and above, with timestamp,
 /// level and filter prefix), optional1 = number of lines kept (default 200, at most 1024); link it to the loggers whose lines should
-/// appear (`Logger.root=5,Console Server CrashRing`, `Logger.playerbot.v2=3,Playerbot CrashRing`).
+/// appear (`Logger.root=5,Console Server CrashRing`).
 class TC_COMMON_API AppenderCrashRing : public Appender
 {
     public:
@@ -36,8 +36,8 @@ class TC_COMMON_API AppenderCrashRing : public Appender
         AppenderCrashRing(uint8 id, std::string name, LogLevel level, AppenderFlags flags, std::vector<std::string_view> const& args);
         AppenderType getType() const override { return type; }
 
-        /// Copies the kept lines, oldest first, one per '\n', into `out` (at most `capacity` bytes, NUL terminated). Only reads fixed
-        /// memory, so it is safe to call from the crash handler. Returns the number of bytes written (without the NUL).
+        /// Copies the newest kept lines that fit into `out` (at most `capacity` bytes, NUL terminated), oldest of them first, one per
+        /// '\n'. Only reads fixed memory, so it is safe to call from the crash handler. Returns the number of bytes written (without the NUL).
         static size_t Snapshot(char* out, size_t capacity);
 
     private:
