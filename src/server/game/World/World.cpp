@@ -21,9 +21,6 @@
 
 #include "World.h"
 #include "DeathRecap.h"
-#if TRINITY_PLAYERBOT_V2
-#include "PlayerbotV2.h"
-#endif
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "AreaTriggerDataStore.h"
@@ -79,7 +76,6 @@
 #include "MapManager.h"
 #include "MapUtils.h"
 #include "Metric.h"
-#include "Modules/ModuleManager.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -2382,26 +2378,10 @@ void World::Update(uint32 diff)
         }
     }
 
-    // CRITICAL FIX: Module/script updates MUST happen BEFORE Map updates
-    // to prevent deadlock when bot worker threads try to access Maps that
-    // main thread is currently updating (holding locks on).
-    // See: CELL_VISIT_DEADLOCK_RESOLUTION.md
     {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
-        sScriptMgr->OnWorldUpdate(diff);
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts before maps"));
+        sScriptMgr->OnWorldBeforeMapsUpdate(diff);
     }
-
-    {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update modules"));
-        ModuleManager::CallOnUpdate(diff);
-    }
-
-#if TRINITY_PLAYERBOT_V2
-    {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update playerbot v2"));
-        Playerbot::V2::Module::instance().OnWorldUpdate(std::chrono::milliseconds{diff});
-    }
-#endif
 
     /// <li> Handle all other objects
     ///- Update objects when the timer has passed (maps, transport, creatures, ...)
@@ -2520,6 +2500,11 @@ void World::Update(uint32 diff)
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Process cli commands"));
         // And last, but not least handle the issued cli commands
         ProcessCliCommands();
+    }
+
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
+        sScriptMgr->OnWorldUpdate(diff);
     }
 
     {

@@ -1541,6 +1541,16 @@ void ScriptMgr::OnWorldUpdate(uint32 diff)
     FOREACH_SCRIPT(WorldScript)->OnUpdate(diff);
 }
 
+void ScriptMgr::OnWorldBeforeMapsUpdate(uint32 diff)
+{
+    FOREACH_SCRIPT(WorldScript)->OnBeforeMapsUpdate(diff);
+}
+
+void ScriptMgr::OnWorldInitialized()
+{
+    FOREACH_SCRIPT(WorldScript)->OnWorldInitialized();
+}
+
 void ScriptMgr::OnHonorCalculation(float& honor, uint8 level, float multiplier)
 {
     FOREACH_SCRIPT(FormulaScript)->OnHonorCalculation(honor, level, multiplier);
@@ -2467,6 +2477,14 @@ void WorldScript::OnShutdownCancel()
 }
 
 void WorldScript::OnUpdate(uint32 /*diff*/)
+{
+}
+
+void WorldScript::OnBeforeMapsUpdate(uint32 /*diff*/)
+{
+}
+
+void WorldScript::OnWorldInitialized()
 {
 }
 

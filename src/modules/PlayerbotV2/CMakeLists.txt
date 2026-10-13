@@ -12,6 +12,10 @@
 # pulls every sub-lib onto the link line, so circular references between
 # sub-libs are resolved naturally by the multi-archive symbol search.
 
+if(NOT BUILD_PLAYERBOT_V2)
+  return()
+endif()
+
 # ---------------------------------------------------------------------------
 # Helper: apply the shared compile/link settings to a sub-library. Keeps the
 # per-subsystem section short and ensures every lib has identical compile
@@ -22,7 +26,6 @@ function(playerbot_v2_configure_sublib target_name)
     PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}
       ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot
-      ${CMAKE_SOURCE_DIR}/src/modules/Common
     PRIVATE
       ${CMAKE_SOURCE_DIR}/src/server
       ${CMAKE_SOURCE_DIR}/src/server/shared
@@ -34,7 +37,6 @@ function(playerbot_v2_configure_sublib target_name)
     PUBLIC
       trinity-core-interface
       game-interface
-      modules-common
     PRIVATE
       shared
       common
@@ -157,6 +159,7 @@ playerbot_v2_configure_sublib(playerbot-v2-world)
 # ---------------------------------------------------------------------------
 add_library(playerbot-v2-core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2Scripts.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Services.cpp
 )
 target_sources(playerbot-v2-core
@@ -208,5 +211,9 @@ else()
   target_link_libraries(playerbot-v2 INTERFACE
     "$<LINK_GROUP:RESCAN,${PLAYERBOT_V2_SUBLIBS},game>")
 endif()
+
+trinity_add_module(playerbot-v2 AddSC_playerbot_v2
+  CONFIGS
+    ${CMAKE_CURRENT_SOURCE_DIR}/conf/playerbot.conf.dist)
 
 message(STATUS "Playerbot V2 module enabled (multi-library: 12 sub-libs)")

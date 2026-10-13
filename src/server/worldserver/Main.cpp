@@ -19,9 +19,6 @@
 #include "AccountMgr.h"
 #include "AppenderDB.h"
 #include "AsyncAcceptor.h"
-#ifdef TRINITY_PLAYERBOT_V2
-#include "Diagnostics/BotInspector.h"   // freeze-dump forensics
-#endif
 #include "AuthenticationPackets.h"
 #include "Banner.h"
 #include "BattlegroundMgr.h"
@@ -33,7 +30,6 @@
 #include "DatabaseLoader.h"
 #include "DeadlineTimer.h"
 #include "GitRevision.h"
-#include "Modules/ModuleManager.h"
 #include "InstanceLockMgr.h"
 #include "IoContext.h"
 #include "IpNetwork.h"
@@ -59,9 +55,6 @@
 #include "World.h"
 #include "WorldSocketMgr.h"
 #include "Util.h"
-#ifdef TRINITY_PLAYERBOT_V2
-#include "PlayerbotV2.h"
-#endif
 #include <openssl/opensslv.h>
 #include <openssl/crypto.h>
 #include <boost/asio/signal_set.hpp>
@@ -139,6 +132,8 @@ void WorldUpdateLoop();
 void ClearOnlineAccounts(uint32 realmId);
 void PruneCrashFiles(size_t keep);
 void LogStartupSelfCheck(Realm const& realm);
+void AddModuleScripts();                             // generated from src/modules, empty when no module is built
+void AddAllScripts() { AddScripts(); AddModuleScripts(); }
 struct ShutdownTCSoapThread { void operator()(std::thread* thread) const; };
 struct ShutdownCLIThread { void operator()(std::thread* cliThread) const; };
 variables_map GetConsoleArguments(int argc, char** argv, fs::path& configFile, fs::path& configDir, std::string& winServiceAction);
@@ -369,7 +364,7 @@ int main(int argc, char** argv)
 
     auto scriptReloadMgrHandle = Trinity::make_unique_ptr_with_deleter<&ScriptReloadMgr::Unload>(sScriptReloadMgr);
 
-    sScriptMgr->SetScriptLoader(AddScripts);
+    sScriptMgr->SetScriptLoader(AddAllScripts);
     auto sScriptMgrHandle = Trinity::make_unique_ptr_with_deleter<&ScriptMgr::Unload>(sScriptMgr);
 
     // Initialize the World
@@ -377,10 +372,7 @@ int main(int argc, char** argv)
     if (!sWorld->SetInitialWorldSettings())
         return 1;
 
-#ifdef TRINITY_PLAYERBOT_V2
-    // Initialize Playerbot V2 after world is set up. See v2/PASS_B_INDEX.md.
-    Playerbot::V2::Module::instance().Init();
-#endif
+    sScriptMgr->OnWorldInitialized();
 
     auto instanceLockMgrHandle = Trinity::make_unique_ptr_with_deleter<&InstanceLockMgr::Unload>(&sInstanceLockMgr);
 
@@ -454,9 +446,6 @@ int main(int argc, char** argv)
 
     sScriptMgr->OnStartup();
 
-    // Initialize registered modules
-    ModuleManager::CallOnStartup();
-
     TC_LOG_INFO("server.worldserver", "{} (worldserver-daemon) ready...", GitRevision::GetFullVersion());
 
     // Launch CliRunnable thread
@@ -479,11 +468,6 @@ int main(int argc, char** argv)
     sLog->SetSynchronous();
 
     sScriptMgr->OnShutdown();
-
-#ifdef TRINITY_PLAYERBOT_V2
-    // Shutdown Playerbot V2 (joins AI workers + fleet thread).
-    Playerbot::V2::Module::instance().Shutdown();
-#endif
 
     // set server offline
     LoginDatabase.DirectPExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", Trinity::Legacy::REALM_FLAG_OFFLINE, realmId);
@@ -653,17 +637,6 @@ void FreezeDetector::Handler(std::weak_ptr<FreezeDetector> freezeDetectorRef, bo
                 if (msTimeDiff > freezeDetector->_maxCoreStuckTimeInMs)
                 {
                     TC_LOG_ERROR("server.worldserver", "World Thread hangs for {} ms, forcing a crash!", msTimeDiff);
-#ifdef TRINITY_PLAYERBOT_V2
-                    // Forensic dump before abort: per-bot intent rings,
-                    // pipeline failure rings, population/budget/queue
-                    // health snapshot. Lands at <logs>/freeze_dump_<ts>.txt
-                    // so post-crash analysis has more than just the call
-                    // stack from the .dmp.
-                    std::string const fdump = ::Playerbot::Diagnostics::DumpFreezeForensics(
-                        Trinity::StringFormat("World thread hung {} ms", msTimeDiff));
-                    if (!fdump.empty())
-                        TC_LOG_ERROR("server.worldserver", "Freeze forensics written to: {}", fdump);
-#endif
                     ABORT_MSG("World Thread hangs for %u ms, forcing a crash!", msTimeDiff);
                 }
             }
@@ -788,10 +761,6 @@ void LogStartupSelfCheck(Realm const& realm)
         TC_LOG_INFO("server.worldserver", "[startup] feature status: official values, no Classic.Feature.* override");
     else
         TC_LOG_INFO("server.worldserver", "[startup] feature status: {} Classic.Feature.* override(s) active (the [feature_status] login line shows the values sent)", featureKeys.size());
-
-    TC_LOG_INFO("server.worldserver", "[startup] bots: Population.TotalTarget={} Gear.MaxTier={} World.Enable={} Raid.Enable={}", value("Playerbot.Population.TotalTarget"),
-        value("Playerbot.Gear.MaxTier"), value("Playerbot.World.Enable"), value("Playerbot.Raid.Enable"));
-    TC_LOG_INFO("server.worldserver", "[startup] diagnostics: Playerbot.Diag.Probes={}", value("Playerbot.Diag.Probes"));
 }
 
 void ClearOnlineAccounts(uint32 realmId)

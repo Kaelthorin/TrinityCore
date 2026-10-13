@@ -12,13 +12,7 @@ add_subdirectory(database)
 add_subdirectory(proto)
 add_subdirectory(shared)
 add_subdirectory(bnetserver)
-
-# Add modules BEFORE game library - modules-common must be defined before game can link to it
-if(BUILD_PLAYERBOT_V2)
-  add_subdirectory(${CMAKE_SOURCE_DIR}/src/modules modules)
-endif()
-
 add_subdirectory(game)
 add_subdirectory(scripts)
-
+add_subdirectory(${CMAKE_SOURCE_DIR}/src/modules modules)
 add_subdirectory(worldserver)

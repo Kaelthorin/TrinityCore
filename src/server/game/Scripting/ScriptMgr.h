@@ -273,6 +273,12 @@ class TC_GAME_API WorldScript : public ScriptObject
         // Called on every world tick (don't execute too heavy code here).
         virtual void OnUpdate(uint32 diff);
 
+        // Called on every world tick before the maps are updated (don't execute too heavy code here).
+        virtual void OnBeforeMapsUpdate(uint32 diff);
+
+        // Called once after the world is loaded, before the network starts and the realm is set online.
+        virtual void OnWorldInitialized();
+
         // Called when the world is started.
         virtual void OnStartup();
 
@@ -1103,6 +1109,8 @@ class TC_GAME_API ScriptMgr
         void OnShutdownInitiate(ShutdownExitCode code, ShutdownMask mask);
         void OnShutdownCancel();
         void OnWorldUpdate(uint32 diff);
+        void OnWorldBeforeMapsUpdate(uint32 diff);
+        void OnWorldInitialized();
         void OnStartup();
         void OnShutdown();
 
