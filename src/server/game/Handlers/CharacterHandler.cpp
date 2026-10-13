@@ -16,7 +16,6 @@
  */
 
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "AccountMgr.h"
 #include "ArenaTeam.h"
 #include "ArenaTeamMgr.h"
@@ -1735,8 +1734,6 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     _player->UpdateCriteria(CriteriaType::Login, 1);
 
     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
-
-    Playerbot::Hooks::OnPlayerLogin(pCurrChar);
 
     // Battle.net presence: the client takes the account's BattleTag from it (Social window, Battle.net friends); online friends are told
     BattlenetPresence::OnLogin(this);

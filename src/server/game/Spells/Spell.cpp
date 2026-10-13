@@ -72,7 +72,6 @@
 #include "VMapManager.h"
 #include "World.h"
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include <numeric>
 #include <sstream>
 
@@ -2786,11 +2785,6 @@ void Spell::TargetInfo::PreprocessTarget(Spell* spell)
         {
             if (missInfo != SPELL_MISS_MISS)
                 spell->m_caster->SendSpellMiss(unit, spell->m_spellInfo->Id, missInfo);
-            // PLAYERBOT V2 HOOK (damage_parity scenarios): an avoided spell, tallied by outcome.
-            if (spell->m_caster->IsUnit() && !spell->m_caster->IsFriendlyTo(unit))
-                Playerbot::Hooks::OnHitOutcome(spell->m_caster->ToUnit(), unit, spell->m_spellInfo->Id,
-                                               missInfo == SPELL_MISS_MISS ? 2 : missInfo == SPELL_MISS_DODGE ? 3 : missInfo == SPELL_MISS_PARRY ? 4
-                                               : missInfo == SPELL_MISS_BLOCK ? 5 : missInfo == SPELL_MISS_RESIST ? 8 : 9, 0);
             spell->m_damage = 0;
             spell->m_healing = 0;
             _spellHitTarget = nullptr;
@@ -2979,8 +2973,6 @@ void Spell::TargetInfo::DoDamageAndTriggers(Spell* spell)
                 }
                 spell->m_damage = damageInfo.damage;
 
-                // PLAYERBOT V2 HOOK (damage_parity scenarios): the direct hit's outcome, just before its damage is dealt.
-                Playerbot::Hooks::OnHitOutcome(caster, damageInfo.target, spell->m_spellInfo->Id, IsCrit ? 1 : 0, damageInfo.damage);
                 caster->DealSpellDamage(&damageInfo, true);
 
                 // Send log damage message to client

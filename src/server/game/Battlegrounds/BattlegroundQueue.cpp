@@ -28,15 +28,11 @@
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "World.h"
 #include "WorldSession.h"
 #include <algorithm>
 #include <vector>
-
-// PlayerbotV2: synchronous BG-invite hook so bots port within the same world
-// tick the invite is sent (otherwise the snapshot-poll fallback can miss the
-// 90s INVITE_ACCEPT_WAIT_TIME under load and only the fastest 5-6 bots port).
-#include "Playerbot/PlayerbotHooks.h"
 
 /*********************************************************/
 /***            BATTLEGROUND QUEUE SYSTEM              ***/
@@ -509,10 +505,7 @@ bool BattlegroundQueue::InviteGroupToBG(GroupQueueInfo* ginfo, Battleground* bg,
             BattlegroundMgr::BuildBattlegroundStatusNeedConfirmation(&battlefieldStatus, bg, player, queueSlot, player->GetBattlegroundQueueJoinTime(bgQueueTypeId), INVITE_ACCEPT_WAIT_TIME, bgQueueTypeId);
             player->SendDirectMessage(battlefieldStatus.Write());
 
-            // PlayerbotV2 path: pushes a BgPortIntent into the bot's intent
-            // queue immediately (idempotent for non-bots; inline no-op when
-            // V2 not built).
-            Playerbot::Hooks::OnBGInvitationReceived(player, bg->GetInstanceID(), bg->GetTypeID());
+            sScriptMgr->OnPlayerBattlegroundInvite(player, bg->GetInstanceID(), bg->GetTypeID());
         }
         return true;
     }
@@ -929,9 +922,7 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 /*diff*/, BattlegroundBra
 
     // finished iterating through the bgs with free slots, maybe we need to create a new bg
 
-    // PlayerbotV2: a real player is about to take a place in a running battleground (a bot is leaving for them): do not
-    // open a second instance for this queue meanwhile.
-    if (!bg_template->IsArena() && Playerbot::Hooks::HoldNewBattleground(m_queueId.BattlemasterListId, uint8(bracket_id)))
+    if (!bg_template->IsArena() && !sScriptMgr->CanCreateBattleground(m_queueId.BattlemasterListId, uint8(bracket_id)))
         return;
 
     // get the min. players per team, properly for larger arenas as well. (must have full teams for arena matches!)
@@ -1147,10 +1138,7 @@ bool BGQueueInviteEvent::Execute(uint64 /*e_time*/, uint32 /*p_time*/)
             BattlegroundMgr::BuildBattlegroundStatusNeedConfirmation(&battlefieldStatus, bg, player, queueSlot, player->GetBattlegroundQueueJoinTime(m_QueueId), INVITE_ACCEPT_WAIT_TIME - INVITATION_REMIND_TIME, m_QueueId);
             player->SendDirectMessage(battlefieldStatus.Write());
 
-            // PlayerbotV2: reminder-event re-fire — handler is idempotent
-            // (the per-bot BgPort cooldown stamped on first invite suppresses
-            // duplicate intent emission within the 5s window).
-            Playerbot::Hooks::OnBGInvitationReceived(player, m_BgInstanceGUID, m_BgTypeId);
+            sScriptMgr->OnPlayerBattlegroundInvite(player, m_BgInstanceGUID, m_BgTypeId);
         }
     }
     return true;                                            //event will be deleted

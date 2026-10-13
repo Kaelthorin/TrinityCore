@@ -26,7 +26,7 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
-#include "Playerbot/PlayerbotHooks.h"
+#include "ScriptMgr.h"
 
 void WorldSession::HandleLfgJoinOpcode(WorldPackets::LFG::DFJoin& dfJoin)
 {
@@ -53,11 +53,8 @@ void WorldSession::HandleLfgJoinOpcode(WorldPackets::LFG::DFJoin& dfJoin)
 
     sLFGMgr->JoinLfg(GetPlayer(), uint8(dfJoin.Roles), newDungeons);
 
-    // Playerbot V2: solo player joined a dungeon queue. Auto-fill remaining
-    // role slots with bots. Use the first selected dungeon as the target
-    // instance id. Bots themselves no-op the hook.
-    if (!IsBot() && !newDungeons.empty())
-        Playerbot::Hooks::OnPlayerJoinedLfg(GetPlayer(), *newDungeons.begin(), uint8(dfJoin.Roles));
+    if (!newDungeons.empty())
+        sScriptMgr->OnPlayerLfgJoin(GetPlayer(), *newDungeons.begin(), uint8(dfJoin.Roles));
 }
 
 void WorldSession::HandleLfgLeaveOpcode(WorldPackets::LFG::DFLeave& dfLeave)

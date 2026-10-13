@@ -16,7 +16,7 @@
  */
 
 #include "LFGMgr.h"
-#include "Playerbot/PlayerbotHooks.h"
+#include "ScriptMgr.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
 #include "DisableMgr.h"
@@ -369,11 +369,8 @@ void LFGMgr::Update(uint32 diff)
                 else
                     SendLfgUpdateStatus(guid, LfgUpdateData(LFG_UPDATETYPE_PROPOSAL_BEGIN, GetSelectedDungeons(guid)), false);
                 SendLfgUpdateProposal(guid, proposal);
-                // PlayerbotV2: auto-accept hook for bots — synchronous push of a
-                // deferred LfgProposalRespondIntent so all 5 (or 25) bots ack
-                // well inside LFG_TIME_PROPOSAL without waiting for snapshot poll.
                 if (Player* candidate = ObjectAccessor::FindConnectedPlayer(guid))
-                    Playerbot::Hooks::OnLfgProposalReceived(candidate, proposalId);
+                    sScriptMgr->OnPlayerLfgProposal(candidate, proposalId);
             }
 
             if (proposal.state == LFG_PROPOSAL_SUCCESS)

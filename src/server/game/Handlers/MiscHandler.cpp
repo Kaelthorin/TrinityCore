@@ -48,7 +48,6 @@
 #include "ObjectMgr.h"
 #include "OutdoorPvP.h"
 #include "Player.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "RestMgr.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
@@ -90,11 +89,6 @@ void WorldSession::HandleRepopRequest(WorldPackets::Misc::RepopRequest& /*packet
             GetPlayer()->GetName(), GetPlayer()->GetGUID().ToString());
         GetPlayer()->KillPlayer();
     }
-
-    // PLAYERBOT V2 HOOK: the owner's dead companions on this map release with the owner (inside a dungeon or
-    // raid RepopAtGraveyard revives the owner at the graveyard, so no ghost state ever tells them). Fired
-    // before the repop so the owner's map is still the death map.
-    Playerbot::Hooks::OnSpiritReleased(GetPlayer());
 
     //this is spirit release confirm?
     GetPlayer()->RemovePet(nullptr, PET_SAVE_NOT_IN_SLOT, true);

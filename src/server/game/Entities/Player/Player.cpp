@@ -111,7 +111,6 @@
 #include "PetitionMgr.h"
 #include "PhasingHandler.h"
 #include "PlayerChoice.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "QueryCallback.h"
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
@@ -2360,9 +2359,6 @@ void Player::GiveLevel(uint8 level)
     UpdateClassicLegacyUnlock();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
-
-    if (level > oldLevel)
-        Playerbot::Hooks::OnLevelUp(this, level);
 
     BattlenetPresence::OnCharacterChanged(this);
 }
@@ -28237,7 +28233,7 @@ void Player::StoreLootItem(ObjectGuid lootWorldObjectGuid, uint8 lootSlot, Loot*
 
             Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomBonusListId, item->GetAllowedLooters(), item->context);
             if (newitem)
-                Playerbot::Hooks::OnItemLooted(this, item->itemid);
+                sScriptMgr->OnPlayerLootItem(this, newitem);
 
             if (newitem && (newitem->GetQuality() > ITEM_QUALITY_EPIC || (newitem->GetQuality() == ITEM_QUALITY_EPIC && newitem->GetItemLevel(this) >= MinNewsItemLevel)))
                 if (Guild* guild = GetGuild())

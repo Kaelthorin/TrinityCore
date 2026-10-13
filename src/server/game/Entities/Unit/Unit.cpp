@@ -97,7 +97,6 @@
 #include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include <queue>
 #include <sstream>
 #include <cmath>
@@ -871,11 +870,6 @@ bool Unit::HasBreakableByDamageCrowdControlAura(Unit const* excludeCasterChannel
         // Hook for OnDamage Event
         sScriptMgr->OnDamage(attacker, victim, tmpDamage);
 
-        // PLAYERBOT V2 HOOK: feed BotEventInbox so reactive AI sees per-hit
-        // events. Filtered to player victims inside the hook.
-        Playerbot::Hooks::OnDamageTaken(attacker, victim, int32(tmpDamage),
-                                        spellProto ? spellProto->Id : 0u);
-
         // if any script modified damage, we need to also apply the same modification to unscaled damage value
         if (tmpDamage != damageTaken)
         {
@@ -1644,14 +1638,6 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
             }
         }
     }
-
-    // PLAYERBOT V2 HOOK (damage_parity scenarios): the swing's outcome, just before its damage is dealt.
-    Playerbot::Hooks::OnHitOutcome(this, victim, 0,
-                                   damageInfo->HitOutCome == MELEE_HIT_CRIT ? 1 : damageInfo->HitOutCome == MELEE_HIT_MISS ? 2
-                                   : damageInfo->HitOutCome == MELEE_HIT_DODGE ? 3 : damageInfo->HitOutCome == MELEE_HIT_PARRY ? 4
-                                   : damageInfo->HitOutCome == MELEE_HIT_BLOCK ? 5 : damageInfo->HitOutCome == MELEE_HIT_GLANCING ? 6
-                                   : damageInfo->HitOutCome == MELEE_HIT_CRUSHING ? 7 : damageInfo->HitOutCome == MELEE_HIT_NORMAL ? 0 : 9,
-                                   damageInfo->Damage);
 
     // Call default DealDamage
     CleanDamage cleanDamage(damageInfo->CleanDamage, damageInfo->Absorb, damageInfo->AttackType, damageInfo->HitOutCome);
@@ -6744,11 +6730,6 @@ void Unit::SetCharm(Unit* charm, bool apply)
     // Hook for OnHeal Event
     sScriptMgr->OnHeal(healer, victim, (uint32&)gain);
 
-    // PLAYERBOT V2 HOOK: feed BotEventInbox with heal events. Filtered to
-    // player victims inside the hook.
-    Playerbot::Hooks::OnHealReceived(healer, victim, int32(gain),
-                                     healInfo.GetSpellInfo() ? healInfo.GetSpellInfo()->Id : 0u);
-
     Unit* unit = healer;
     if (healer && healer->GetTypeId() == TYPEID_UNIT && healer->IsTotem())
         unit = healer->GetOwner();
@@ -7017,7 +6998,6 @@ void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damag
 
     int32 gain = victim->ModifyPower(powerType, damage, false);
     int32 overEnergize = damage - gain;
-    Playerbot::Hooks::OnEnergize(victim, spellInfo->Id, gain, powerType);
     victim->GetThreatManager().ForwardThreatForAssistingMe(this, float(damage) / 2, spellInfo, true);
     SendEnergizeSpellLog(victim, spellInfo->Id, gain, overEnergize, powerType);
 }
@@ -11697,9 +11677,7 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
         attacker = nullptr;
 
 
-    // PLAYERBOT V2 HOOK: drives auto-loot enqueueing for bots in the tap list
-    // and (eventually) state transitions when a bot itself dies.
-    Playerbot::Hooks::OnDeath(victim, attacker);
+    sScriptMgr->OnUnitDeath(victim, attacker);
 
     // find player: owner of controlled `this` or `this` itself maybe
     Player* player = nullptr;

@@ -17,7 +17,6 @@
 
 #include "WorldSession.h"
 #include "Playerbot/DiagProbes.h"
-#include "Playerbot/PlayerbotHooks.h"
 #include "Account.h"
 #include "AccountMgr.h"
 #include "AuthenticationPackets.h"
@@ -856,8 +855,6 @@ void WorldSession::LogoutPlayer(bool save)
 
         //! Call script hook before deletion
         sScriptMgr->OnPlayerLogout(_player);
-
-        Playerbot::Hooks::OnPlayerLogout(_player);
 
         // Battle.net friends see us go offline
         BattlenetPresence::OnLogout(this);

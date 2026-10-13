@@ -43,7 +43,6 @@
 #include "Player.h"
 #include "UpdateData.h"
 #include "WorldSession.h"
-#include "Playerbot/PlayerbotHooks.h"
 
 Seconds Group::CountdownInfo::GetTimeLeft() const
 {
@@ -1074,7 +1073,7 @@ void Group::ChangeMembersGroup(ObjectGuid guid, uint8 group)
 
     // Broadcast the changes to the group
     SendUpdate();
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, guid, group);
+    sScriptMgr->OnGroupSubgroupChange(this, guid, group);
 }
 
 void Group::ReorderMembers(std::vector<ObjectGuid> const& order)
@@ -1134,8 +1133,8 @@ void Group::SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid)
     CharacterDatabase.CommitTransaction(trans);
 
     SendUpdate();
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[0]->guid, slots[0]->group);
-    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[1]->guid, slots[1]->group);
+    sScriptMgr->OnGroupSubgroupChange(this, slots[0]->guid, slots[0]->group);
+    sScriptMgr->OnGroupSubgroupChange(this, slots[1]->guid, slots[1]->group);
 }
 
 // Retrieve the next Round-Roubin player for the group
