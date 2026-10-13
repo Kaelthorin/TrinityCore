@@ -22,10 +22,6 @@ namespace WorldPackets::Battleground
 {
 WorldPacket const* SeasonInfo::Write()
 {
-    // client 1.60.1.70291 (case 0x65, reader read from the binary): u64, 7 x u32, one flag byte; the 70245 layout has no leading u64
-    if (Classic70291)
-        _worldPacket << uint64(Classic70291_Leading);
-
     _worldPacket << int32(MythicPlusDisplaySeasonID);
     _worldPacket << int32(MythicPlusMilestoneSeasonID);
     _worldPacket << int32(CurrentArenaSeason);
@@ -169,13 +165,6 @@ void BattlemasterJoin::Read()
 
     for (uint64& queueId : QueueIDs)
         _worldPacket >> queueId;
-}
-
-void BattlemasterJoinRaw::Read()
-{
-    if (_worldPacket.size() > _worldPacket.rpos())
-        Data.assign(_worldPacket.data() + _worldPacket.rpos(), _worldPacket.data() + _worldPacket.size());
-    _worldPacket.rfinish();
 }
 
 void BattlemasterJoinArena::Read()

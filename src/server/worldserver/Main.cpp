@@ -751,16 +751,10 @@ void LogStartupSelfCheck(Realm const& realm)
 
     TC_LOG_INFO("server.worldserver", "[startup] build {} ({} branch, {})", GitRevision::GetHash(), GitRevision::GetBranch(), GitRevision::GetDate());
     TC_LOG_INFO("server.worldserver", "[startup] realm {} (id {}) build {}: client numbering {}", realm.Name, realm.Id.Realm, realm.Build,
-        ClassicOpcodes::CurrentBuild() == ClassicOpcodes::Build::Build70291 ? "70291" : "70245");
+        ClassicOpcodes::IsBuild70291OrLater() ? "70291" : "70245");
     TC_LOG_INFO("server.worldserver", "[startup] network: EnterEncryptedModeDelay={} SkipBuildAuthKeyCheck={}", value("Network.EnterEncryptedModeDelay"),
         value("Network.SkipBuildAuthKeyCheck"));
-    TC_LOG_INFO("server.worldserver", "[startup] classic: GuildFinder={}", value("Classic.GuildFinder"));
-
-    std::vector<std::string> const featureKeys = sConfigMgr->GetKeysByString("Classic.Feature.");
-    if (featureKeys.empty())
-        TC_LOG_INFO("server.worldserver", "[startup] feature status: official values, no Classic.Feature.* override");
-    else
-        TC_LOG_INFO("server.worldserver", "[startup] feature status: {} Classic.Feature.* override(s) active (the [feature_status] login line shows the values sent)", featureKeys.size());
+    TC_LOG_INFO("server.worldserver", "[startup] classic: GuildFinder={} OfficialFeatureFlags={}", value("Classic.GuildFinder"), value("Classic.OfficialFeatureFlags"));
 }
 
 void ClearOnlineAccounts(uint32 realmId)

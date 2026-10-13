@@ -481,8 +481,6 @@ void BattlegroundMgr::SendBattlegroundList(Player* player, ObjectGuid const& gui
         return;
 
     player->PlayerTalkClass->GetInteractionData().StartInteraction(guid, PlayerInteractionType::BattleMaster);
-    if (WorldSession* session = player->GetSession())
-        session->SetLastBattlemasterBgType(uint32(bgTypeId));
 
     WorldPackets::Battleground::BattlefieldList battlefieldList;
     battlefieldList.BattlemasterGuid = guid;

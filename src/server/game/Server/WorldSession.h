@@ -190,9 +190,6 @@ namespace WorldPackets
         class PVPLogDataRequest;
         class BattlemasterJoin;
         class BattlemasterJoinArena;
-        class BattlemasterJoinRaw;
-        class BattlemasterJoinBlitz;
-        class BattlemasterJoinArenaRaw;
         class BattlefieldLeave;
         class BattlefieldPort;
         class BattlefieldListRequest;
@@ -1063,8 +1060,6 @@ class TC_GAME_API WorldSession
         uint32 GetClientBuild() const { return _clientBuild; }
         ClientBuild::VariantId const& GetClientBuildVariant() const { return _clientBuildVariant; }
 
-        // Battleground type of the last battlemaster list the player opened (see _lastBattlemasterBgType).
-        void SetLastBattlemasterBgType(uint32 bgType) { _lastBattlemasterBgType = bgType; }
 
         // A session without a client, run by a module (bots): no socket, shares its owner's account.
         bool IsBot() const { return _isBot; }
@@ -1749,9 +1744,6 @@ class TC_GAME_API WorldSession
         //Battleground
         void HandleBattlemasterHelloOpcode(WorldPackets::NPC::Hello& hello);
         void HandleBattlemasterJoinOpcode(WorldPackets::Battleground::BattlemasterJoin& battlemasterJoin);
-        void HandleBattlemasterJoinBlitz(WorldPackets::Battleground::BattlemasterJoinBlitz& packet);
-        void HandleBattlemasterJoinArenaRaw(WorldPackets::Battleground::BattlemasterJoinArenaRaw& packet);
-        void HandleBattlemasterJoinUnknownLayout(WorldPackets::Battleground::BattlemasterJoinRaw& packet);
         // Queues the player (or, as leader, the group) for the battleground a queue id names; shared by the packet handlers and .playerbot bgjoin.
         void JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId);
         void HandlePVPLogDataOpcode(WorldPackets::Battleground::PVPLogDataRequest& pvpLogDataRequest);
@@ -2147,10 +2139,6 @@ class TC_GAME_API WorldSession
         std::unique_ptr<CollectionMgr> _collectionMgr;
 
         ConnectToKey _instanceConnectKey;
-
-        // Battleground type of the last battlemaster list the player opened: the 70205 client's join packets do not say which
-        // battleground they are for, and the client has closed the battlemaster interaction by the time they arrive.
-        uint32 _lastBattlemasterBgType = 0;
 
         bool _isBot;
 

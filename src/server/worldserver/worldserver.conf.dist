@@ -4673,14 +4673,21 @@ Recap.Announce = 3
 
 Classic.GuildFinder = 0
 
-#    Classic.SharedEncounterLoot
-#        Description: Bosses (dungeon encounters) drop their whole loot table on one shared corpse under the group's
-#                     loot rules, like vanilla (Molten Core: 2-3 epics per boss). Off: retail personal loot, where each
-#                     table roll goes to one random player.
-#        Default:     1 - (Enabled)
-#                     0 - (Disabled)
+#    Classic.OpcodeGroupShift
+#        Description: Client 1.60.1.70291 numbers the message groups one higher than 70245 (and changed some packet and
+#                     update field layouts). -1 picks it from the realm's game build (realmlist.gamebuild >= 70291).
+#        Default:     -1 - (From the realm build)
+#                      0 - (70245 and older)
+#                      1 - (70291 and newer)
 
-Classic.SharedEncounterLoot = 1
+Classic.OpcodeGroupShift = -1
+
+#    Classic.MainGroupInsertIndex
+#        Description: Client 70291+: first 70245 index (decimal) of the main server message group that moved up by one.
+#                     The official sniff narrows it to 147..173 (0x93..0xAD: party, ready check, pet battle messages).
+#        Default:     147
+
+Classic.MainGroupInsertIndex = 147
 
 #    Classic.ClientMainGroupInsertIndex
 #        Description: Client 70291+: 70291 index (decimal) of the message added to the main client group; the client messages
@@ -4689,16 +4696,22 @@ Classic.SharedEncounterLoot = 1
 
 Classic.ClientMainGroupInsertIndex = 315
 
-#    Classic.Feature.*
-#        Description: Per-field overrides for SMSG_FEATURE_SYSTEM_STATUS, read at every
-#                     login (".reload config" and relog, no restart). Unset = the value the server chose. For bisecting which flag
-#                     makes the 70291 client lose its own /w handler (doc/whisper-feature-bisect.md).
-#        Keys (bool unless noted): VoiceEnabled, VoiceChatParentalDisabled, VoiceChatParentalMuted, SpeakForMeAllowed,
-#                     NetEaseChatTelemetryEnabled, GlobalUserGeneratedContentMuteEnabled, AccountUserGeneratedContentIsRisky,
-#                     FriendsDisabled, DoesAccountNeedAADCPrompt, IsAccountOptedInToAADC;
-#                     SocialRestriction (int, 0 = none; 2 = age verification, blocks chat).
-#        Example:     Classic.Feature.VoiceChatParentalDisabled = 0
-#
+#    Classic.OfficialFeatureFlags
+#        Description: Send the client feature flags exactly as the official server does (sniffs 70205/70235).
+#                     0 goes back to the older hand-picked flags.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+Classic.OfficialFeatureFlags = 1
+
+#    Classic.SharedEncounterLoot
+#        Description: Bosses (dungeon encounters) drop their whole loot table on one shared corpse under the group's
+#                     loot rules, like vanilla (Molten Core: 2-3 epics per boss). Off: retail personal loot, where each
+#                     table roll goes to one random player.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+Classic.SharedEncounterLoot = 1
 
 #    Classic.Shop.Enabled
 #        Description: In-game Store: shop points, products from world.shop_* (.shop reload), the Gold Market, character

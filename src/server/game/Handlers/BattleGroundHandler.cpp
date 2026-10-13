@@ -64,7 +64,6 @@ void WorldSession::HandleBattlemasterHelloOpcode(WorldPackets::NPC::Hello& hello
         return;
     }
 
-    _lastBattlemasterBgType = uint32(bgTypeId);
     sBattlegroundMgr->SendBattlegroundList(_player, hello.Unit, bgTypeId);
 }
 
@@ -77,64 +76,6 @@ void WorldSession::HandleBattlemasterJoinOpcode(WorldPackets::Battleground::Batt
     }
 
     JoinBattlegroundQueue(BattlegroundQueueTypeId::FromPacked(battlemasterJoin.QueueIDs[0]));
-}
-
-// The 70205 client's Join Battle button sends the opcode this build names CMSG_BATTLEMASTER_JOIN_RATED_BG_BLITZ (0x3E00C0), never
-// CMSG_BATTLEMASTER_JOIN, and a 5-byte packet on CMSG_BATTLEMASTER_JOIN_ARENA. The layout is not known, so the payload is logged and
-// read defensively: any 64-bit value that decodes to a valid battleground queue id wins (the standard BattlemasterJoin layout puts
-// it at offset 13, but every offset is tried); otherwise the player's open battlemaster supplies the battleground type.
-void WorldSession::HandleBattlemasterJoinUnknownLayout(WorldPackets::Battleground::BattlemasterJoinRaw& packet)
-{
-    std::vector<uint8> const& data = packet.Data;
-    std::string hex;
-    for (size_t i = 0; i < data.size() && i < 48; ++i)
-        hex += Trinity::StringFormat("{:02X} ", uint32(data[i]));
-
-    BattlegroundQueueTypeId queueId = BATTLEGROUND_QUEUE_NONE;
-    for (size_t offset = 0; offset + sizeof(uint64) <= data.size() && queueId == BATTLEGROUND_QUEUE_NONE; ++offset)
-    {
-        uint64 value = 0;
-        memcpy(&value, data.data() + offset, sizeof(value));
-        // A queue id always carries the 0x1F10 marker in its top 16 bits (BattlegroundQueueTypeId::GetPacked). Without that check any
-        // little count or flag such as 01 00 00 00 reads as battleground 1 (Alterac Valley): 2026-10-07, Warsong Gulch queued AV.
-        if ((value >> 48) != 0x1F10)
-            continue;
-        BattlegroundQueueTypeId candidate = BattlegroundQueueTypeId::FromPacked(value);
-        if (candidate.Type == uint8(BattlegroundQueueIdType::Battleground) && !candidate.Rated && !candidate.TeamSize && candidate.BattlemasterListId
-            && BattlegroundMgr::IsValidQueueId(candidate) && sBattlegroundMgr->GetBattlegroundTemplateByTypeId(BattlegroundTypeId(candidate.BattlemasterListId)))
-            queueId = candidate;
-    }
-
-    if (queueId == BATTLEGROUND_QUEUE_NONE)
-    {
-        InteractionData const& interaction = _player->PlayerTalkClass->GetInteractionData();
-        if (interaction.Type == PlayerInteractionType::BattleMaster && !interaction.SourceGuid.IsEmpty())
-            if (Creature const* master = ObjectAccessor::GetCreature(*_player, interaction.SourceGuid))
-                if (BattlegroundTypeId bgTypeId = sBattlegroundMgr->GetBattleMasterBG(master->GetEntry()))
-                    queueId = BattlegroundMgr::BGQueueTypeId(uint16(bgTypeId), BattlegroundQueueIdType::Battleground, false, 0);
-    }
-
-    if (queueId == BATTLEGROUND_QUEUE_NONE && _lastBattlemasterBgType)
-        queueId = BattlegroundMgr::BGQueueTypeId(uint16(_lastBattlemasterBgType), BattlegroundQueueIdType::Battleground, false, 0);
-
-    if (queueId == BATTLEGROUND_QUEUE_NONE)
-    {
-        ChatHandler(this).PSendSysMessage("The battleground join could not be read. Talk to the battlemaster again, or use .playerbot bgjoin wsg|ab|av.");
-        return;
-    }
-
-    JoinBattlegroundQueue(queueId);
-}
-
-void WorldSession::HandleBattlemasterJoinBlitz(WorldPackets::Battleground::BattlemasterJoinBlitz& packet)
-{
-    HandleBattlemasterJoinUnknownLayout(packet);
-}
-
-// Arena join slot. On the 70205 client 0x3F00C1 also arrives once at login with a single 00 byte, which is not a join, and the
-// battleground join has its own opcode (0x3F00C0 -> CMSG_BATTLEMASTER_JOIN): only log it.
-void WorldSession::HandleBattlemasterJoinArenaRaw(WorldPackets::Battleground::BattlemasterJoinArenaRaw& packet)
-{
 }
 
 void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
