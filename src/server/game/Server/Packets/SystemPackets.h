@@ -177,8 +177,6 @@ namespace WorldPackets
             bool LfdEnabled                          = false;
             bool LfrEnabled                          = true;  // classic only
             bool PetHappinessEnabled                 = true;  // classic only
-            bool GuildEventsEditsEnabled             = true;
-            bool GuildTradeSkillsEnabled             = true;
             bool IsAccountCurrencyTransferEnabled    = false;
             bool NetEaseChatTelemetryEnabled         = false;
             bool LobbyMatchmakerQueueFromMainlineEnabled = false;
@@ -195,7 +193,7 @@ namespace WorldPackets
             std::vector<GameRuleValuePair> GameRules;
             int32 ActiveTimerunningSeasonID          = 0;
             int32 RemainingTimerunningSeasonSeconds  = 0;
-            uint16 ClassicFlagBits10                 = 0;       ///< Classic 1.60: 10 bits where retail has the Unknown1027 string length; no string follows (official: 2)
+            uint8 ClassicFlagsAfterLength            = 0;       ///< Classic 1.60.1.70291: 2 flags right after the string length (client 0x5b4, 0x5b5; official: 2). Meaning not known
             ChatThrottleParams AddonChatThrottle;
             ChatThrottleParams GuildChatThrottle;
             ChatThrottleParams GroupChatThrottle;

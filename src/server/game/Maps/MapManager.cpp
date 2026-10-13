@@ -88,6 +88,35 @@ Map* MapManager::CreateWorldMap(uint32 mapId, uint32 instanceId)
     return map;
 }
 
+Map* MapManager::PrewarmContinentMap(uint32 mapId)
+{
+    MapEntry const* entry = sMapStore.LookupEntry(mapId);
+    if (!entry) return nullptr;
+    // Only continent base maps - bg/arena/dungeon/garrison/split-by-faction
+    // need a Player context for instance routing, so the prewarm path
+    // can't safely create them headlessly.
+    if (entry->IsBattlegroundOrArena() || entry->IsDungeon() ||
+        entry->IsGarrison() || entry->IsSplitByFaction())
+        return nullptr;
+
+    std::scoped_lock lock(_mapsLock);
+    constexpr uint32 instanceId = 0;
+    if (Map* m = FindMap_i(mapId, instanceId))
+        return m;
+
+    Map* map = CreateWorldMap(mapId, instanceId);
+    if (map)
+    {
+        Trinity::unique_trackable_ptr<Map>& ptr = i_maps[{ map->GetId(), map->GetInstanceId() }];
+        ptr.reset(map);
+        map->SetWeakPtr(ptr);
+        sScriptMgr->OnCreateMap(map);
+        sOutdoorPvPMgr->CreateOutdoorPvPForMap(map);
+        sBattlefieldMgr->CreateBattlefieldsForMap(map);
+    }
+    return map;
+}
+
 InstanceMap* MapManager::CreateInstance(uint32 mapId, uint32 instanceId, InstanceLock* instanceLock, Difficulty difficulty, TeamId team, Group* group,
     Optional<uint32> lfgDungeonsId)
 {
@@ -104,6 +133,15 @@ InstanceMap* MapManager::CreateInstance(uint32 mapId, uint32 instanceId, Instanc
 
     InstanceMap* map = new InstanceMap(mapId, i_gridCleanUpDelay, instanceId, difficulty, team, instanceLock, lfgDungeonsId);
     ASSERT(map->IsDungeon());
+
+    // a fresh raid instance must not inherit respawn rows an earlier lockout left under the same recycled id
+    if (map->IsRaid() && sWorld->getBoolConfig(CONFIG_INSTANCE_PERSIST_RAID_TRASH) && (!instanceLock || instanceLock->IsNew()))
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ALL_RESPAWNS);
+        stmt->setUInt16(0, mapId);
+        stmt->setUInt32(1, instanceId);
+        CharacterDatabase.Execute(stmt);
+    }
 
     map->LoadRespawnTimes();
     map->LoadCorpseData();
@@ -234,6 +272,13 @@ Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDun
             else
                 player->SetRecentInstance(mapId, newInstanceId);
         }
+        // A map that outlives its group (raid disbanded or re-formed while the map is still loaded: the lock keeps the instance id and
+        // the unload delay keeps the map) has no owning group any more. The owner is otherwise only set when the map is created, so the
+        // next group to walk in would fail Player::CheckInstanceValidity ("not in this instance's group") and be sent to the graveyard
+        // after 60 s. A group entering an unowned map becomes its owner; a map whose owner is alive is not touched.
+        else if (group)
+            if (InstanceMap* instanceMap = map->ToInstanceMap())
+                instanceMap->TrySetOwningGroup(group);
     }
     else if (entry->IsGarrison())
     {

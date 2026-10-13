@@ -39,6 +39,7 @@ void ThreatReference::AddThreat(float amount)
 {
     if (amount == 0.0f)
         return;
+    float oldThreat = _baseAmount;
     _baseAmount = std::max<float>(_baseAmount + amount, 0.0f);
     if (amount > 0.0f)
         HeapNotifyIncreased();
@@ -407,6 +408,12 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
     // apply threat modifiers to the amount
     if (!ignoreModifiers)
         amount = CalculateModifiedThreat(amount, target, spell);
+
+    // the source's generated-threat multiplier (playerbot tanks). Applies to threat the target generates by acting,
+    // including flat spell bonus threat that skips the modifiers above (Sunder, Revenge, Heroic Strike); not to
+    // ignoreRedirects adds (taunt matching, scripted sets, the redirect re-dispatch below) nor to reductions.
+    if (!ignoreRedirects && amount > 0.0f)
+        amount *= target->GetThreatManager().GetGeneratedThreatMultiplier();
 
     // if we're increasing threat, send some/all of it to redirection targets instead if applicable
     if (!ignoreRedirects && amount > 0.0f)

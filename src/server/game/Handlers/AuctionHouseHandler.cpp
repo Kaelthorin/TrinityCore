@@ -371,11 +371,23 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsMap(creature->GetFaction());
 
     AuctionPosting* auction = auctionHouse->GetAuction(placeBid.AuctionID);
-    if (!auction || auction->IsCommodity())
+    if (!auction)
     {
+        TC_LOG_INFO("auctionhouse", "[ahbuy] {} bid on auction {} refused: no such auction in this house (gone, expired or already bought)",
+            GetPlayerInfo(), placeBid.AuctionID);
         SendAuctionCommandResult(placeBid.AuctionID, AuctionCommand::PlaceBid, AuctionResult::ItemNotFound, throttle.DelayUntilNext);
         return;
     }
+
+    // A stackable listing is a commodity. The commodity flow (quote + confirm) buys by item and quantity;
+    // a client that buys such a row by auction id (the classic-style list) used to be answered "item not found".
+    // Treat that as buying the whole listing at its total price.
+    bool const commodity = auction->IsCommodity();
+    uint64 const buyoutPrice = commodity ? auction->BuyoutOrUnitPrice * auction->GetTotalItemCount() : auction->BuyoutOrUnitPrice;
+    if (commodity)
+        TC_LOG_INFO("auctionhouse", "[ahbuy] {} buys commodity auction {} whole: {} x{} at {} each, asked {} of {}",
+            GetPlayerInfo(), placeBid.AuctionID, auction->Items[0]->GetEntry(), auction->GetTotalItemCount(),
+            auction->BuyoutOrUnitPrice, placeBid.BidAmount, buyoutPrice);
 
     Player* player = GetPlayer();
 
@@ -389,9 +401,10 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     bool canBid = auction->MinBid != 0;
     bool canBuyout = auction->BuyoutOrUnitPrice != 0;
 
-    // buyout attempt with wrong amount
-    if (!canBid && placeBid.BidAmount != auction->BuyoutOrUnitPrice)
+    // buyout attempt with wrong amount (a commodity row may quote the unit price: accept that too)
+    if (!canBid && placeBid.BidAmount != buyoutPrice && !(commodity && placeBid.BidAmount == auction->BuyoutOrUnitPrice))
     {
+        TC_LOG_INFO("auctionhouse", "[ahbuy] {} buyout of auction {} refused: sent {}, buyout is {}", GetPlayerInfo(), placeBid.AuctionID, placeBid.BidAmount, buyoutPrice);
         SendAuctionCommandResult(placeBid.AuctionID, AuctionCommand::PlaceBid, AuctionResult::BidIncrement, throttle.DelayUntilNext);
         return;
     }
@@ -405,14 +418,16 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
 
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
-    uint64 priceToPay = placeBid.BidAmount;
+    // a commodity bought by unit price pays the total
+    uint64 const bidAmount = commodity && placeBid.BidAmount == auction->BuyoutOrUnitPrice ? buyoutPrice : uint64(placeBid.BidAmount);
+    uint64 priceToPay = bidAmount;
     if (!auction->Bidder.IsEmpty())
     {
         // return money to previous bidder
         if (auction->Bidder != player->GetGUID())
-            auctionHouse->SendAuctionOutbid(auction, player->GetGUID(), placeBid.BidAmount, trans);
+            auctionHouse->SendAuctionOutbid(auction, player->GetGUID(), bidAmount, trans);
         else
-            priceToPay = placeBid.BidAmount - auction->BidAmount;
+            priceToPay = bidAmount - auction->BidAmount;
     }
 
     // check money
@@ -424,13 +439,13 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
 
     player->ModifyMoney(-int64(priceToPay));
     auction->Bidder = player->GetGUID();
-    auction->BidAmount = placeBid.BidAmount;
+    auction->BidAmount = bidAmount;
     if (HasPermission(rbac::RBAC_PERM_LOG_GM_TRADE))
         auction->ServerFlags |= AuctionPostingServerFlag::GmLogBuyer;
     else
         auction->ServerFlags &= ~AuctionPostingServerFlag::GmLogBuyer;
 
-    if (canBuyout && placeBid.BidAmount == auction->BuyoutOrUnitPrice)
+    if (canBuyout && bidAmount == buyoutPrice)
     {
         // buyout
         std::map<uint32, AuctionPosting>::node_type removedAuctionNode = auctionHouse->RemoveAuction(trans, auction);

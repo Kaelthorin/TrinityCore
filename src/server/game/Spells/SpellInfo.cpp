@@ -37,6 +37,7 @@
 #include "SpellMgr.h"
 #include "TraitMgr.h"
 #include "Vehicle.h"
+#include "World.h"
 #include <boost/container/small_vector.hpp>
 #include <G3D/g3dmath.h>
 #include <bit>
@@ -513,6 +514,18 @@ uint32 SpellEffectInfo::GetPeriodicTickCount() const
     return totalTicks;
 }
 
+// Classic 1.60: the vanilla (1.12) dice of an effect of a legacy spell, whoever casts it (ClassicSpellValue.h). The client's flat
+// values differ from vanilla for part of the legacy spells (Evoker Flamestrike 11829: 479, vanilla 76..88; player Shadow Bolt
+// rank 10 25307: 257, vanilla 482..538).
+static ClassicSpellValue::Value const* GetClassicValue(WorldObject const* caster, uint32 spellId, uint32 effectIndex)
+{
+    if (!caster)
+        return nullptr;
+    if (!ClassicSpellValue::AppliesToSpell(spellId))
+        return nullptr;
+    return sSpellMgr->GetClassicSpellValue(spellId, effectIndex);
+}
+
 int32 SpellEffectInfo::CalcValueAsInt(WorldObject const* caster /*= nullptr*/, SpellEffectValue const* basePoints /*= nullptr*/, Unit const* target /*= nullptr*/, float* variance /*= nullptr*/, uint32 castItemId /*= 0*/, int32 itemLevel /*= -1*/) const
 {
     return int32(CalcValue(caster, basePoints, target, variance, castItemId, itemLevel));
@@ -524,6 +537,14 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
     SpellEffectValue value = bp ? *bp : basePoints;
     SpellEffectValue basePointsPerLevel = RealPointsPerLevel;
     SpellEffectValue comboDamage = PointsPerResource;
+    float scalingVariance = Scaling.Variance;
+    ClassicSpellValue::Value const* vanilla = GetClassicValue(caster, _spellInfo->Id, EffectIndex);
+    if (vanilla)
+    {
+        basePointsPerLevel = vanilla->PointsPerLevel;
+        scalingVariance = ClassicSpellValue::Variance(*vanilla);
+        comboDamage = vanilla->PointsPerCombo;      // vanilla points per combo point (the client's PointsPerResource differs for part of the finishers)
+    }
 
     Unit const* casterUnit = nullptr;
     if (caster)
@@ -557,9 +578,9 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
         }
     }
 
-    if (Scaling.Variance)
+    if (scalingVariance)
     {
-        float delta = fabs(Scaling.Variance * 0.5f);
+        float delta = fabs(scalingVariance * 0.5f);
         float valueVariance = frand(-delta, delta);
         value += basePoints * valueVariance;
 
@@ -568,12 +589,12 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
     }
 
     // base amount modification based on spell lvl vs caster lvl
-    if (Scaling.Coefficient != 0.0f)
+    if (Scaling.Coefficient != 0.0f && !vanilla)
     {
         if (Scaling.ResourceCoefficient)
             comboDamage = value * Scaling.ResourceCoefficient;
     }
-    else if (GetScalingExpectedStat() == ExpectedStatType::None || UsesClassicFlatBasePoints(caster))
+    else if (vanilla || GetScalingExpectedStat() == ExpectedStatType::None || UsesClassicFlatBasePoints(caster))
     {
         // Classic 1.60 (vanilla): spells cast by a player's object (hunter traps: Explosive Trap, Immolation Trap) scale with the
         // owner's level
@@ -665,14 +686,27 @@ SpellEffectValue SpellEffectInfo::CalcValue(WorldObject const* caster /*= nullpt
     return std::clamp(value, MinValue, MaxValue);
 }
 
-// Classic 1.60: spells of players and of what they control (pets, totems, traps) use their base points as flat values
-bool SpellEffectInfo::UsesClassicFlatBasePoints(WorldObject const* caster)
+// Classic 1.60: spells of players and of what they control (pets, totems, traps) use their base points as flat values.
+// So do the legacy creature spells: the 1.60 client's SpellEffect.db2 still carries their vanilla flat values (Molten Giant
+// Smash 18944: 900 +-20%, Firesworn Blast Wave 20229: 750 +-15%), and reading those as a percentage of the expected creature
+// spell damage made Smash hit for 7.7k-25.7k (MC, 2026-10-06). Only the spells new to Forever carry percentages (Living
+// Storm Shock 1259652: 10 -> 16..18 on the official beta); they all sit in the modern id range, while vanilla and Classic Era
+// spells stay below it (the Forever creature scripts in sql/custom cast 1250053..1317755 for new content and < 415000 for
+// the rest).
+static constexpr uint32 CLASSIC_FIRST_SCALED_SPELL_ID = 1000000;
+
+bool SpellEffectInfo::UsesClassicFlatBasePoints(WorldObject const* caster) const
 {
-    return caster && caster->GetAffectingPlayer();
+    if (caster && caster->GetAffectingPlayer())
+        return true;
+    return _spellInfo->Id < CLASSIC_FIRST_SCALED_SPELL_ID;
 }
 
 SpellEffectValue SpellEffectInfo::CalcBaseValue(WorldObject const* caster, Unit const* target, uint32 itemId, int32 itemLevel) const
 {
+    if (ClassicSpellValue::Value const* vanilla = GetClassicValue(caster, _spellInfo->Id, EffectIndex))
+        return ClassicSpellValue::Mean(*vanilla);
+
     if (Scaling.Coefficient != 0.0f)
     {
         uint32 level = _spellInfo->SpellLevel;
@@ -1303,7 +1337,7 @@ std::array<SpellEffectInfo::StaticData, TOTAL_SPELL_EFFECTS> SpellEffectInfo::_d
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 326 SPELL_EFFECT_326
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 327 SPELL_EFFECT_327
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 328 SPELL_EFFECT_328
-    {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 329 SPELL_EFFECT_329
+    {EFFECT_IMPLICIT_TARGET_EXPLICIT, TARGET_OBJECT_TYPE_CORPSE_ALLY}, // 329 SPELL_EFFECT_RESURRECT_NEW
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 330 SPELL_EFFECT_330
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 331 SPELL_EFFECT_331
     {EFFECT_IMPLICIT_TARGET_NONE,     TARGET_OBJECT_TYPE_NONE}, // 332 SPELL_EFFECT_332
@@ -2560,10 +2594,10 @@ SpellCastResult SpellInfo::CheckTarget(WorldObject const* caster, WorldObject co
         return SPELL_FAILED_TARGET_AURASTATE;
 
     if (unitTarget->HasAuraType(SPELL_AURA_PREVENT_RESURRECTION) && !HasAttribute(SPELL_ATTR7_BYPASS_NO_RESURRECT_AURA))
-        if (HasEffect(SPELL_EFFECT_SELF_RESURRECT) || HasEffect(SPELL_EFFECT_RESURRECT))
+        if (HasEffect(SPELL_EFFECT_SELF_RESURRECT) || HasEffect(SPELL_EFFECT_RESURRECT) || HasEffect(SPELL_EFFECT_RESURRECT_NEW))
             return SPELL_FAILED_TARGET_CANNOT_BE_RESURRECTED;
 
-    if (HasAttribute(SPELL_ATTR8_ENFORCE_IN_COMBAT_RESSURECTION_LIMIT))
+    if (HasAttribute(SPELL_ATTR8_ENFORCE_IN_COMBAT_RESSURECTION_LIMIT) && sWorld->getBoolConfig(CONFIG_INSTANCE_COMBAT_RES_LIMIT))
         if (Map* map = caster->GetMap())
             if (InstanceMap* iMap = map->ToInstanceMap())
                 if (InstanceScript* instance = iMap->GetInstanceScript())
@@ -4222,8 +4256,17 @@ Optional<SpellPowerCost> SpellInfo::CalcPowerCost(SpellPowerEntry const* power, 
     if (!optionalCost)
     {
         powerCost = power->ManaCost;
+        // Classic 1.60: the vanilla mana cost of a legacy spell (classic_spell_cost: flat plus percent of the base mana) replaces the
+        // client's; the cost modifiers below (talents, auras) still apply to it
+        bool usesVanillaCost = false;
+        if (power->PowerType == POWER_MANA && ClassicSpellValue::AppliesToSpell(Id))
+            if (ClassicSpellValue::Cost const* vanillaCost = sSpellMgr->GetClassicSpellCost(Id))
+            {
+                powerCost = ClassicSpellValue::ManaCost(*vanillaCost, int32(unitCaster->GetCreateMana()));
+                usesVanillaCost = true;
+            }
         // PCT cost from total amount
-        if (power->PowerCostPct)
+        if (power->PowerCostPct && !usesVanillaCost)
         {
             switch (power->PowerType)
             {

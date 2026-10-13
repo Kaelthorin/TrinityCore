@@ -24,6 +24,7 @@
 #include "GroupMgr.h"
 #include "LFG.h"
 #include "Log.h"
+#include "Playerbot/DiagProbes.h"
 #include "Loot.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
@@ -63,7 +64,20 @@ void WorldSession::SendPartyResult(PartyOperation operation, const std::string& 
 void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClient& packet)
 {
     Player* invitingPlayer = GetPlayer();
-    Player* invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
+    // The unit menu / portrait Invite can send the target by guid (empty name) or as "Name-Realm"; typed /invite sends the plain name.
+    Player* invitedPlayer = nullptr;
+    if (!packet.TargetGUID.IsEmpty() && packet.TargetGUID.IsPlayer())
+        invitedPlayer = ObjectAccessor::FindConnectedPlayer(packet.TargetGUID);
+    if (!invitedPlayer && !packet.TargetName.empty())
+    {
+        invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
+        if (!invitedPlayer)
+            if (size_t const dash = packet.TargetName.find('-'); dash != std::string::npos && dash > 0)
+                invitedPlayer = ObjectAccessor::FindPlayerByName(std::string_view(packet.TargetName).substr(0, dash));
+    }
+    PROBE_LOG("[invite_probe] {} invites name '{}' realm '{}' guid {}: {}", invitingPlayer ? invitingPlayer->GetName() : "?", packet.TargetName,
+                packet.TargetRealm, packet.TargetGUID.ToString(),
+                invitedPlayer ? (invitedPlayer->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
 
     // no player
     if (!invitedPlayer)
@@ -362,16 +376,17 @@ void WorldSession::HandleLeaveGroupOpcode(WorldPackets::Party::LeaveGroup& packe
     }
 }
 
-void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod& /*packet*/)
+void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod& packet)
 {
-    // not allowed to change
-    /*
     Group* group = GetPlayer()->GetGroup(packet.PartyIndex);
     if (!group)
         return;
 
     if (!group->IsLeader(GetPlayer()->GetGUID()))
+    {
+        TC_LOG_INFO("playerbot.v2", "[loot_method] {} is not the leader of its group, request ignored", GetPlayer()->GetName());
         return;
+    }
 
     if (group->isLFGGroup())
         return;
@@ -379,26 +394,33 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
     switch (packet.LootMethod)
     {
         case FREE_FOR_ALL:
+        case ROUND_ROBIN:
         case MASTER_LOOT:
         case GROUP_LOOT:
-        case PERSONAL_LOOT:
+        case NEED_BEFORE_GREED:
             break;
         default:
+            TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent unsupported loot method {}", GetPlayer()->GetName(), uint32(packet.LootMethod));
             return;
     }
 
     if (packet.LootThreshold < ITEM_QUALITY_UNCOMMON || packet.LootThreshold > ITEM_QUALITY_ARTIFACT)
+    {
+        TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent loot threshold {} out of range", GetPlayer()->GetName(), packet.LootThreshold);
         return;
+    }
 
     if (packet.LootMethod == MASTER_LOOT && !group->IsMember(packet.LootMasterGUID))
+    {
+        TC_LOG_INFO("playerbot.v2", "[loot_method] {} chose a master looter outside the group", GetPlayer()->GetName());
         return;
+    }
 
-    // everything's fine, do it
+    TC_LOG_INFO("playerbot.v2", "[loot_method] {} sets loot method {} threshold {}", GetPlayer()->GetName(), uint32(packet.LootMethod), packet.LootThreshold);
     group->SetLootMethod(static_cast<LootMethod>(packet.LootMethod));
-    group->SetMasterLooterGuid(packet.LootMasterGUID);
+    group->SetMasterLooterGuid(packet.LootMethod == MASTER_LOOT ? packet.LootMasterGUID : ObjectGuid::Empty);
     group->SetLootThreshold(static_cast<ItemQualities>(packet.LootThreshold));
     group->SendUpdate();
-    */
 }
 
 void WorldSession::HandleMinimapPingOpcode(WorldPackets::Party::MinimapPingClient& packet)
@@ -600,6 +622,7 @@ void WorldSession::HandleRequestPartyMemberStatsOpcode(WorldPackets::Party::Requ
 void WorldSession::HandleRequestRaidInfoOpcode(WorldPackets::Party::RequestRaidInfo& /*packet*/)
 {
     // every time the player checks the character screen
+    TC_LOG_INFO("instance.lock", "[raid_info] client requested raid info ({})", _player->GetName());
     _player->SendRaidInfo();
 }
 

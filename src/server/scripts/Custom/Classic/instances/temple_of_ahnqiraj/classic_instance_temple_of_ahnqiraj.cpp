@@ -32,6 +32,7 @@
 #include "ScriptedCreature.h"
 #include "SpellInfo.h"
 #include "SpellScript.h"
+#include "classic_boss_pack.h"
 #include "TemporarySummon.h"
 #include "classic_script_text.h"
 #include "classic_temple_of_ahnqiraj.h"
@@ -505,6 +506,15 @@ public:
                     SetBossState(uiType, EncounterState(uiData));
                     break;
                 case TYPE_SARTURA:
+                    // A Sartura that resets alive brings back the Royal Guards killed in the failed attempt.
+                    if (GetBossState(uiType) == IN_PROGRESS && (uiData == NOT_STARTED || uiData == FAIL))
+                    {
+                        SetBossState(uiType, EncounterState(uiData));
+                        ClassicRespawnBossPack(instance, NPC_BATTLEGUARD_SARTURA, { NPC_SARTURA_S_ROYAL_GUARD });
+                        break;
+                    }
+                    SetBossState(uiType, EncounterState(uiData));
+                    break;
                 case TYPE_FANKRISS:
                 case TYPE_VISCIDUS:
                     SetBossState(uiType, EncounterState(uiData));

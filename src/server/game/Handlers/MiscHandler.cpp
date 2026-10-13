@@ -48,6 +48,7 @@
 #include "ObjectMgr.h"
 #include "OutdoorPvP.h"
 #include "Player.h"
+#include "Playerbot/PlayerbotHooks.h"
 #include "RestMgr.h"
 #include "ScriptMgr.h"
 #include "Spell.h"
@@ -60,7 +61,19 @@
 
 void WorldSession::HandleRepopRequest(WorldPackets::Misc::RepopRequest& /*packet*/)
 {
+    // [release] (Garr test 2026-10-08: the client's Release Spirit seemed to do nothing; this line proves whether the click reaches the server)
+    TC_LOG_INFO("playerbot.v2", "[release] repop request from {} alive={} ghost={} prevent_rez={} teleporting={} map {} ({:.1f},{:.1f},{:.1f})",
+        GetPlayer()->GetName(), GetPlayer()->IsAlive(), GetPlayer()->HasPlayerFlag(PLAYER_FLAGS_GHOST),
+        GetPlayer()->HasAuraType(SPELL_AURA_PREVENT_RESURRECTION), GetPlayer()->IsBeingTeleported(), GetPlayer()->GetMapId(),
+        GetPlayer()->GetPositionX(), GetPlayer()->GetPositionY(), GetPlayer()->GetPositionZ());
+
     if (GetPlayer()->IsAlive() || GetPlayer()->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+        return;
+
+    // A second Release Spirit click while the first one's teleport is still under way (a dungeon release sends the player to
+    // the graveyard of another map): the repop would teleport again into the loading screen of the first, and the client
+    // arrives with no terrain under it and falls through the world (Karrz, Deadmines -> Sentinel Hill, 2026-10-09, z -1409).
+    if (GetPlayer()->IsBeingTeleported())
         return;
 
     if (GetPlayer()->HasAuraType(SPELL_AURA_PREVENT_RESURRECTION))
@@ -77,6 +90,11 @@ void WorldSession::HandleRepopRequest(WorldPackets::Misc::RepopRequest& /*packet
             GetPlayer()->GetName(), GetPlayer()->GetGUID().ToString());
         GetPlayer()->KillPlayer();
     }
+
+    // PLAYERBOT V2 HOOK: the owner's dead companions on this map release with the owner (inside a dungeon or
+    // raid RepopAtGraveyard revives the owner at the graveyard, so no ghost state ever tells them). Fired
+    // before the repop so the owner's map is still the death map.
+    Playerbot::Hooks::OnSpiritReleased(GetPlayer());
 
     //this is spirit release confirm?
     GetPlayer()->RemovePet(nullptr, PET_SAVE_NOT_IN_SLOT, true);
@@ -425,27 +443,59 @@ void WorldSession::HandleStandStateChangeOpcode(WorldPackets::Misc::StandStateCh
 
 void WorldSession::HandleReclaimCorpse(WorldPackets::Misc::ReclaimCorpse& /*packet*/)
 {
+    TC_LOG_ERROR("playerbot.death", "🔍 RECLAIM_CORPSE: {} - Handler called (IsAlive={}, deathState={})",
+        _player->GetName(), _player->IsAlive(), static_cast<int>(_player->getDeathState()));
+
     if (_player->IsAlive())
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: IsAlive check (player is alive)", _player->GetName());
         return;
+    }
 
     // do not allow corpse reclaim in arena
     if (_player->InArena())
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: InArena check", _player->GetName());
         return;
+    }
 
     // body not released yet
     if (!_player->HasPlayerFlag(PLAYER_FLAGS_GHOST))
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: No PLAYER_FLAGS_GHOST (body not released)", _player->GetName());
         return;
+    }
 
     Corpse* corpse = _player->GetCorpse();
     if (!corpse)
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: No corpse found (GetCorpse() returned nullptr)", _player->GetName());
         return;
+    }
+
+    TC_LOG_ERROR("playerbot.death", "🔍 RECLAIM_CORPSE: {} - Corpse found! GhostTime={}, CurrentTime={}, Delay={}",
+        _player->GetName(), corpse->GetGhostTime(), GameTime::GetGameTime(),
+        _player->GetCorpseReclaimDelay(corpse->GetType() == CORPSE_RESURRECTABLE_PVP));
 
     // prevent resurrect before 30-sec delay after body release not finished
     if (time_t(corpse->GetGhostTime() + _player->GetCorpseReclaimDelay(corpse->GetType() == CORPSE_RESURRECTABLE_PVP)) > time_t(GameTime::GetGameTime()))
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: Ghost time delay not expired (need to wait)", _player->GetName());
         return;
+    }
+
+    float distance = _player->GetDistance2d(corpse);
+    TC_LOG_ERROR("playerbot.death", "🔍 RECLAIM_CORPSE: {} - Distance to corpse: {:.2f}y (max: {}y)",
+        _player->GetName(), distance, CORPSE_RECLAIM_RADIUS);
 
     if (!corpse->IsWithinDistInMap(_player, CORPSE_RECLAIM_RADIUS, true))
+    {
+        TC_LOG_ERROR("playerbot.death", "❌ RECLAIM_CORPSE: {} - FAILED: Corpse too far ({:.2f}y > {}y)",
+            _player->GetName(), distance, CORPSE_RECLAIM_RADIUS);
         return;
+    }
+
+    TC_LOG_ERROR("playerbot.death", "✅ RECLAIM_CORPSE: {} - ALL CHECKS PASSED! Resurrecting...", _player->GetName());
 
     // Classic 1.60 Hardcore: refuse before the corpse turns into bones
     if (_player->RefuseHardcoreResurrect())
@@ -453,6 +503,9 @@ void WorldSession::HandleReclaimCorpse(WorldPackets::Misc::ReclaimCorpse& /*pack
 
     // resurrect
     _player->ResurrectPlayer(_player->InBattleground() ? 1.0f : 0.5f);
+
+    TC_LOG_ERROR("playerbot.death", "✅ RECLAIM_CORPSE: {} - ResurrectPlayer() called! IsAlive={}",
+        _player->GetName(), _player->IsAlive());
 
     // spawn bones
     _player->SpawnCorpseBones();
@@ -476,7 +529,7 @@ void WorldSession::HandleResurrectResponse(WorldPackets::Misc::ResurrectResponse
     {
         if (InstanceScript* instance = ressPlayer->GetInstanceScript())
         {
-            if (instance->IsEncounterInProgress())
+            if (sWorld->getBoolConfig(CONFIG_INSTANCE_COMBAT_RES_LIMIT) && instance->IsEncounterInProgress())
             {
                 if (!instance->GetCombatResurrectionCharges())
                     return;

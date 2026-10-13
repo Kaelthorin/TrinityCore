@@ -21,6 +21,8 @@
 #include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
+#include "ClassicOpcodes.h"
+#include "Config.h"
 #include "Formulas.h"
 #include "GameObject.h"
 #include "GameTime.h"
@@ -28,6 +30,8 @@
 #include "Item.h"
 #include "LFGMgr.h"
 #include "Log.h"
+#include "Playerbot/DiagProbes.h"
+#include "Util.h"
 #include "Loot.h"
 #include "MapManager.h"
 #include "MiscPackets.h"
@@ -39,6 +43,7 @@
 #include "Player.h"
 #include "UpdateData.h"
 #include "WorldSession.h"
+#include "Playerbot/PlayerbotHooks.h"
 
 Seconds Group::CountdownInfo::GetTimeLeft() const
 {
@@ -60,7 +65,8 @@ Group::Group() : m_leaderGuid(), m_leaderFactionGroup(0), m_leaderName(""), m_gr
 m_dungeonDifficulty(DIFFICULTY_NORMAL), m_raidDifficulty(DIFFICULTY_NORMAL_RAID), m_legacyRaidDifficulty(DIFFICULTY_10_N),
 m_bgGroup(nullptr), m_bfGroup(nullptr), m_lootMethod(PERSONAL_LOOT), m_lootThreshold(ITEM_QUALITY_UNCOMMON), m_looterGuid(),
 m_masterLooterGuid(), m_subGroupsCounts(nullptr), m_guid(), m_dbStoreId(0), m_isLeaderOffline(false),
-m_readyCheckStarted(false), m_readyCheckTimer(Milliseconds::zero()), m_activeMarkers(0), m_scriptRef(this, NoopGroupDeleter())
+m_readyCheckStarted(false), m_readyCheckTimer(Milliseconds::zero()), m_activeMarkers(0), m_pingRestriction(RestrictPingsTo::None),
+m_scriptRef(this, NoopGroupDeleter())
 {
     for (uint8 i = 0; i < TARGET_ICONS_COUNT; ++i)
         m_targetIcons[i].Clear();
@@ -914,7 +920,15 @@ void Group::SendUpdateToPlayer(Player* player, MemberSlot const* slot /*= nullpt
         partyUpdate.LfgInfos->MyKickVoteCount = 0;
     }
 
-    player->SendDirectMessage(partyUpdate.Write());
+    WorldPacket const* packet = partyUpdate.Write();
+    // human recipients only: a raid would log 40 lines per bot per update
+    if (!player->GetSession()->IsBot())
+        PROBE_LOG("[party_update] to {}: flags {:#x} index {} type {} myIndex {} seq {} members {} leader {} loot {} difficulty {} bytes {} wire opcode {:#x} (build70291 {})",
+                    player->GetName(), uint32(partyUpdate.PartyFlags), uint32(partyUpdate.PartyIndex), uint32(partyUpdate.PartyType), partyUpdate.MyIndex,
+                    partyUpdate.SequenceNum, uint32(partyUpdate.PlayerList.size()), partyUpdate.LeaderGUID.ToString(), partyUpdate.LootSettings.has_value(),
+                    partyUpdate.DifficultySettings.has_value(), packet->size(), ClassicOpcodes::TranslateServerOpcode(SMSG_PARTY_UPDATE),
+                    ClassicOpcodes::IsBuild70291OrLater());
+    player->SendDirectMessage(packet);
 }
 
 void Group::SendUpdateDestroyGroupToPlayer(Player* player) const
@@ -954,7 +968,10 @@ void Group::BroadcastAddonMessagePacket(WorldPacket const* packet, const std::st
         if ((!ignore.IsEmpty() && player->GetGUID() == ignore) || (ignorePlayersInBGRaid && player->GetGroup() != this))
             continue;
 
-        if (player->GetSession()->IsAddonRegistered(prefix) && (group == -1 || itr.getSubGroup() == group))
+        // Null-session guard for mid-logout group members in addon-msg
+        // broadcast path. Skipping a logging-out target is the right
+        // outcome — they can't process the addon msg anyway.
+        if (player->GetSession() && player->GetSession()->IsAddonRegistered(prefix) && (group == -1 || itr.getSubGroup() == group))
             player->SendDirectMessage(packet);
     }
 }
@@ -1057,6 +1074,21 @@ void Group::ChangeMembersGroup(ObjectGuid guid, uint8 group)
 
     // Broadcast the changes to the group
     SendUpdate();
+    Playerbot::Hooks::OnRaidSubgroupChanged(this, guid, group);
+}
+
+void Group::ReorderMembers(std::vector<ObjectGuid> const& order)
+{
+    MemberSlotList sorted;
+    for (ObjectGuid const& guid : order)
+    {
+        member_witerator it = _getMemberWSlot(guid);
+        if (it != m_memberSlots.end())
+            sorted.splice(sorted.end(), m_memberSlots, it);
+    }
+    sorted.splice(sorted.end(), m_memberSlots);
+    m_memberSlots.swap(sorted);
+    SendUpdate();
 }
 
 void Group::SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid)
@@ -1102,6 +1134,8 @@ void Group::SwapMembersGroups(ObjectGuid firstGuid, ObjectGuid secondGuid)
     CharacterDatabase.CommitTransaction(trans);
 
     SendUpdate();
+    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[0]->guid, slots[0]->group);
+    Playerbot::Hooks::OnRaidSubgroupChanged(this, slots[1]->guid, slots[1]->group);
 }
 
 // Retrieve the next Round-Roubin player for the group
@@ -1430,6 +1464,11 @@ void Group::SetLfgRoles(ObjectGuid guid, uint8 roles)
 {
     member_witerator slot = _getMemberWSlot(guid);
     if (slot == m_memberSlots.end())
+        return;
+
+    // Unchanged roles need no SMSG_PARTY_UPDATE: every send makes each member's
+    // client rebuild its whole party/raid frame roster.
+    if (slot->roles == roles)
         return;
 
     slot->roles = roles;

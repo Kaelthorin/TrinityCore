@@ -17,6 +17,7 @@
 
 #include "SpellAuras.h"
 #include "CellImpl.h"
+#include "ClassicSpellValue.h"
 #include "Common.h"
 #include "Containers.h"
 #include "CreatureAI.h"
@@ -165,8 +166,18 @@ void AuraApplication::_HandleEffect(uint8 effIndex, bool apply)
         return;
     }
     ASSERT(aurEff);
-    ASSERT(HasEffect(effIndex) == (!apply));
-    ASSERT((1<<effIndex) & _effectsToApply);
+    // Message payload discriminates a reentrant double-apply (clean masks,
+    // live nested Spell on the stack) from a corrupted/zombie application
+    // (mask bits outside effectsToApply, non-zero removeMode, IsRemoved).
+    ASSERT(HasEffect(effIndex) == (!apply),
+        "aura %u eff %u apply %u effectMask 0x%X effectsToApply 0x%X removeMode %u slot %u stack %u auraRemoved %u target %s caster %s",
+        GetBase()->GetId(), uint32(effIndex), uint32(apply), _effectMask, _effectsToApply,
+        uint32(GetRemoveMode()), uint32(GetSlot()), uint32(GetBase()->GetStackAmount()),
+        uint32(GetBase()->IsRemoved()),
+        GetTarget()->GetGUID().ToString().c_str(), GetBase()->GetCasterGUID().ToString().c_str());
+    ASSERT((1<<effIndex) & _effectsToApply,
+        "aura %u eff %u not in effectsToApply 0x%X (effectMask 0x%X)",
+        GetBase()->GetId(), uint32(effIndex), _effectsToApply, _effectMask);
     TC_LOG_DEBUG("spells", "AuraApplication::_HandleEffect: {}, apply: {}: amount: {}", aurEff->GetAuraType(), apply, aurEff->GetAmount());
 
     if (apply)
@@ -526,6 +537,10 @@ bool Aura::CanPeriodicTickCrit() const
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR2_CANT_CRIT))
         return false;
 
+    // Classic 1.60 (vanilla): damage and healing over time never critically strike (Renew, Rejuvenation, Corruption, Immolate...)
+    if (ClassicSpellValue::AppliesToSpell(GetId()))
+        return false;
+
     if (GetSpellInfo()->HasAttribute(SPELL_ATTR8_PERIODIC_CAN_CRIT))
         return true;
 
@@ -601,6 +616,7 @@ void Aura::_ApplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
             caster->GetSpellHistory()->StartCooldown(m_spellInfo, castItem ? castItem->GetEntry() : 0, nullptr, true);
         }
     }
+
 }
 
 void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
@@ -629,6 +645,7 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
     if (caster && GetSpellInfo()->IsCooldownStartedOnEvent())
         // note: item based cooldowns and cooldown spell mods with charges ignored (unknown existed cases)
         caster->GetSpellHistory()->SendCooldownEvent(GetSpellInfo());
+
 }
 
 // removes aura from all targets

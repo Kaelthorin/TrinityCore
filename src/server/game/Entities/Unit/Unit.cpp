@@ -15,7 +15,10 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "PetFollowSpeed.h"
+#include <atomic>
 #include "Unit.h"
+#include "ClassicArmor.h"
 #include "DeathRecap.h"
 #include "AbstractFollower.h"
 #include "Battlefield.h"
@@ -51,6 +54,7 @@
 #include "KillRewarder.h"
 #include "ListUtils.h"
 #include "Log.h"
+#include "Config.h"
 #include "Loot.h"
 #include "LootMgr.h"
 #include "LootPackets.h"
@@ -93,6 +97,7 @@
 #include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+#include "Playerbot/PlayerbotHooks.h"
 #include <queue>
 #include <sstream>
 #include <cmath>
@@ -441,9 +446,25 @@ void Unit::Update(uint32 p_time)
 
     _UpdateSpells(p_time);
 
-    // If this is set during update SetCantProc(false) call is missing somewhere in the code
-    // Having this would prevent spells from being proced, so let's crash
-    ASSERT(!m_procDeep);
+    // Defensive reset: if m_procDeep leaked between updates (the RAII
+    // guard + per-handler try/catch in TriggerAurasProcOnEvent should
+    // make this impossible, yet it has been observed to still happen
+    // under heavy bot-driven proc load on Paladin/Monk), log + reset
+    // instead of crashing the world thread. The next tick's procs
+    // will fire normally. The original ASSERT was correct as a canary
+    // but unconditionally fatal in production. Keeping the log line at
+    // ERROR level so the GUID of the offending unit surfaces every
+    // time and we can chase the underlying TC bug as a separate
+    // workstream without taking the server down.
+    if (m_procDeep)
+    {
+        TC_LOG_ERROR("entities.unit",
+            "Unit::Update entered with m_procDeep={} (leak — reset). "
+            "Unit GUID {} class {} mapId {}",
+            m_procDeep, GetGUID().ToString(), uint32(GetClass()),
+            GetMapId());
+        m_procDeep = 0;
+    }
 
     m_combatManager.Update(p_time);
 
@@ -850,6 +871,11 @@ bool Unit::HasBreakableByDamageCrowdControlAura(Unit const* excludeCasterChannel
         // Hook for OnDamage Event
         sScriptMgr->OnDamage(attacker, victim, tmpDamage);
 
+        // PLAYERBOT V2 HOOK: feed BotEventInbox so reactive AI sees per-hit
+        // events. Filtered to player victims inside the hook.
+        Playerbot::Hooks::OnDamageTaken(attacker, victim, int32(tmpDamage),
+                                        spellProto ? spellProto->Id : 0u);
+
         // if any script modified damage, we need to also apply the same modification to unscaled damage value
         if (tmpDamage != damageTaken)
         {
@@ -1214,6 +1240,11 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
 
     SpellSchoolMask damageSchoolMask = SpellSchoolMask(damageInfo->schoolMask);
 
+    // Diagnostic (2026-10-09, low spell damage): the stages after the damage bonus, logged once absorb / resist are known.
+    int32 const diagInDamage = damage;
+    int32 diagAfterCrit = damage;
+    int32 diagAfterResilience = damage;
+
     // Spells with SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS ignore resilience because their damage is based off another spell's damage.
     if (!spellInfo->HasAttribute(SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS))
     {
@@ -1280,9 +1311,11 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
                     damage = Unit::SpellCriticalDamageBonus(this, spellInfo, damage, victim);
                 }
+                diagAfterCrit = damage;
 
                 if (CanApplyResilience())
                     Unit::ApplyResilience(victim, &damage);
+                diagAfterResilience = damage;
                 break;
 
             }
@@ -1312,6 +1345,26 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
         damageInfo->HitInfo |= (damageInfo->damage - damageInfo->resist == 0 ? HITINFO_FULL_RESIST : HITINFO_PARTIAL_RESIST);
 
     damageInfo->damage = dmgInfo.GetDamage();
+
+    // Capped at 400 lines like the [spell_dmg] line before it; remove once the low-damage report is explained.
+    if (GetTypeId() == TYPEID_PLAYER && spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MAGIC)
+    {
+        static uint32 s_mitigationDiagLines = 0;
+        WorldSession const* diagSession = ToPlayer()->GetSession();
+        Player const* diagVictim = victim->ToPlayer();
+        bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
+        if (s_mitigationDiagLines < 1500 && humanInvolved)
+        {
+            ++s_mitigationDiagLines;
+            // The resistance steps of the hit: the victim's school resistance, the caster's penetration (spell penetration gear and talents),
+            // and the average resisted share the roll in CalcSpellResistedDamage works from (level gap 8 per level included).
+            float const avgResist = Unit::CalculateAverageResistReduction(this, damageSchoolMask, victim, spellInfo);
+            TC_LOG_INFO("playerbot.v2", "[spell_dmg_post] caster={} spell={} in={} crit={} after_crit={} after_resilience={} resist={} absorb={} final={} (victim={} lvl={} caster_lvl={} school_mask={} victim_resistance={} avg_resist_pct={:.1f})",
+                GetName(), spellInfo->Id, diagInDamage, crit ? 1 : 0, diagAfterCrit, diagAfterResilience, damageInfo->resist, damageInfo->absorb,
+                damageInfo->damage, victim->GetName(), uint32(victim->GetLevelForTarget(this)), uint32(GetLevelForTarget(victim)), uint32(damageSchoolMask),
+                victim->GetResistance(damageSchoolMask), avgResist * 100.0f);
+        }
+    }
 }
 
 void Unit::DealSpellDamage(SpellNonMeleeDamage const* damageInfo, bool durabilityLoss)
@@ -1592,6 +1645,14 @@ void Unit::DealMeleeDamage(CalcDamageInfo* damageInfo, bool durabilityLoss)
         }
     }
 
+    // PLAYERBOT V2 HOOK (damage_parity scenarios): the swing's outcome, just before its damage is dealt.
+    Playerbot::Hooks::OnHitOutcome(this, victim, 0,
+                                   damageInfo->HitOutCome == MELEE_HIT_CRIT ? 1 : damageInfo->HitOutCome == MELEE_HIT_MISS ? 2
+                                   : damageInfo->HitOutCome == MELEE_HIT_DODGE ? 3 : damageInfo->HitOutCome == MELEE_HIT_PARRY ? 4
+                                   : damageInfo->HitOutCome == MELEE_HIT_BLOCK ? 5 : damageInfo->HitOutCome == MELEE_HIT_GLANCING ? 6
+                                   : damageInfo->HitOutCome == MELEE_HIT_CRUSHING ? 7 : damageInfo->HitOutCome == MELEE_HIT_NORMAL ? 0 : 9,
+                                   damageInfo->Damage);
+
     // Call default DealDamage
     CleanDamage cleanDamage(damageInfo->CleanDamage, damageInfo->Absorb, damageInfo->AttackType, damageInfo->HitOutCome);
     Unit::DealDamage(this, victim, damageInfo->Damage, &cleanDamage, DIRECT_DAMAGE, SpellSchoolMask(damageInfo->DamageSchoolMask), nullptr, durabilityLoss);
@@ -1767,27 +1828,12 @@ void Unit::HandleEmoteCommand(Emote emoteId, Player* target /*=nullptr*/, Trinit
     if (G3D::fuzzyLe(armor, 0.0f))
         return damage;
 
-    Classes attackerClass = CLASS_NONE;
-    Optional<float> attackerItemLevel;
     if (attacker)
-    {
         attackerLevel = attacker->GetLevelForTarget(victim);
-        if (Player const* ownerPlayer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
-            attackerItemLevel = ownerPlayer->m_playerData->AvgItemLevel[AsUnderlyingType(AvgItemLevelCategory::EquippedBase)];
-        else
-            attackerClass = Classes(attacker->GetClass());
-    }
 
-    // Expansion and ContentTuningID necessary? Does Player get a ContentTuningID too ?
-    // Classic 1.60 (vanilla): the client ExpectedStat armor constant is the vanilla 400 + 85 * level; no retail item level
-    // diminishing at max level, and armor reduces damage by at most 75% (retail 85%)
-    float armorConstant = sDB2Manager.EvaluateExpectedStat(ExpectedStatType::ArmorConstant, attackerLevel, -2, 0, attackerClass, 0);
-    (void)attackerItemLevel;
-
-    if (!(armor + armorConstant))
-        return damage;
-
-    float mitigation = std::min(armor / (armor + armorConstant), 0.75f);
+    // Classic 1.60 (vanilla, VMaNGOS SpellCaster::CalcArmorReducedDamage): armor / (armor + 400 + 85 * attacker level), at most 75%.
+    // The client's retail expected-stat ArmorConstant and the retail 85% cap are not used.
+    float const mitigation = ClassicArmor::Mitigation(armor, attackerLevel);
     // Classic 1.60 (vanilla): rounded, and armor never takes a hit below 1 damage (retail truncated: 1 damage hits became 0)
     if (!damage)
         return 0;
@@ -3090,6 +3136,28 @@ void Unit::_UpdateAutoRepeatSpell()
         return;
     }
 
+    // The auto-repeat spell keeps its explicit target as a raw pointer that is refreshed from the GUID by Spell::update (through the spell's
+    // event). CheckCast below dereferences it: a battleground bot's Shoot / Auto Shot read a pointer that was no longer a live object
+    // (WorldObject::CanSeeOrDetect, read of 0xFFFFFFFFFFFFFFFF, WSG map 489, four times on 2026-10-11, each time the map update was lost for
+    // a tick). Resolve it again from the GUID here, exactly as Spell::update does, and stop the auto-repeat when the target is gone. The
+    // line says when the pointer had been stale, which is what finds where it goes stale.
+    if (Spell* repeat = m_currentSpells[CURRENT_AUTOREPEAT_SPELL]; repeat && repeat->getState() != SPELL_STATE_PREPARING)
+    {
+        ObjectGuid const targetGuid = repeat->m_targets.GetObjectTargetGUID();
+        WorldObject* const held = repeat->m_targets.GetObjectTarget();
+        bool const refreshed = repeat->UpdatePointers();
+        WorldObject* const resolved = repeat->m_targets.GetObjectTarget();
+        if (held != resolved)
+            TC_LOG_ERROR("spells", "Auto-repeat spell {} of {} held a stale target pointer {} for {} (resolves to {}), map {}",
+                repeat->m_spellInfo->Id, GetGUID().ToString(), static_cast<void const*>(held), targetGuid.ToString(),
+                static_cast<void const*>(resolved), GetMapId());
+        if (!refreshed || (!targetGuid.IsEmpty() && !resolved))
+        {
+            InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+            return;
+        }
+    }
+
     // castroutine
     if (isAttackReady(RANGED_ATTACK) && m_currentSpells[CURRENT_AUTOREPEAT_SPELL]->getState() != SPELL_STATE_PREPARING)
     {
@@ -3248,6 +3316,7 @@ void Unit::InterruptSpell(CurrentSpellTypes spellType, bool withDelayed, bool wi
             m_currentSpells[spellType] = nullptr;
             spell->SetReferencedFromCurrent(false);
         }
+
 
         if (GetTypeId() == TYPEID_UNIT && IsAIEnabled())
             ToCreature()->AI()->OnSpellFailed(spell->GetSpellInfo());
@@ -3620,8 +3689,14 @@ void Unit::_ApplyAuraEffect(Aura* aura, uint8 effIndex)
     ASSERT(aurApp);
     if (!aurApp->GetEffectMask())
         _ApplyAura(aurApp, 1 << effIndex);
-    else
+    else if (!aurApp->HasEffect(effIndex))
         aurApp->_HandleEffect(effIndex, true);
+    else
+        // The HasEffect pre-check for this path lives one frame up in
+        // Aura::_ApplyEffectForTargets and goes stale across its multi-target
+        // loop when an earlier target's handler re-enters the spell system.
+        TC_LOG_ERROR("spells", "Unit::_ApplyAuraEffect: aura {} eff {} on {} was applied re-entrantly (effMask 0x{:X})",
+            aura->GetId(), uint32(effIndex), GetGUID().ToString(), aurApp->GetEffectMask());
 }
 
 // handles effects of aura application
@@ -3665,7 +3740,17 @@ void Unit::_ApplyAura(AuraApplication* aurApp, uint32 effMask)
     {
         if (effMask & 1 << aurEff->GetEffIndex())
         {
-            aurApp->_HandleEffect(aurEff->GetEffIndex(), true);
+            // A handler above (HandleAuraSpecificMods linked cast, ModifyAuraState
+            // passive cast, no-stack removal script, or an earlier effect handler)
+            // can re-enter the spell system and apply this effect through a nested
+            // hit of the same aura application. The contract here is "ensure these
+            // effects are applied" — re-applying an already-applied effect would
+            // double its handler (and trips the _HandleEffect assert).
+            if (!aurApp->HasEffect(aurEff->GetEffIndex()))
+                aurApp->_HandleEffect(aurEff->GetEffIndex(), true);
+            else
+                TC_LOG_ERROR("spells", "Unit::_ApplyAura: aura {} eff {} on {} was applied re-entrantly during application (effMask 0x{:X})",
+                    aura->GetId(), uint32(aurEff->GetEffIndex()), GetGUID().ToString(), aurApp->GetEffectMask());
             if (aurApp->GetRemoveMode())
                 break;
         }
@@ -6659,6 +6744,11 @@ void Unit::SetCharm(Unit* charm, bool apply)
     // Hook for OnHeal Event
     sScriptMgr->OnHeal(healer, victim, (uint32&)gain);
 
+    // PLAYERBOT V2 HOOK: feed BotEventInbox with heal events. Filtered to
+    // player victims inside the hook.
+    Playerbot::Hooks::OnHealReceived(healer, victim, int32(gain),
+                                     healInfo.GetSpellInfo() ? healInfo.GetSpellInfo()->Id : 0u);
+
     Unit* unit = healer;
     if (healer && healer->GetTypeId() == TYPEID_UNIT && healer->IsTotem())
         unit = healer->GetOwner();
@@ -6916,15 +7006,28 @@ void Unit::SendEnergizeSpellLog(Unit* victim, uint32 spellID, int32 damage, int3
 
 void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damage, Powers powerType)
 {
-    if (Player* player = victim->ToPlayer())
-        if (PowerTypeEntry const* powerTypeEntry = sDB2Manager.GetPowerTypeEntry(powerType))
-            if (powerTypeEntry->GetFlags().HasFlag(PowerTypeFlags::UseRegenInterrupt))
-                player->InterruptPowerRegen(powerType);
+    // Classic 1.60 (vanilla): only paying mana starts the five second rule (Spell::TakePower). Receiving mana does not (Judgement of
+    // Wisdom, Spiritual Attunement, Life Tap...): with such a gain every few seconds the window never ran out, which is the likely
+    // reason the paladin regenerated 38% of its out-of-combat mana while standing in combat. Other powers keep the retail rule.
+    if (powerType != POWER_MANA)
+        if (Player* player = victim->ToPlayer())
+            if (PowerTypeEntry const* powerTypeEntry = sDB2Manager.GetPowerTypeEntry(powerType))
+                if (powerTypeEntry->GetFlags().HasFlag(PowerTypeFlags::UseRegenInterrupt))
+                    player->InterruptPowerRegen(powerType);
 
     int32 gain = victim->ModifyPower(powerType, damage, false);
     int32 overEnergize = damage - gain;
+    Playerbot::Hooks::OnEnergize(victim, spellInfo->Id, gain, powerType);
     victim->GetThreatManager().ForwardThreatForAssistingMe(this, float(damage) / 2, spellInfo, true);
     SendEnergizeSpellLog(victim, spellInfo->Id, gain, overEnergize, powerType);
+}
+
+// Classic 1.60: the VMaNGOS spell power / healing power factor of a legacy spell effect, when the vanilla table has one (classic_spell_value.bonus_coeff)
+static ClassicSpellValue::Value const* ClassicCoefficientRow(SpellInfo const* spellInfo, SpellEffectInfo const& effectInfo)
+{
+    if (!ClassicSpellValue::AppliesToSpell(spellInfo->Id))
+        return nullptr;
+    return sSpellMgr->GetClassicSpellValue(spellInfo->Id, uint32(effectInfo.EffectIndex));
 }
 
 // Classic 1.60 (vanilla, VMaNGOS SpellCaster::CalculateLevelPenalty): spells learned below level 20 get less from spell power,
@@ -6955,6 +7058,18 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     // Some spells don't benefit from done mods
     if (damagetype == DIRECT_DAMAGE || spellProto->HasAttribute(SPELL_ATTR3_IGNORE_CASTER_MODIFIERS))
     {
+        // Diagnostic (2026-10-08, low spell damage): a player's spell that skips spell power altogether never reaches the line below.
+        if (GetTypeId() == TYPEID_PLAYER)
+        {
+            static uint32 s_skipDiagLines = 0;
+            WorldSession const* skipSession = ToPlayer()->GetSession();
+            if (s_skipDiagLines < 100 && skipSession && !skipSession->IsBot())
+            {
+                ++s_skipDiagLines;
+                TC_LOG_INFO("playerbot.v2", "[spell_dmg] caster={} spell={} base={} NO caster modifiers (damagetype={} ignore_attr={})",
+                    GetName(), spellProto->Id, pdamage, uint32(damagetype), spellProto->HasAttribute(SPELL_ATTR3_IGNORE_CASTER_MODIFIERS) ? 1 : 0);
+            }
+        }
         callDamageScript(pdamage, DoneTotal, DoneTotalMod);
         return int32(std::max(float(pdamage + DoneTotal) * DoneTotalMod, 0.0f));
     }
@@ -7008,7 +7123,7 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     // Default calculation
     if (DoneAdvertisedBenefit)
     {
-        float coeff = spellEffectInfo.BonusCoefficient * ClassicSpellLevelPenalty(spellProto);
+        float coeff = ClassicSpellValue::BonusCoefficientOr(ClassicCoefficientRow(spellProto, spellEffectInfo), spellEffectInfo.BonusCoefficient) * ClassicSpellLevelPenalty(spellProto);
         if (Player* modOwner = GetSpellModOwner())
         {
             coeff *= 100.0f;
@@ -7022,10 +7137,34 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     callDamageScript(pdamage, DoneTotal, DoneTotalMod);
 
     float tmpDamage = float(pdamage + DoneTotal) * DoneTotalMod;
+    float const diagBeforeSpellMod = tmpDamage;
 
     // apply spellmod to Done damage (flat and pct)
     if (Player* modOwner = GetSpellModOwner())
         modOwner->ApplySpellMod(spellProto, damagetype == DOT ? SpellModOp::PeriodicHealingAndDamage : SpellModOp::HealingAndDamage, tmpDamage);
+
+    // Diagnostic (2026-10-08, "Shadow Bolt crit only ~800 in T2.5"): what a player's direct/periodic spell damage is made of.
+    // Capped at 400 lines; remove once the low-damage report is explained.
+    if (GetTypeId() == TYPEID_PLAYER && victim)
+    {
+        static uint32 s_dmgDiagLines = 0;
+        WorldSession const* diagSession = ToPlayer()->GetSession();
+        Player const* diagVictim = victim->ToPlayer();
+        bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
+        if (s_dmgDiagLines < 1500 && humanInvolved)
+        {
+            ++s_dmgDiagLines;
+            // Which auras make up pct_done: the caster's "damage done %" auras that match the spell's school (spell id:amount), so a
+            // talent that is missing or holds a later-era value (Shadow Mastery, Demonic Sacrifice...) is visible by its id.
+            std::string pctAuras;
+            for (AuraEffect const* aurEff : GetAuraEffectsByType(SPELL_AURA_MOD_DAMAGE_PERCENT_DONE))
+                if (aurEff->GetMiscValue() & spellProto->GetSchoolMask())
+                    pctAuras += fmt::format("{}:{} ", aurEff->GetId(), aurEff->GetAmount());
+            TC_LOG_INFO("playerbot.v2","[spell_dmg] caster={} spell={} base={} power={} coeff={:.3f} stack={} pct_done={:.3f} before_spellmod={} -> {} pct_auras=[{}] (victim={} lvl={})",
+                GetName(), spellProto->Id, pdamage, DoneAdvertisedBenefit, spellEffectInfo.BonusCoefficient, stack, DoneTotalMod,
+                int32(std::max(diagBeforeSpellMod, 0.0f)), int32(std::max(tmpDamage, 0.0f)), pctAuras, victim->GetName(), uint32(victim->GetLevel()));
+        }
+    }
 
     return int32(std::max(tmpDamage, 0.0f));
 }
@@ -7444,7 +7583,7 @@ float Unit::SpellCritChanceTaken(Unit const* caster, Spell* spell, AuraEffect co
 /*static*/ uint32 Unit::SpellCriticalHealingBonus(Unit const* caster, SpellInfo const* spellProto, uint32 damage, Unit* /*victim*/)
 {
     // Calculate critical bonus
-    // Classic 1.60 (vanilla): heal crits heal for 150% (retail 200%); talents add to the 50% bonus
+    // Classic 1.60 (vanilla): a critical heal is 150% of the normal heal, like a critical spell (retail: 200%)
     int32 crit_bonus = damage / 2;
 
     // adds additional damage to critBonus (from talents)
@@ -8774,7 +8913,8 @@ int64 Unit::ModifyHealth(int64 dVal)
         packet.Health = GetHealth();
 
         if (Player* player = GetCharmerOrOwnerPlayerOrPlayerItself())
-            player->GetSession()->SendPacket(packet.Write());
+            if (WorldSession* sess = player->GetSession())
+                sess->SendPacket(packet.Write());
     }
 
     return gain;
@@ -9039,6 +9179,7 @@ void Unit::UpdateSpeed(UnitMoveType mtype)
             break;
     }
 
+    bool petCatchUp = false;   // speed scaled by the gap to the owner: tiny drifts are not sent
     if (Creature* creature = ToCreature())
     {
         if (creature->HasUnitTypeMask(UNIT_MASK_MINION) && !creature->IsInCombat())
@@ -9052,6 +9193,7 @@ void Unit::UpdateSpeed(UnitMoveType mtype)
                     if (speed < ownerSpeed || creature->IsWithinDist3d(followed, 10.0f))
                         speed = ownerSpeed;
                     speed *= std::min(std::max(1.0f, 0.75f + (GetDistance(followed) - PET_FOLLOW_DIST) * 0.05f), 1.3f);
+                    petCatchUp = true;
                 }
             }
         }
@@ -9072,6 +9214,10 @@ void Unit::UpdateSpeed(UnitMoveType mtype)
         if (speed < min_speed)
             speed = min_speed;
     }
+
+    // The catch-up scale drifts with every step; a packet for each drift floods the nearby clients.
+    if (petCatchUp && !PetCatchUpSpeedWorthSending(m_speed_rate[mtype], speed))
+        return;
 
     SetSpeedRate(mtype, speed);
 }
@@ -9386,6 +9532,7 @@ void Unit::AtEnterCombat()
 
     if (!IsInteractionAllowedInCombat())
         UpdateNearbyPlayersInteractions();
+
 }
 
 void Unit::AtExitCombat()
@@ -9404,6 +9551,7 @@ void Unit::AtExitCombat()
 
     if (!IsInteractionAllowedInCombat())
         UpdateNearbyPlayersInteractions();
+
 }
 
 void Unit::AtEngage(Unit* /*target*/)
@@ -9432,7 +9580,17 @@ void Unit::AtTargetAttacked(Unit* target, bool canInitialAggro)
 
 void Unit::UpdatePetCombatState()
 {
-    ASSERT(!IsPet()); // player pets do not use UNIT_FLAG_PET_IN_COMBAT for this purpose - but player pets should also never have minions of their own to call this
+    // Player pets do not use UNIT_FLAG_PET_IN_COMBAT for this purpose, and a pet
+    // should never have minions of its own to call this. In practice a pet CAN
+    // transiently end up with a controlled minion (e.g. a bot hunter pet that got
+    // a temp-summon/guardian attributed to it), and that minion's combat-state
+    // transition then calls master->UpdatePetCombatState() ON the pet — which used
+    // to ASSERT(!IsPet()) and HARD-CRASH the world (observed 2026-06-16: pet
+    // 'Kreezhum' entry 417, Northrend, took the server down ~15 min). Early-return
+    // instead: a pet has no use for UNIT_FLAG_PET_IN_COMBAT, so skipping is a
+    // semantic no-op and crash-safe.
+    if (IsPet())
+        return;
 
     bool state = false;
     for (Unit* minion : m_Controlled)
@@ -10265,6 +10423,11 @@ void Unit::SetPower(Powers power, int32 val, bool withPowerUpdate /*= true*/)
     if (power == POWER_COMBO_POINTS && IsPlayer() && oldPower != val)
         withPowerUpdate = true;
 
+    // no points left, no combo target (finishers, resets and logout all end up here)
+    if (power == POWER_COMBO_POINTS && val == 0)
+        if (Player* comboPlayer = ToPlayer())
+            comboPlayer->SetComboTarget(ObjectGuid::Empty);
+
     if (IsInWorld() && withPowerUpdate)
     {
         WorldPackets::Combat::PowerUpdate packet;
@@ -10395,7 +10558,24 @@ bool Unit::PopAI()
 
 void Unit::RefreshAI()
 {
-    ASSERT(!m_aiLocked, "Tried to change current AI during UpdateAI()");
+    // Was: ASSERT(!m_aiLocked, "Tried to change current AI during UpdateAI()");
+    // Re-entrance happens when a spell / aura handler inside UpdateAI() flips
+    // the unit's AI (typical: charm/possess scripts, vehicle-eject handlers,
+    // mind-control proc chains). Original behavior crashed the world thread;
+    // we instead defer the AI swap to the next tick. The current i_AI keeps
+    // running for THIS tick (its UpdateAI is still on the stack); the next
+    // ScheduleAIChange / RefreshAI after UpdateAI() exits will apply cleanly.
+    // Without this defensive skip, a single mis-timed AI swap takes the
+    // process down — observed today as a 0xC0000420 ASSERT_FAILURE loop
+    // after the procDeep / BIH fixes.
+    if (m_aiLocked)
+    {
+        TC_LOG_ERROR("entities.unit",
+            "RefreshAI called during UpdateAI (unit {} entry {}); skipped, "
+            "next tick will apply the swap",
+            GetGUID().ToString(), GetEntry());
+        return;
+    }
     if (i_AIs.empty())
         i_AI = nullptr;
     else
@@ -10830,7 +11010,27 @@ void Unit::TriggerAurasProcOnEvent(ProcEventInfo& eventInfo, AuraApplicationProc
     Spell const* triggeringSpell = eventInfo.GetProcSpell();
     bool const disableProcs = triggeringSpell && triggeringSpell->IsProcDisabled();
 
-    int32 oldProcChainLength = std::exchange(m_procChainLength, std::max(m_procChainLength + 1, triggeringSpell ? triggeringSpell->GetProcChainLength() : 0));
+    int32 const oldProcChainLength = std::exchange(m_procChainLength, std::max(m_procChainLength + 1, triggeringSpell ? triggeringSpell->GetProcChainLength() : 0));
+
+    // RAII guard: m_procDeep and m_procChainLength are unwound even if
+    // a TriggerProcOnEvent handler throws. The original code unwound at
+    // the bottom of the function, so an exception in the loop bypassed
+    // the cleanup and left m_procDeep > 0; the NEXT Unit::Update tick
+    // then tripped the !m_procDeep ASSERT at line 439 and crashed the
+    // worker thread. Observed multiple times on proc-heavy classes
+    // (Paladin/Monk) under playerbot fleet load.
+    struct ProcDepthGuard
+    {
+        Unit* self;
+        int32 saved_chain_length;
+        bool  need_can_proc_restore;
+        ~ProcDepthGuard()
+        {
+            if (need_can_proc_restore)
+                self->SetCantProc(false);
+            self->m_procChainLength = saved_chain_length;
+        }
+    } guard{this, oldProcChainLength, disableProcs};
 
     if (disableProcs)
         SetCantProc(true);
@@ -10840,13 +11040,34 @@ void Unit::TriggerAurasProcOnEvent(ProcEventInfo& eventInfo, AuraApplicationProc
         if (aurApp->GetRemoveMode())
             continue;
 
-        aurApp->GetBase()->TriggerProcOnEvent(procEffectMask, aurApp, eventInfo);
+        // Per-handler catch so one badly-behaved proc doesn't take down
+        // the worker thread (or — combined with the guard above — leak
+        // m_procDeep into the next tick and trip the ASSERT). We swallow
+        // and log, then continue iterating the remaining procs. Without
+        // this the entire batch is aborted on the first exception, and
+        // an uncaught exception propagates up to Map::Update (no
+        // try/catch there) and terminates the process.
+        try
+        {
+            aurApp->GetBase()->TriggerProcOnEvent(procEffectMask, aurApp, eventInfo);
+        }
+        catch (std::exception const& e)
+        {
+            TC_LOG_ERROR("entities.unit",
+                "TriggerProcOnEvent threw std::exception (caster {} spell {}): {}; aura skipped",
+                GetGUID().ToString(),
+                triggeringSpell ? triggeringSpell->GetSpellInfo()->Id : 0,
+                e.what());
+        }
+        catch (...)
+        {
+            TC_LOG_ERROR("entities.unit",
+                "TriggerProcOnEvent threw non-std exception (caster {} spell {}); aura skipped",
+                GetGUID().ToString(),
+                triggeringSpell ? triggeringSpell->GetSpellInfo()->Id : 0);
+        }
     }
-
-    if (disableProcs)
-        SetCantProc(false);
-
-    m_procChainLength = oldProcChainLength;
+    // Unwinding handled by guard destructor — no explicit cleanup here.
 }
 
 ///----------Pet responses methods-----------------
@@ -11170,6 +11391,21 @@ void Unit::SetBaseAttackTime(WeaponAttackType att, uint32 val)
 
 void Unit::UpdateAttackTimeField(WeaponAttackType att)
 {
+    if (att < MAX_ATTACK && GetTypeId() == TYPEID_PLAYER && uint32(m_baseAttackSpeed[att] * m_modAttackSpeedPct[att]) == 0)
+    {
+        static std::atomic<uint32> s_zeroAttackTimeLines{ 0 };
+        if (s_zeroAttackTimeLines.fetch_add(1, std::memory_order_relaxed) < 100)
+        {
+            Player const* diagPlayer = ToPlayer();
+            Item const* diagItem = diagPlayer->GetWeaponForAttack(att, true);
+            SpellShapeshiftFormEntry const* diagForm = sSpellShapeshiftFormStore.LookupEntry(GetShapeshiftForm());
+            TC_LOG_ERROR("entities.unit", "[attack_time] {} attack type {} computes 0: baseAttackSpeed {} modAttackSpeedPct {} weapon {} (delay {}) form {} combatRoundTime {}",
+                GetName(), uint32(att), m_baseAttackSpeed[att], m_modAttackSpeedPct[att],
+                diagItem ? diagItem->GetEntry() : 0, diagItem ? diagItem->GetTemplate()->GetDelay() : 0,
+                uint32(GetShapeshiftForm()), diagForm ? diagForm->CombatRoundTime : 0);
+        }
+    }
+
     switch (att)
     {
         case BASE_ATTACK:
@@ -11378,9 +11614,12 @@ bool Unit::InitTamedPet(Pet* pet, uint8 level, uint32 spell_id)
 
 void Unit::SendDurabilityLoss(Player* receiver, uint32 percent)
 {
+    if (!receiver) return;
+    WorldSession* sess = receiver->GetSession();
+    if (!sess) return;     // logging-out receiver — drop the durability-loss packet
     WorldPackets::Misc::DurabilityDamageDeath packet;
     packet.Percent = percent;
-    receiver->GetSession()->SendPacket(packet.Write());
+    sess->SendPacket(packet.Write());
 }
 
 void Unit::PlayOneShotAnimKitId(uint16 animKitId)
@@ -11457,6 +11696,11 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
     if (attacker && !attacker->IsInMap(victim))
         attacker = nullptr;
 
+
+    // PLAYERBOT V2 HOOK: drives auto-loot enqueueing for bots in the tap list
+    // and (eventually) state transitions when a bot itself dies.
+    Playerbot::Hooks::OnDeath(victim, attacker);
+
     // find player: owner of controlled `this` or `this` itself maybe
     Player* player = nullptr;
     if (attacker)
@@ -11525,7 +11769,49 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
             if (InstanceScript const* instance = creature->GetInstanceScript())
                 dungeonEncounter = instance->GetBossDungeonEncounter(creature);
 
-            if (creature->GetMap()->IsDungeon())
+            // Classic: a boss drops its whole table on one corpse (group loot rules), as in vanilla. The retail
+            // personal encounter loot hands each table roll to one random player, so a party of 5 saw one epic.
+            bool const sharedEncounterLoot = dungeonEncounter && !tappers.empty()
+                && sConfigMgr->GetBoolDefault("Classic.SharedEncounterLoot", true);
+
+            if (sharedEncounterLoot)
+            {
+                Group* group = nullptr;
+                for (Player* tapper : tappers)
+                    if (Group* tapperGroup = tapper->GetGroup())
+                    {
+                        group = tapperGroup;
+                        break;
+                    }
+
+                Player* looter = tappers[0];
+                if (group)
+                    if (Player* groupLooter = ObjectAccessor::GetPlayer(*creature, group->GetLooterGuid()))
+                        looter = groupLooter;
+
+                Loot* loot = new Loot(creature->GetMap(), creature->GetGUID(), LOOT_CORPSE, group);
+                creature->m_loot.reset(loot);
+                loot->SetDungeonEncounterId(dungeonEncounter->ID);
+
+                if (uint32 lootid = creature->GetLootId())
+                    loot->FillLoot(lootid, LootTemplates_Creature, looter, !group, false, creature->GetLootMode(), ItemBonusMgr::GetContextForPlayer(creature->GetMap()->GetMapDifficulty(), looter));
+
+                if (creature->GetLootMode() > 0)
+                    loot->generateMoneyLoot(creature->GetCreatureDifficulty()->GoldMin, creature->GetCreatureDifficulty()->GoldMax);
+
+                if (group)
+                    loot->NotifyLootList(creature->GetMap());
+
+                uint32 epics = 0;
+                for (LootItem const& lootItem : loot->items)
+                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(lootItem.itemid))
+                        if (proto->GetQuality() >= ITEM_QUALITY_EPIC)
+                            ++epics;
+
+                TC_LOG_INFO("playerbot.v2", "[boss_loot] {} ({}) shared corpse: {} items ({} epic), group {}, loot method {}, tappers {}",
+                    creature->GetName(), creature->GetEntry(), loot->items.size(), epics, group ? "yes" : "no", uint32(loot->GetLootMethod()), tappers.size());
+            }
+            else if (creature->GetMap()->IsDungeon())
             {
                 if (dungeonEncounter)
                 {
@@ -12710,7 +12996,8 @@ float Unit::MeleeSpellMissChance(Unit const* victim, WeaponAttackType attType, S
     else
         missChance -= victim->GetTotalAuraModifier(SPELL_AURA_MOD_ATTACKER_MELEE_HIT_CHANCE);
 
-    return std::max(missChance, 0.f);
+    // Classic 1.60 (vanilla, VMaNGOS): the miss chance is limited to 0..60%
+    return std::clamp(missChance, 0.f, 60.f);
 }
 
 void Unit::OnPhaseChange()
@@ -14594,7 +14881,8 @@ void Unit::DestroyForPlayer(Player const* target) const
         {
             WorldPackets::Battleground::DestroyArenaUnit destroyArenaUnit;
             destroyArenaUnit.Guid = GetGUID();
-            target->GetSession()->SendPacket(destroyArenaUnit.Write());
+            if (WorldSession* sess = target->GetSession())
+                sess->SendPacket(destroyArenaUnit.Write());
         }
     }
 

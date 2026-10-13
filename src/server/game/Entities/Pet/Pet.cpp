@@ -853,7 +853,11 @@ bool Pet::CreateBaseAtCreature(Creature* creature)
     SetDisplayId(creature->GetDisplayId());
 
     if (CreatureFamilyEntry const* cFamily = sCreatureFamilyStore.LookupEntry(cinfo->family))
-        SetName(cFamily->Name[GetOwner()->GetSession()->GetSessionDbcLocale()]);
+    {
+        WorldSession const* osess = GetOwner() ? GetOwner()->GetSession() : nullptr;
+        LocaleConstant loc = osess ? osess->GetSessionDbcLocale() : DEFAULT_LOCALE;
+        SetName(cFamily->Name[loc]);
+    }
     else
         SetName(creature->GetNameForLocaleIdx(sObjectMgr->GetDBCLocaleIndex()));
 
@@ -1717,7 +1721,9 @@ void Pet::learnSpells(std::vector<uint32> const& spellIds)
     }
 
     if (!m_loading)
-        GetOwner()->GetSession()->SendPacket(packet.Write());
+        if (Player* o = GetOwner())
+            if (WorldSession* sess = o->GetSession())
+                sess->SendPacket(packet.Write());
 }
 
 void Pet::InitLevelupSpellsForLevel()
@@ -1788,7 +1794,9 @@ void Pet::unlearnSpells(std::vector<uint32> const& spellIds, bool learn_prev, bo
     }
 
     if (!m_loading)
-        GetOwner()->GetSession()->SendPacket(packet.Write());
+        if (Player* o = GetOwner())
+            if (WorldSession* sess = o->GetSession())
+                sess->SendPacket(packet.Write());
 }
 
 bool Pet::removeSpell(uint32 spell_id, bool learn_prev, bool clear_ab)
@@ -2051,7 +2059,9 @@ float Pet::GetFollowAngle() const
 float Pet::GetNativeObjectScale() const
 {
     CreatureFamilyEntry const* creatureFamily = sCreatureFamilyStore.LookupEntry(GetCreatureTemplate()->family);
-    if (creatureFamily && creatureFamily->MinScale > 0.0f && getPetType() == HUNTER_PET)
+    // both ends must be set: a family row with MinScale but no MaxScale (MaxScale 0, MaxScaleLevel 0) would give every hunter pet of
+    // that family ObjectScale 0 - an invisible pet and the client's "Model FileData ... scale:0" assert.
+    if (creatureFamily && creatureFamily->MinScale > 0.0f && creatureFamily->MaxScale > 0.0f && getPetType() == HUNTER_PET)
         return PetScaling::FamilyScale(*creatureFamily, GetLevel());
 
     return Guardian::GetNativeObjectScale();
@@ -2160,7 +2170,9 @@ void Pet::SetSpecialization(uint16 spec)
 
     WorldPackets::Pet::SetPetSpecialization setPetSpecialization;
     setPetSpecialization.SpecID = m_petSpecialization;
-    GetOwner()->GetSession()->SendPacket(setPetSpecialization.Write());
+    if (Player* o = GetOwner())
+        if (WorldSession* sess = o->GetSession())
+            sess->SendPacket(setPetSpecialization.Write());
 }
 
 std::string Pet::GenerateActionBarData() const

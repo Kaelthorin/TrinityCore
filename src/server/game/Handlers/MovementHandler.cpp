@@ -227,15 +227,26 @@ void WorldSession::HandleMoveWorldportAck()
     // relocate the player to the teleport destination
     // the CannotEnter checks are done in TeleporTo but conditions may change
     // while the player is in transit, for example the map may get full
-    if (!newMap || newMap->CannotEnter(player))
+    TransferAbortParams const denied = newMap ? newMap->CannotEnter(player) : TransferAbortParams(TRANSFER_ABORT_ERROR);
+    if (!newMap || denied)
     {
-        TC_LOG_ERROR("network", "Map {} ({}) could not be created for player {} ({}), porting player to homebind", loc.Location.GetMapId(), newMap ? newMap->GetMapName() : "Unknown", player->GetGUID().ToString(), player->GetName());
+        // The reason is the whole diagnosis: MAX_PLAYERS (a full raid, or an owning group that is not the player's), ZONE_IN_COMBAT
+        // (encounter in progress), a lock error, or no map at all.
+        TC_LOG_ERROR("network", "Map {} ({}) could not be created for player {} ({}), porting player to homebind: reason {} arg {}{}",
+            loc.Location.GetMapId(), newMap ? newMap->GetMapName() : "Unknown", player->GetGUID().ToString(), player->GetName(),
+            uint32(denied.Reason), uint32(denied.Arg),
+            newMap ? Trinity::StringFormat(" (instance {} players {} group {})", newMap->GetInstanceId(), newMap->GetPlayersCountExceptGMs(),
+                player->GetGroup() ? (player->GetGroup()->isRaidGroup() ? "raid" : "party") : "none") : std::string());
         player->TeleportTo(player->m_homebind);
         return;
     }
 
-    float z = loc.Location.GetPositionZ() + player->GetHoverOffset();
-    player->Relocate(loc.Location.GetPositionX(), loc.Location.GetPositionY(), z, loc.Location.GetOrientation());
+    WorldLocation arrival = loc.Location;
+    if (uint32 graveyardId = player->ConsumeGraveyardTeleportId())
+        player->SnapBuriedLocToFloor(newMap, arrival, graveyardId);
+
+    float z = arrival.GetPositionZ() + player->GetHoverOffset();
+    player->Relocate(arrival.GetPositionX(), arrival.GetPositionY(), z, arrival.GetOrientation());
     player->SetFallInformation(0, player->GetPositionZ());
 
     player->ResetMap();
@@ -348,11 +359,13 @@ void WorldSession::HandleMoveWorldportAck()
             {
                 raidInstanceMessage.Locked = !playerLock->IsExpired();
                 raidInstanceMessage.Extended = playerLock->IsExtended();
+                raidInstanceMessage.TimeLeft = int32(std::max<int64>(std::chrono::duration_cast<Seconds>(playerLock->GetEffectiveExpiryTime() - GameTime::GetSystemTime()).count(), 0));
             }
             else
             {
                 raidInstanceMessage.Locked = false;
                 raidInstanceMessage.Extended = false;
+                raidInstanceMessage.TimeLeft = int32(std::max<int64>(std::chrono::duration_cast<Seconds>(InstanceLockMgr::GetNextResetTime(entries) - GameTime::GetSystemTime()).count(), 0));
             }
             SendPacket(raidInstanceMessage.Write());
         }
@@ -591,7 +604,25 @@ void WorldSession::HandleMovementOpcode(OpcodeClient opcode, MovementInfo& movem
 
         plrMover->UpdateFallInformationIfNeed(movementInfo, opcode);
 
-        if (movementInfo.pos.GetPositionZ() < plrMover->GetMap()->GetMinHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY()))
+        // Below the map's minimum height only counts when no geometry holds the player up: the Forever .map files of WMO-only
+        // instances (Molten Core) carry a minimum plane above the floor, and a player standing on a valid WMO floor at the
+        // entrance was killed by KillPlayer below (Garr test 2026-10-08, killer=self dmg=0 at 1082.0,-474.6,-107.8, a GM is
+        // immune to the environmental damage so the kill came from KillPlayer).
+        float const min_height = plrMover->GetMap()->GetMinHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY());
+        bool under_map = movementInfo.pos.GetPositionZ() < min_height;
+        if (under_map)
+        {
+            float const floor = plrMover->GetMap()->GetHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY(),
+                movementInfo.pos.GetPositionZ() + 2.0f, true, 10.0f);
+            if (floor > INVALID_HEIGHT && movementInfo.pos.GetPositionZ() >= floor - 2.0f)
+            {
+                under_map = false;
+                if (plrMover->IsAlive())
+                    TC_LOG_INFO("playerbot.v2", "[under_map] {} z={:.1f} is below map min height {:.1f} but stands on geometry at {:.1f}: not out of bounds (map {} {:.1f},{:.1f})",
+                        plrMover->GetName(), movementInfo.pos.GetPositionZ(), min_height, floor, plrMover->GetMapId(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY());
+            }
+        }
+        if (under_map)
         {
             if (!(plrMover->GetBattleground() && plrMover->GetBattleground()->HandlePlayerUnderMap(_player)))
             {

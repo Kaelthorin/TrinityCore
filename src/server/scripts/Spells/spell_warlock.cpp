@@ -867,6 +867,48 @@ class spell_warl_haunt : public AuraScript
 };
 
 // 755 - Health Funnel
+// 1454, 1455, 1456, 11687, 11688, 11689 - Life Tap (Classic)
+// The Classic spell data carries a dummy effect that the core never handled, so the cast did nothing.
+class spell_warl_classic_life_tap : public SpellScript
+{
+    void HandleTap()
+    {
+        Unit* caster = GetCaster();
+        if (!caster || !caster->IsAlive() || caster->GetPowerType() != POWER_MANA)
+            return;
+
+        // vanilla values per rank plus 80% of shadow spell power
+        int64 amount;
+        switch (GetSpellInfo()->Id)
+        {
+            case 1454:  amount = 30;  break;
+            case 1455:  amount = 75;  break;
+            case 1456:  amount = 140; break;
+            case 11687: amount = 220; break;
+            case 11688: amount = 310; break;
+            case 11689: amount = 424; break;
+            default:    return;
+        }
+        amount += int64(caster->SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_SHADOW) * 0.8f);
+        if (amount <= 0)
+            return;
+
+        // never kill the caster
+        int64 const health = int64(caster->GetHealth());
+        if (health <= 1)
+            return;
+        amount = std::min<int64>(amount, health - 1);
+
+        caster->ModifyHealth(-amount);
+        caster->EnergizeBySpell(caster, GetSpellInfo(), int32(amount), POWER_MANA);
+    }
+
+    void Register() override
+    {
+        AfterCast += SpellCastFn(spell_warl_classic_life_tap::HandleTap);
+    }
+};
+
 class spell_warl_health_funnel : public AuraScript
 {
     void ApplyEffect(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
@@ -1906,6 +1948,7 @@ void AddSC_warlock_spell_scripts()
     RegisterSpellScript(spell_warl_doom);
     RegisterSpellScript(spell_warl_drain_soul);
     RegisterSpellScript(spell_warl_haunt);
+    RegisterSpellScript(spell_warl_classic_life_tap);
     RegisterSpellScript(spell_warl_health_funnel);
     RegisterSpellScript(spell_warl_healthstone_heal);
     RegisterSpellScript(spell_warl_immolate);

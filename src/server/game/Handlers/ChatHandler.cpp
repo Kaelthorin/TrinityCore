@@ -32,6 +32,7 @@
 #include "Language.h"
 #include "LanguageMgr.h"
 #include "Log.h"
+#include "Playerbot/DiagProbes.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -40,6 +41,7 @@
 #include "SpellAuraEffects.h"
 #include "Util.h"
 #include "World.h"
+#include "Playerbot/PlayerbotHooks.h"
 #include <algorithm>
 
 enum class ChatWhisperTargetStatus : uint8
@@ -129,6 +131,9 @@ void WorldSession::HandleChatMessageOpcode(WorldPackets::Chat::ChatMessage& chat
 
 void WorldSession::HandleChatMessageWhisperOpcode(WorldPackets::Chat::ChatMessageWhisper& chatMessageWhisper)
 {
+    PROBE_LOG("[whisper_probe] CMSG_CHAT_MESSAGE_WHISPER from {}: lang {} target '{}' guid {} realm {} text '{}'",
+                GetPlayerName(), uint32(chatMessageWhisper.Language), chatMessageWhisper.Target,
+                chatMessageWhisper.TargetGUID.ToString(), chatMessageWhisper.TargetVirtualRealmAddress, chatMessageWhisper.Text);
     HandleChatMessage(CHAT_MSG_WHISPER, Language(chatMessageWhisper.Language), chatMessageWhisper.Text, chatMessageWhisper.Target, chatMessageWhisper.TargetGUID);
 }
 
@@ -230,8 +235,16 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
     if (msg.empty())
         return ChatMessageResult::MessageEmpty;
 
+    // [cmd_probe]: a dot / bang command as it arrives (Karrz, MC 2026-10-08: `.revive` typed while dead did nothing, the console's revive worked),
+    // with the sender's life state and whether the command table took it.
+    bool const cmd_probe = msg.size() > 1 && (msg[0] == '.' || msg[0] == '!');
+    if (cmd_probe)
+        PROBE_LOG("[cmd_probe] {} alive={} ghost={} selected={} sent '{}'", sender->GetName(), int(sender->IsAlive()),
+                    int(sender->HasPlayerFlag(PLAYER_FLAGS_GHOST)), sender->GetTarget().ToString(), msg);
     if (ChatHandler(this).ParseCommands(msg.c_str()))
         return ChatMessageResult::HandledCommand;
+    if (cmd_probe)
+        PROBE_LOG("[cmd_probe] {}: '{}' was not taken by the command table (unknown command or no permission) and goes on as chat", sender->GetName(), msg);
 
     // do message validity checks
     if (!ValidateMessage(GetPlayer(), msg))
@@ -256,6 +269,10 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             }
 
             sender->Say(msg, lang);
+            // PlayerbotV2 SC-P1a: let a nearby bot answer /say (greetings,
+            // direct-name mentions, "anyone know where X is?"). Reactor
+            // self-filters bot senders + range-gates via CONFIG_LISTEN_RANGE_SAY.
+            Playerbot::Hooks::OnSayChat(sender, msg);
             break;
         }
         case CHAT_MSG_EMOTE:
@@ -286,6 +303,9 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             }
 
             sender->Yell(msg, lang);
+            // PlayerbotV2 SC-P1a: yell reactions are rarer than say (handled
+            // inside the reactor) but a nearby bot may still respond.
+            Playerbot::Hooks::OnYellChat(sender, msg);
             break;
         }
         case CHAT_MSG_WHISPER:
@@ -298,6 +318,9 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             }
             else
             {
+                // the unit menu hands over "Name " (name + empty surname): trim it, or the lookup says "No player named"
+                while (!target.empty() && (target.back() == ' ' || target.back() == '\t'))
+                    target.pop_back();
                 ExtendedPlayerName extName = ExtractExtendedPlayerName(target);
 
                 if (!normalizePlayerName(extName.Name))
@@ -308,6 +331,12 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
 
                 receiver = ObjectAccessor::FindConnectedPlayerByName(extName.Name);
             }
+            if (lang != LANG_ADDON)
+                PROBE_LOG("[whisper_probe] {} -> '{}' (guid {}): {}", sender->GetName(), target,
+                            targetGuid ? targetGuid->ToString() : "none",
+                            receiver ? (receiver->GetSession()->IsBot() ? "found, a bot" : "found, a player") : "NOT FOUND");
+            if (!receiver && lang != LANG_ADDON)
+                PROBE_LOG("[whisper_probe] target bytes: {}", Trinity::Impl::ByteArrayToHexStr(reinterpret_cast<uint8 const*>(target.data()), target.size()));
             if (!receiver || (lang != LANG_ADDON && !receiver->isAcceptWhispers() && receiver->GetSession()->HasPermission(rbac::RBAC_PERM_CAN_FILTER_WHISPERS) && !receiver->IsInWhisperWhiteList(sender->GetGUID())))
             {
                 SendChatPlayerNotfoundNotice(target);
@@ -343,6 +372,7 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
                 sender->AddWhisperWhiteList(receiver->GetGUID());
 
             GetPlayer()->Whisper(msg, lang, receiver);
+            Playerbot::Hooks::OnWhisperReceived(GetPlayer(), receiver, msg);
             break;
         }
         case CHAT_MSG_PARTY:
@@ -363,6 +393,13 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             WorldPackets::Chat::Chat packet;
             packet.Initialize(ChatMsg(type), lang, sender, nullptr, msg);
             group->BroadcastPacket(packet.Write(), false, group->GetMemberGroup(GetPlayer()->GetGUID()));
+            // Playerbot V2: route party-chat squad commands. Messages
+            // starting with `;` (the squad prefix) are dispatched to
+            // the sender's bots in the group via the address resolver.
+            // Any non-bot listeners see the literal message in chat;
+            // bots react. This makes raid-leader chatter ergonomic
+            // ("` ;tank pull") without forcing whisper-per-bot.
+            Playerbot::Hooks::OnPartyChat(GetPlayer(), group, msg);
             break;
         }
         case CHAT_MSG_GUILD:
@@ -374,6 +411,11 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
                     sScriptMgr->OnPlayerChat(GetPlayer(), type, lang, msg, guild);
 
                     guild->BroadcastToGuild(this, false, msg, lang == LANG_ADDON ? LANG_ADDON : LANG_UNIVERSAL);
+                    // V2 Phase C.3: route to BotChatReactor so an online
+                    // officer of the sender's guild can drop a contextual
+                    // reply (gz/nice/:) ). Bot-originated chat is
+                    // self-filtered by the reactor.
+                    Playerbot::Hooks::OnGuildChat(GetPlayer(), GetPlayer()->GetGuildId(), msg);
                 }
             }
             break;
@@ -405,6 +447,9 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             WorldPackets::Chat::Chat packet;
             packet.Initialize(ChatMsg(type), lang, sender, nullptr, msg);
             group->BroadcastPacket(packet.Write(), false);
+            // PlayerbotV2: same squad-chat surface as PARTY for the user.
+            // Raid/instance chat is what LFG groups end up using by default.
+            Playerbot::Hooks::OnPartyChat(GetPlayer(), group, msg);
             break;
         }
         case CHAT_MSG_RAID_WARNING:
@@ -468,6 +513,13 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             WorldPackets::Chat::Chat packet;
             packet.Initialize(ChatMsg(type), lang, sender, nullptr, msg);
             group->BroadcastPacket(packet.Write(), false);
+            // PlayerbotV2: route instance chat the same way as party chat
+            // for squad command dispatch (`;all run`, `;tank pull`, etc.).
+            // LFG groups default to instance chat — without this hook the
+            // user's commands never reach the resolver. Fix 2026-05-13:
+            // observed "Player Balastan tells instance with leader Thaoir:
+            // ;all run" with bots not responding.
+            Playerbot::Hooks::OnPartyChat(GetPlayer(), group, msg);
             break;
         }
         default:
@@ -554,6 +606,9 @@ void WorldSession::HandleChatAddonMessage(ChatMsg type, std::string prefix, std:
                 break;
 
             sender->WhisperAddon(text, prefix, isLogged, receiver);
+            // Playerbot V2: the ForeverBots addon whispers a bot this way in battlegrounds, where the client's own /whisper does
+            // nothing; the hook ignores every other prefix.
+            Playerbot::Hooks::OnAddonWhisper(sender, receiver, prefix, text);
             break;
         }
         // Messages sent to "RAID" while in a party will get delivered to "PARTY"
@@ -579,6 +634,9 @@ void WorldSession::HandleChatAddonMessage(ChatMsg type, std::string prefix, std:
             WorldPackets::Chat::Chat packet;
             packet.Initialize(type, isLogged ? LANG_ADDON_LOGGED : LANG_ADDON, sender, nullptr, text, 0, "", DEFAULT_LOCALE, prefix);
             group->BroadcastAddonMessagePacket(packet.Write(), prefix, true, subGroup, sender->GetGUID());
+            // Playerbot V2: the ForeverBots panel sends its bot orders as addon messages (SendChatMessage from addon code
+            // is blocked by the client in combat and in battlegrounds); the hook ignores every other prefix.
+            Playerbot::Hooks::OnAddonMessage(sender, group, prefix, text);
             break;
         }
         case CHAT_MSG_CHANNEL:
@@ -748,6 +806,12 @@ void WorldSession::HandleTextEmoteOpcode(WorldPackets::Chat::CTextEmote& packet)
     textEmote.SoundIndex = packet.SoundIndex;
     _player->SendMessageToSetInRange(textEmote.Write(), sWorld->getFloatConfig(CONFIG_LISTEN_RANGE_TEXTEMOTE), true);
 
+    // PlayerbotV2 SC-P2c: a nearby bot reciprocates a text emote (waves
+    // back, returns a salute/cheer). Pass the resolved Emote id + target so
+    // the reactor can pick a reciprocal animation. Reactor self-filters bot
+    // senders and range-gates via CONFIG_LISTEN_RANGE_TEXTEMOTE.
+    Playerbot::Hooks::OnTextEmote(_player, static_cast<uint32>(emote), uint32(packet.EmoteID), packet.Target);
+
     Unit* unit = ObjectAccessor::GetUnit(*_player, packet.Target);
 
     _player->UpdateCriteria(CriteriaType::DoEmote, packet.EmoteID, 0, 0, unit);
@@ -790,6 +854,8 @@ void WorldSession::SendChatRestricted(ChatRestrictionType restriction)
 
 void WorldSession::HandleChatCanLocalWhisperTargetRequest(WorldPackets::Chat::CanLocalWhisperTargetRequest const& canLocalWhisperTargetRequest)
 {
+    PROBE_LOG("[whisper_probe] CMSG_CHAT_CAN_LOCAL_WHISPER_TARGET_REQUEST from {} for {}", GetPlayerName(),
+                canLocalWhisperTargetRequest.WhisperTarget.ToString());
     ChatWhisperTargetStatus status = [&]
     {
         Player* sender = GetPlayer();

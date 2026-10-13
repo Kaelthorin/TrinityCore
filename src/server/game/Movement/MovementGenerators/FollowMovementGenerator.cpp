@@ -24,6 +24,14 @@
 #include "PathGenerator.h"
 #include "Pet.h"
 #include "Unit.h"
+#if defined(TRINITY_PLAYERBOT_V2)
+#include "Player.h"
+#include "WorldSession.h"
+
+// Target drift (yards) a playerbot follower tolerates before re-pathing a follow spline that is
+// still in flight. 2.5y at run speed is ~0.35 s of leader movement.
+static constexpr float FOLLOW_BOT_REPATH_DIST = 2.5f;
+#endif
 
 static void DoMovementInform(Unit* owner, Unit* target)
 {
@@ -63,6 +71,10 @@ bool FollowMovementGenerator::Initialize(Unit* owner)
     UpdatePetSpeed(owner);
     _path = nullptr;
     _lastTargetPosition.reset();
+#if defined(TRINITY_PLAYERBOT_V2)
+    Player const* playerOwner = owner->ToPlayer();
+    _throttleRepath = playerOwner && playerOwner->GetSession() && playerOwner->GetSession()->IsBot();
+#endif
     return true;
 }
 
@@ -130,6 +142,19 @@ bool FollowMovementGenerator::Update(Unit* owner, uint32 diff)
         owner->ClearUnitState(UNIT_STATE_FOLLOW_MOVE);
         DoMovementInform(owner, target);
     }
+
+#if defined(TRINITY_PLAYERBOT_V2)
+    // Playerbot followers: while a follow spline is still in flight, re-path only once the
+    // target has drifted FOLLOW_BOT_REPATH_DIST from where it stood at the last launch.
+    // The stock rule re-paths and re-launches on ANY target movement, i.e. every map update
+    // while the leader runs; with a raid of bot followers that is tens of SMSG_ON_MONSTER_MOVE
+    // per bot per second to every viewer (and a pathfind each), which chokes the client.
+    // _lastTargetPosition is left untouched while holding, so the drift accumulates; a
+    // finished spline, a speed change (reset) or a large drift re-paths exactly as before.
+    if (_throttleRepath && _lastTargetPosition && owner->HasUnitState(UNIT_STATE_FOLLOW_MOVE) && !owner->movespline->Finalized()
+        && _lastTargetPosition->GetExactDistSq(target->GetPosition()) < FOLLOW_BOT_REPATH_DIST * FOLLOW_BOT_REPATH_DIST)
+        return true;
+#endif
 
     if (!_lastTargetPosition || _lastTargetPosition->GetExactDistSq(target->GetPosition()) > 0.0f)
     {

@@ -419,7 +419,7 @@ NonDefaultConstructible<SpellEffectHandlerFn> SpellEffectHandlers[TOTAL_SPELL_EF
     &Spell::EffectNULL,                                     //326 SPELL_EFFECT_326
     &Spell::EffectNULL,                                     //327 SPELL_EFFECT_327
     &Spell::EffectNULL,                                     //328 SPELL_EFFECT_328
-    &Spell::EffectNULL,                                     //329 SPELL_EFFECT_329
+    &Spell::EffectResurrectNew,                             //329 SPELL_EFFECT_RESURRECT_NEW
     &Spell::EffectNULL,                                     //330 SPELL_EFFECT_330
     &Spell::EffectNULL,                                     //331 SPELL_EFFECT_331
     &Spell::EffectNULL,                                     //332 SPELL_EFFECT_332
@@ -468,8 +468,15 @@ void Spell::EffectResurrectNew()
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
+    // [raid_rez] the Classic 70291 rez spells are this effect (329, loaded as an effect with no handler and no implicit target until
+    // 2026-10-10: the casts completed, spent their mana and offered nothing); every early return says why, and the offer says it was sent.
+    bool const logRez = m_caster->IsPlayer();
     if (!m_corpseTarget && !unitTarget)
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed with no target (unit or corpse)", m_caster->GetName(), m_spellInfo->Id);
         return;
+    }
 
     Player* player = nullptr;
 
@@ -479,16 +486,29 @@ void Spell::EffectResurrectNew()
         player = unitTarget->ToPlayer();
 
     if (!player || player->IsAlive() || !player->IsInWorld())
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: not offered (player={} alive={} in_world={})", m_caster->GetName(),
+                m_spellInfo->Id, m_corpseTarget ? "a corpse" : "a unit", int(player != nullptr), player ? int(player->IsAlive()) : -1,
+                player ? int(player->IsInWorld()) : -1);
         return;
+    }
 
     if (player->IsResurrectRequested())       // already have one active request
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: an offer is already pending", m_caster->GetName(), m_spellInfo->Id, player->GetName());
         return;
+    }
 
     uint32 health = GetEffectValueAsInt();
     uint32 mana = effectInfo->MiscValue;
     ExecuteLogEffectResurrect(effectInfo->Effect, player);
     player->SetResurrectRequestData(m_caster, health, mana, 0);
     SendResurrectRequest(player);
+    if (logRez)
+        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} offered a resurrection to {} (health {} mana {})", m_caster->GetName(), m_spellInfo->Id,
+            player->GetName(), health, mana);
 }
 
 void Spell::EffectInstaKill()
@@ -1598,6 +1618,10 @@ void Spell::EffectEnergize()
         return;
 
     Powers power = Powers(effectInfo->MiscValue);
+    if (power == POWER_COMBO_POINTS && unitTarget->IsPlayer())
+        TC_LOG_INFO("playerbot.v2", "[combo] energize {} {} ({}) on {}: power {} max {} amount {} victim {}", unitCaster->GetName(), m_spellInfo->Id,
+            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], unitTarget->GetName(), unitTarget->GetPower(power), unitTarget->GetMaxPower(power),
+            GetEffectValueAsInt(), m_targets.GetUnitTargetGUID().ToString());
     if (unitTarget->GetMaxPower(power) == 0)
         return;
 
@@ -1624,20 +1648,9 @@ void Spell::EffectEnergize()
             break;
     }
 
-    // Classic 1.60 (game rule 112): combo points belong to one target. The client shows them and allows finishers only while
-    // UnitData ClassicComboTarget is the current target (official sniff: set when Sinister Strike awards the first point), and
-    // building points on another target starts over from zero
-    if (power == POWER_COMBO_POINTS && unitTarget == unitCaster && unitCaster->IsPlayer())
-    {
-        if (Unit* comboTarget = m_targets.GetUnitTarget(); comboTarget && comboTarget != unitCaster)
-        {
-            if (unitCaster->GetClassicComboTarget() != comboTarget->GetGUID())
-            {
-                unitCaster->SetPower(POWER_COMBO_POINTS, 0);
-                unitCaster->SetClassicComboTarget(comboTarget->GetGUID());
-            }
-        }
-    }
+    if (power == POWER_COMBO_POINTS)
+        if (Player* comboPlayer = unitTarget->ToPlayer())
+            comboPlayer->GainComboPointsOn(m_targets.GetUnitTarget());
 
     unitCaster->EnergizeBySpell(unitTarget, m_spellInfo, energizeAmount, power);
 }
@@ -2406,7 +2419,29 @@ void Spell::EffectLearnSkill()
     uint32 skillid = effectInfo->MiscValue;
     SkillRaceClassInfoEntry const* rcEntry = sDB2Manager.GetSkillRaceClassInfo(skillid, playerTarget->GetRace(), playerTarget->GetClass());
     if (!rcEntry)
+    {
+        // Modern 12.0+ client DB2 dropped SkillRaceClassInfo entries for the
+        // classic primary-profession skill lines (165 Leatherworking, 164
+        // Blacksmithing, 186 Mining, 182 Herbalism, 393 Skinning, ...) while
+        // the "Learn <Profession>" spells (e.g. 264578) still carry
+        // SPELL_EFFECT_SKILL and are taught castable. Without this fallback
+        // the cast silently no-ops here (the player clicks "Learn
+        // Leatherworking" at the trainer, confirms, and nothing happens —
+        // the skill is never granted). Mirror the Player::AddSpell fallback:
+        // for a primary profession with no rcInfo, derive the max from the
+        // classic apprentice→grand-master tier table and grant the skill.
+        if (IsPrimaryProfessionSkill(skillid))
+        {
+            static constexpr uint16 kPrimaryProfessionTierMax[] = { 75, 150, 225, 300, 375, 450 };
+            uint16 tierIdx = skillTier >= 1 ? uint16(skillTier - 1) : uint16(0);
+            if (tierIdx >= std::size(kPrimaryProfessionTierMax))
+                tierIdx = uint16(std::size(kPrimaryProfessionTierMax) - 1);
+            uint16 const maxSkillVal = kPrimaryProfessionTierMax[tierIdx];
+            uint16 const skillval = std::max<uint16>(1, playerTarget->GetPureSkillValue(skillid));
+            playerTarget->SetSkill(skillid, skillTier, skillval, maxSkillVal);
+        }
         return;
+    }
 
     SkillTiersEntry const* tier = sObjectMgr->GetSkillTier(rcEntry->SkillTierID);
     if (!tier)
@@ -3706,8 +3741,15 @@ void Spell::EffectResurrect()
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
+    // [raid_rez] where a landed resurrection goes (Karrz, MC 2026-10-10: bot casts ran to the end and the owner was never offered one):
+    // every early return says why, and the offer says it was sent.
+    bool const logRez = m_caster->IsPlayer();
     if (!m_corpseTarget && !unitTarget)
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed with no target (unit or corpse)", m_caster->GetName(), m_spellInfo->Id);
         return;
+    }
 
     Player* player = nullptr;
 
@@ -3717,10 +3759,20 @@ void Spell::EffectResurrect()
         player = unitTarget->ToPlayer();
 
     if (!player || player->IsAlive() || !player->IsInWorld())
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: not offered (player={} alive={} in_world={})", m_caster->GetName(),
+                m_spellInfo->Id, m_corpseTarget ? "a corpse" : "a unit", int(player != nullptr), player ? int(player->IsAlive()) : -1,
+                player ? int(player->IsInWorld()) : -1);
         return;
+    }
 
     if (player->IsResurrectRequested())       // already have one active request
+    {
+        if (logRez)
+            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: an offer is already pending", m_caster->GetName(), m_spellInfo->Id, player->GetName());
         return;
+    }
 
     uint32 health = player->CountPctFromMaxHealth(effectValue);
     uint32 mana   = CalculatePct(player->GetMaxPower(POWER_MANA), effectValue);
@@ -3729,6 +3781,9 @@ void Spell::EffectResurrect()
 
     player->SetResurrectRequestData(m_caster, health, mana, 0);
     SendResurrectRequest(player);
+    if (logRez)
+        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} offered a resurrection to {} (health {} mana {}, effect value {})", m_caster->GetName(),
+            m_spellInfo->Id, player->GetName(), health, mana, effectValue);
 }
 
 void Spell::EffectAddExtraAttacks()

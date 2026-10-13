@@ -38,6 +38,10 @@ void WorldSession::SendTradeStatus(WorldPackets::Trade::TradeStatus& info)
     info.Clear();   // reuse packet
     Player* trader = _player->GetTrader();
     info.PartnerIsSameBnetAccount = trader && trader->GetSession()->GetBattlenetAccountId() == GetBattlenetAccountId();
+    // Every status sent, with its value: a trade window that never opens is diagnosed from what each side was told.
+    if (IsBot() || (trader && trader->GetSession() && trader->GetSession()->IsBot()))
+        TC_LOG_INFO("playerbot.v2", "[trade] status {} to {} (partner {})", uint32(info.Status), _player ? _player->GetName() : "?",
+                    trader ? trader->GetName() : "none");
     SendPacket(info.Write());
 }
 
@@ -554,6 +558,8 @@ void WorldSession::HandleAcceptTradeOpcode(WorldPackets::Trade::AcceptTrade& acc
         trader->SaveInventoryAndGoldToDB(trans);
         CharacterDatabase.CommitTransaction(trans);
 
+        if (_player->GetSession()->IsBot() || trader->GetSession()->IsBot())
+            TC_LOG_INFO("playerbot.v2", "[trade] complete {} <-> {}", _player->GetName(), trader->GetName());
         info.Status = TRADE_STATUS_COMPLETE;
         trader->GetSession()->SendTradeStatus(info);
         SendTradeStatus(info);
@@ -608,7 +614,14 @@ void WorldSession::HandleCancelTradeOpcode(WorldPackets::Trade::CancelTrade& /*c
 void WorldSession::HandleInitiateTradeOpcode(WorldPackets::Trade::InitiateTrade& initiateTrade)
 {
     if (GetPlayer()->m_trade)
-        return;
+    {
+        // A client only sends an initiate when it believes no trade is open, so a trade still held server side is stale (a
+        // partner that never answered, a cancel the client missed): clear it, on both sides, and open the new one. Silently
+        // ignoring it left the player unable to trade with anyone ("already trading") until a relog.
+        TC_LOG_INFO("playerbot.v2", "[trade] {} started a trade while one was still open (partner {}): cleared it",
+                    GetPlayer()->GetName(), GetPlayer()->GetTrader() ? GetPlayer()->GetTrader()->GetName() : std::string("?"));
+        GetPlayer()->TradeCancel(true);
+    }
 
     WorldPackets::Trade::TradeStatus info;
     if (!GetPlayer()->IsAlive())
@@ -717,6 +730,8 @@ void WorldSession::HandleInitiateTradeOpcode(WorldPackets::Trade::InitiateTrade&
     }
 
     // OK start trade
+    if (IsBot() || pOther->GetSession()->IsBot())
+        TC_LOG_INFO("playerbot.v2", "[trade] {} proposes a trade to {}", _player->GetName(), pOther->GetName());
     _player->m_trade = new TradeData(_player, pOther);
     pOther->m_trade = new TradeData(pOther, _player);
 

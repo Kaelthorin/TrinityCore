@@ -19,6 +19,8 @@
 #include "DB2Stores.h"
 #include "Item.h"
 #include "Player.h"
+#include "ClassicManaRegen.h"
+#include "ClassicSpellValue.h"
 #include "Pet.h"
 #include "GameTables.h"
 #include "GameTime.h"
@@ -171,6 +173,14 @@ void Player::ApplySpellPowerBonus(int32 amount, bool apply)
 
 void Player::UpdateSpellDamageAndHealingBonus()
 {
+    // RECURSION GUARD: Prevent infinite loop when player has both
+    // SPELL_AURA_OVERRIDE_ATTACK_POWER_BY_SP_PCT and SPELL_AURA_OVERRIDE_SPELL_POWER_BY_AP_PCT
+    // which causes UpdateSpellDamageAndHealingBonus <-> UpdateAttackPowerAndDamage loop
+    thread_local bool inSpellDamageUpdate = false;
+    if (inSpellDamageUpdate)
+        return;
+    inSpellDamageUpdate = true;
+
     // Magic damage modifiers implemented in Unit::SpellDamageBonusDone
     // This information for client side use only
     // Get healing bonus for all schools
@@ -195,6 +205,8 @@ void Player::UpdateSpellDamageAndHealingBonus()
         UpdateAttackPowerAndDamage();
         UpdateAttackPowerAndDamage(true);
     }
+
+    inSpellDamageUpdate = false;
 }
 
 bool Player::UpdateAllStats()
@@ -1053,6 +1065,18 @@ float Player::GetPowerRegen(Powers power) const
     if (!powerType)
         return 0.f;
 
+    if (power == POWER_MANA)
+    {
+        // Classic 1.60 (vanilla): five second rule (ClassicManaRegen.h). The window starts when a mana spell is paid (Spell::TakePower)
+        // and the interrupted rate is the share of SPELL_AURA_MOD_MANA_REGEN_INTERRUPT (UpdatePowerRegen), not zero. Combat does
+        // not interrupt the regeneration.
+        // (leaving combat does not start the window, so it has a timestamp of its own)
+        unsigned const msSinceManaSpell = unsigned(std::chrono::duration_cast<Milliseconds>(GameTime::Now() - m_manaSpentTimestamp).count());
+        bool const manaInterrupted = ClassicManaRegen::IsInterrupted(msSinceManaSpell, HasAuraType(SPELL_AURA_INTERRUPT_REGEN));
+        return manaInterrupted ? powerType->RegenCombat + m_unitData->PowerRegenInterruptedFlatModifier[powerIndex]
+                               : powerType->RegenPeace + m_unitData->PowerRegenFlatModifier[powerIndex];
+    }
+
     if (powerType->GetFlags().HasFlag(PowerTypeFlags::UseRegenInterrupt) && m_regenInterruptTimestamp + Milliseconds(powerType->RegenInterruptTimeMS) >= GameTime::Now())
         return 0.f;
 
@@ -1281,6 +1305,21 @@ void Creature::CalculateMinMaxDamage(WeaponAttackType attType, bool normalized, 
     float totalValue       = GetFlatModifierValue(unitMod, TOTAL_VALUE);
     float totalPct         = addTotalPct ? GetPctModifierValue(unitMod, TOTAL_PCT) : 1.0f;
     float dmgMultiplier    = GetCreatureDifficulty()->DamageModifier; // = DamageModifier * GetDamageMod(rank);
+
+    // Classic 1.60 (vanilla): the VMaNGOS hit of the creature, per hit whatever its swing time (the client's damage per second table and the
+    // old damage modifiers are 0-60% off per creature, and scale the hit with the swing)
+    if (attType != RANGED_ATTACK && !IsPet() && !IsGuardian())
+        if (ObjectMgr::CreatureClassicMelee const* classic = sObjectMgr->GetCreatureClassicMelee(GetEntry()); classic && classic->DamageMax > 0.0f)
+        {
+            float const mainHand = CanUseAttackType(attType) ? 1.0f : 0.0f;
+            float const auraAttackPower = attackPower - baseAttackPower;
+            float const swingMs = float(GetBaseAttackTime(attType));
+            float const flat = GetFlatModifierValue(unitMod, BASE_VALUE);
+            float const pct = GetPctModifierValue(unitMod, BASE_PCT);
+            minDamage = ClassicSpellValue::CreatureClassicHit(classic->DamageMin * mainHand, auraAttackPower, variance, swingMs, flat, pct, totalValue, totalPct);
+            maxDamage = ClassicSpellValue::CreatureClassicHit(classic->DamageMax * mainHand, auraAttackPower, variance, swingMs, flat, pct, totalValue, totalPct);
+            return;
+        }
 
     // Classic 1.60: vanilla creatures (creature_classic_stats) hit for their per-hit weapon damage, which already holds their
     // damage multiplier (Creature::UpdateLevelDependantStats); only attack power changes from auras scale with attack time

@@ -19,6 +19,7 @@
 #include "BattlefieldMgr.h"
 #include "CellImpl.h"
 #include "CinematicMgr.h"
+#include "ClassicSpellHit.h"
 #include "CombatLogPackets.h"
 #include "Corpse.h"
 #include "CreatureGroups.h"
@@ -1845,6 +1846,18 @@ void WorldObject::ModSpellCastTime(SpellInfo const* spellInfo, int32& castTime, 
         castTime = int32(float(castTime) * unitCaster->m_modAttackSpeedPct[RANGED_ATTACK]);
     else if (IsPartOfSkillLine(SKILL_COOKING, spellInfo->Id) && unitCaster->HasAura(67556)) // cooking with Chef Hat.
         castTime = 500;
+
+    // PlayerbotV2 pacing multiplier (bots only; 1.0 for everyone else). Applied last so it
+    // also covers ranged-slot and ability cast times. A cast never drops below 250 ms.
+    if (castTime > 0 && unitCaster->IsPlayer())
+    {
+        float const botMod = unitCaster->ToPlayer()->GetBotCastSpeedMod();
+        if (botMod != 1.0f)
+        {
+            int32 const scaled = int32(float(castTime) * botMod);
+            castTime = botMod < 1.0f ? std::max(scaled, std::min(castTime, 250)) : scaled;
+        }
+    }
 }
 
 void WorldObject::ModSpellDurationTime(SpellInfo const* spellInfo, int32& duration, Spell* spell /*= nullptr*/) const
@@ -1901,8 +1914,6 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
             return 0.0f;
 
         SpellSchoolMask schoolMask = spellInfo->GetSchoolMask();
-        // PvP - PvE spell misschances per leveldif > 2
-        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
         int32 thisLevel = GetLevelForTarget(victim);
         if (GetTypeId() == TYPEID_UNIT && ToCreature()->IsTrigger())
             thisLevel = std::max<int32>(thisLevel, spellInfo->SpellLevel);
@@ -1910,6 +1921,7 @@ SpellMissInfo WorldObject::MagicSpellHitResult(Unit* victim, SpellInfo const* sp
 
         // Classic 1.60 (vanilla, VMaNGOS SpellCaster::MagicSpellHitChance): 96% against the same level, -1% per level up to +2,
         // then -11% per level against creatures (-7% against players): 96 / 95 / 94 / 83 / 72; never below 22%
+        int32 lchance = victim->GetTypeId() == TYPEID_PLAYER ? 7 : 11;
         float modHitChance;
         if (leveldif < 3)
             modHitChance = float(96 - leveldif);
@@ -3118,13 +3130,27 @@ void WorldObject::BuildUpdate(UpdateDataMapType& data_map)
 
 bool WorldObject::AddToObjectUpdate()
 {
-    GetMap()->AddUpdateObject(this);
+    // SAFETY CHECK: Validate Map pointer to prevent crash in AddUpdateObject
+    // Crash at Map.h:573 (hash set insert) could be caused by corrupted Map pointer
+    Map* map = GetMap();
+    if (!map)
+    {
+        TC_LOG_ERROR("misc", "WorldObject::AddToObjectUpdate called with null map for {}", GetGUID().ToString());
+        return false;
+    }
+    map->AddUpdateObject(this);
     return true;
 }
 
 void WorldObject::RemoveFromObjectUpdate()
 {
-    GetMap()->RemoveUpdateObject(this);
+    Map* map = GetMap();
+    if (!map)
+    {
+        TC_LOG_ERROR("misc", "WorldObject::RemoveFromObjectUpdate called with null map for {}", GetGUID().ToString());
+        return;
+    }
+    map->RemoveUpdateObject(this);
 }
 
 ObjectGuid WorldObject::GetTransGUID() const

@@ -164,6 +164,31 @@ void InstanceLockMgr::Load()
 
         } while (result->NextRow());
     }
+
+    // Persisted raid respawn times (Instance.PersistRaidTrash) belong to a lockout; once the lockout is gone or expired
+    // the rows must go too, or a recycled instance id would inherit dead creatures
+    CharacterDatabasePreparedStatement* orphanStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ORPHAN_INSTANCE_RESPAWNS);
+    orphanStmt->setUInt64(0, uint64(time(nullptr)));
+    if (PreparedQueryResult orphans = CharacterDatabase.Query(orphanStmt))
+    {
+        do
+        {
+            Field* fields = orphans->Fetch();
+            uint32 mapId = fields[0].GetUInt16();
+            uint32 instanceId = fields[1].GetUInt32();
+
+            // faction-split world maps use small non-zero instance ids and are not instance locks
+            MapEntry const* mapEntry = sMapStore.LookupEntry(mapId);
+            if (!mapEntry || !mapEntry->IsDungeon())
+                continue;
+
+            CharacterDatabasePreparedStatement* delStmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ALL_RESPAWNS);
+            delStmt->setUInt16(0, mapId);
+            delStmt->setUInt32(1, instanceId);
+            CharacterDatabase.Execute(delStmt);
+            TC_LOG_INFO("instance.locks", "Removed stale respawn times of map {} instance {} (no active lockout)", mapId, instanceId);
+        } while (orphans->NextRow());
+    }
 }
 
 void InstanceLockMgr::Unload()
@@ -314,8 +339,14 @@ InstanceLock* InstanceLockMgr::UpdateInstanceLockForPlayer(CharacterDatabaseTran
             ASSERT(sharedDataItr != _instanceLockDataById.end());
             ASSERT(!sharedDataItr->second.expired());
 
+            // The shared data of a fresh instance has InstanceId 0 until the first lock in it is saved. A player without a lock
+            // (a companion bot, or anyone when the first player in is a GM and never binds) confirming a pending bind before that
+            // used to assert here (crash in Molten Core, 2026-10-08); the first saved lock names the instance.
+            std::shared_ptr<SharedInstanceLockData> sharedData = sharedDataItr->second.lock();
+            if (!sharedData->InstanceId)
+                sharedData->InstanceId = updateEvent.InstanceId;
             instanceLock = new SharedInstanceLock(entries.MapDifficulty->MapID, Difficulty(entries.MapDifficulty->DifficultyID),
-                GetNextResetTime(entries), updateEvent.InstanceId, sharedDataItr->second.lock());
+                GetNextResetTime(entries), updateEvent.InstanceId, std::move(sharedData));
             ASSERT(static_cast<SharedInstanceLock*>(instanceLock)->GetSharedData()->InstanceId == updateEvent.InstanceId);
         }
         else

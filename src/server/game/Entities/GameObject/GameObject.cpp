@@ -54,6 +54,7 @@
 #include "SpellAuras.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "StringFormat.h"
 #include "Transport.h"
 #include "Util.h"
 #include "Vignette.h"
@@ -647,6 +648,11 @@ public:
         _value = RoundToInterval<float>(value, 0.0f, 100.0f);
     }
 
+    // Diagnostic read of the live capture-bar value (0 = horde captured,
+    // 100 = alliance captured, between = contested/neutral band). Consumed
+    // by GameObject::GetControlZoneValue for GM tooling.
+    float GetValue() const { return _value; }
+
     void HandleHeartbeat()
     {
         // update player list inside control zone
@@ -655,6 +661,15 @@ public:
 
         TeamId oldControllingTeam = GetControllingTeam();
         float pointsGained = CalculatePointsPerSecond(targetList) * _heartbeatRate.count() / 1000.0f;
+
+        // Diagnostic (2026-06-11, EotS towers frozen with eligible players
+        // inside): expose what the grid searcher actually returned vs the
+        // resulting gain. Debug-gated — silent at default log levels.
+        TC_LOG_DEBUG("bg.battleground",
+            "ControlZone {} (map {} inst {}) heartbeat: targets={} gain={} value={}",
+            _owner.GetEntry(), _owner.GetMapId(), _owner.GetMap()->GetInstanceId(),
+            uint32(targetList.size()), pointsGained, _value);
+
         if (pointsGained == 0)
             return;
 
@@ -740,7 +755,7 @@ public:
     float CalculateTimeNeeded(int32 hordePlayers, int32 alliancePlayers) const
     {
         uint32 const uncontestedTime = _owner.GetGOInfo()->controlZone.UncontestedTime;
-        uint32 const delta = std::abs(alliancePlayers - hordePlayers);
+        uint32 delta = std::abs(alliancePlayers - hordePlayers);
         uint32 const minSuperiority = _owner.GetGOInfo()->controlZone.minSuperiority;
 
         if (delta < minSuperiority)
@@ -754,7 +769,23 @@ public:
         uint32 const maxTime = _owner.GetGOInfo()->controlZone.maxTime;
         uint32 const maxSuperiority = _owner.GetGOInfo()->controlZone.maxSuperiority;
 
-        float const slope = static_cast<float>(minTime - maxTime) / static_cast<float>(std::max<uint32>(maxSuperiority - minSuperiority, 1));
+        // Superiority beyond maxSuperiority caps the capture speed at
+        // minTime — it must NOT keep extrapolating the line. Unclamped,
+        // EotS tower data (minSup 1, maxSup 5, minTime 90, maxTime 180 →
+        // slope -22.5) hits timeNeeded == 0 at delta 9 (zone freezes via
+        // the ==0 guard) and goes NEGATIVE past it, INVERTING the gain
+        // direction.
+        delta = std::min<uint32>(delta, maxSuperiority);
+
+        // minTime and maxTime are uint32: subtracting them BEFORE the float
+        // cast underflows to ~2^32 whenever minTime < maxTime (always),
+        // turning the slope into +2^30 instead of -22.5. Live-proven
+        // 2026-06-11 via per-heartbeat gain logging in EotS: gain came out
+        // 100/(delta*2^30 - 2^30) — 2.33e-08 at delta 5, 7.76e-09 at
+        // delta 13 — i.e. towers froze for any superiority >= 2, and a
+        // lone player needed ~192s instead of 180s. Cast each operand
+        // first so the subtraction happens in float.
+        float const slope = (static_cast<float>(minTime) - static_cast<float>(maxTime)) / static_cast<float>(std::max<uint32>(maxSuperiority - minSuperiority, 1));
         float const intercept = static_cast<float>(maxTime) - slope * static_cast<float>(minSuperiority);
         return slope * static_cast<float>(delta) + intercept;
     }
@@ -941,6 +972,11 @@ void GameObject::AddToWorld()
         GetMap()->GetObjectsStore().Insert<GameObject>(this);
         if (m_spawnId)
             GetMap()->GetGameObjectBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
+
+        // Instance.AhnQirajGatesOpen: the Gate of Ahn'Qiraj stands open without the war effort and the Scarab Gong
+        // (176146 Doodad_Ahn_Qiraj_DoorPlug01, 176149 Gate of Ahn'Qiraj2)
+        if ((GetEntry() == 176146 || GetEntry() == 176149) && sWorld->getBoolConfig(CONFIG_AQ_GATES_OPEN))
+            SetGoState(GO_STATE_ACTIVE);
 
         // The state can be changed after GameObject::Create but before GameObject::AddToWorld
         bool toggledState = GetGoType() == GAMEOBJECT_TYPE_CHEST ? getLootState() == GO_READY : (GetGoState() == GO_STATE_READY || IsTransport());
@@ -1653,7 +1689,24 @@ void GameObject::Update(uint32 diff)
                         if (goInfo->trap.spell && goInfo->trap.playerCast)
                             target->CastSpell(target, goInfo->trap.spell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
                         else if (goInfo->trap.spell)
-                            CastSpell(target, goInfo->trap.spell, args);
+                        {
+                            SpellCastResult trapResult = CastSpell(target, goInfo->trap.spell, args);
+                            // Diagnostic [trap_cast]: a failed cast despawns the trap with no visible effect (hunter Explosive Trap report)
+                            if (SpellInfo const* trapSpellInfo = sSpellMgr->GetSpellInfo(goInfo->trap.spell, GetMap()->GetDifficultyID()))
+                            {
+                                std::string effects;
+                                for (SpellEffectInfo const& effectInfo : trapSpellInfo->GetEffects())
+                                    if (effectInfo.IsEffect())
+                                        effects += Trinity::StringFormat(" [eff{} effect={} aura={} targetA={} targetB={} radiusA={:.1f} radiusB={:.1f}]",
+                                            uint32(effectInfo.EffectIndex), uint32(effectInfo.Effect), uint32(effectInfo.ApplyAuraName),
+                                            uint32(effectInfo.TargetA.GetTarget()), uint32(effectInfo.TargetB.GetTarget()),
+                                            effectInfo.CalcRadius(this, SpellTargetIndex::TargetA).Max, effectInfo.CalcRadius(this, SpellTargetIndex::TargetB).Max);
+                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} target {} owner {} goRadius {}{}",
+                                    GetEntry(), goInfo->trap.spell, uint32(trapResult), target->GetGUID(), GetOwnerGUID(), goInfo->trap.radius, effects);
+                            }
+                            else
+                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} (no SpellInfo)", GetEntry(), goInfo->trap.spell, uint32(trapResult));
+                        }
 
                         // Template value or 4 seconds
                         m_cooldownTime = GameTime::GetGameTimeMS() + (goInfo->trap.cooldown ? goInfo->trap.cooldown : uint32(4)) * IN_MILLISECONDS;
@@ -4667,6 +4720,18 @@ TeamId GameObject::GetControllingTeam() const
         return TEAM_NEUTRAL;
 
     return controlZone->GetControllingTeam();
+}
+
+float GameObject::GetControlZoneValue() const
+{
+    if (GetGoType() != GAMEOBJECT_TYPE_CONTROL_ZONE)
+        return -1.0f;
+
+    GameObjectType::ControlZone const* controlZone = dynamic_cast<GameObjectType::ControlZone const*>(m_goTypeImpl.get());
+    if (!controlZone)
+        return -1.0f;
+
+    return controlZone->GetValue();
 }
 
 void GameObject::CreateModel()

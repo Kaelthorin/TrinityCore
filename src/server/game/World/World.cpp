@@ -21,6 +21,9 @@
 
 #include "World.h"
 #include "DeathRecap.h"
+#if TRINITY_PLAYERBOT_V2
+#include "PlayerbotV2.h"
+#endif
 #include "AccountMgr.h"
 #include "AchievementMgr.h"
 #include "AreaTriggerDataStore.h"
@@ -60,6 +63,7 @@
 #include "GridNotifiersImpl.h"
 #include "GroupMgr.h"
 #include "GuildMgr.h"
+#include "HandcraftedRoadStorage.h"
 #include "IPLocation.h"
 #include "InstanceLockMgr.h"
 #include "ItemBonusMgr.h"
@@ -75,6 +79,7 @@
 #include "MapManager.h"
 #include "MapUtils.h"
 #include "Metric.h"
+#include "Modules/ModuleManager.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -624,7 +629,14 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "AllFlightPaths"sv, .DefaultValue = false, .Index = CONFIG_ALL_TAXI_PATHS },
         { .Name = "InstantFlightPaths"sv, .DefaultValue = false, .Index = CONFIG_INSTANT_TAXI },
         { .Name = "Instance.IgnoreLevel"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_LEVEL },
+        { .Name = "Instance.IgnoreAttunement"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_ATTUNEMENT },
+        { .Name = "Instance.AhnQirajGatesOpen"sv, .DefaultValue = false, .Index = CONFIG_AQ_GATES_OPEN },
         { .Name = "Instance.IgnoreRaid"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_IGNORE_RAID },
+        { .Name = "Instance.BindOnEntry"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_BIND_ON_ENTRY },
+        { .Name = "Instance.PersistRaidTrash"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_PERSIST_RAID_TRASH },
+        { .Name = "Instance.MoltenCoreHoundsLinked"sv, .DefaultValue = false, .Index = CONFIG_MC_CORE_HOUNDS_LINKED },
+        { .Name = "Instance.MoltenCoreSkipRunes"sv, .DefaultValue = false, .Index = CONFIG_MC_SKIP_RUNES },
+        { .Name = "Instance.CombatResurrectionLimit"sv, .DefaultValue = false, .Index = CONFIG_INSTANCE_COMBAT_RES_LIMIT },
         { .Name = "CastUnstuck"sv, .DefaultValue = true, .Index = CONFIG_CAST_UNSTUCK },
         { .Name = "GM.AllowInvite"sv, .DefaultValue = false, .Index = CONFIG_ALLOW_GM_GROUP },
         { .Name = "GM.LowerSecurity"sv, .DefaultValue = false, .Index = CONFIG_GM_LOWER_SECURITY },
@@ -1415,6 +1427,11 @@ bool World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading SpellInfo corrections...");
     sSpellMgr->LoadSpellInfoCorrections();
 
+    TC_LOG_INFO("server.loading", "Loading classic spell values...");
+    sSpellMgr->LoadClassicSpellInfo();
+    sSpellMgr->LoadClassicSpellValues();
+    sSpellMgr->LoadClassicSpellCosts();
+
     TC_LOG_INFO("server.loading", "Loading SkillLineAbilityMultiMap Data...");
     sSpellMgr->LoadSkillLineAbilityMap();
 
@@ -1552,6 +1569,7 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading Classic creature levels...");
     sObjectMgr->LoadCreatureClassicLevels();
+    sObjectMgr->LoadCreatureClassicMelee();
     sObjectMgr->LoadItemClassicBlock();
 
     TC_LOG_INFO("server.loading", "Loading Shop products...");                 // must be after LoadItemTemplates
@@ -1715,6 +1733,17 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading Graveyard-zone links...");
     sObjectMgr->LoadGraveyardZones();
+
+    TC_LOG_INFO("server.loading", "Loading Handcrafted Road Segments...");
+    HandcraftedRoadStorage::LoadFromDB();
+    // Belt-and-suspenders for ordering: if any continent navmesh was
+    // already loaded (e.g. by a prewarm helper) BEFORE LoadFromDB
+    // completed, the LoadMMapImpl hook would have seen only an empty
+    // segment list. Walk every currently-loaded Map and retag now. At
+    // first-boot this is typically a no-op (MapManager::Initialize
+    // happens later) — but the AlreadyLoaded branch of LoadMMapImpl
+    // catches the remaining cases.
+    TerrainMgrDetail::ApplyHandcraftedRoadsToAllLoadedMaps();
 
     TC_LOG_INFO("server.loading", "Loading spell pet auras...");
     sSpellMgr->LoadSpellPetAuras();
@@ -2353,6 +2382,27 @@ void World::Update(uint32 diff)
         }
     }
 
+    // CRITICAL FIX: Module/script updates MUST happen BEFORE Map updates
+    // to prevent deadlock when bot worker threads try to access Maps that
+    // main thread is currently updating (holding locks on).
+    // See: CELL_VISIT_DEADLOCK_RESOLUTION.md
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
+        sScriptMgr->OnWorldUpdate(diff);
+    }
+
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update modules"));
+        ModuleManager::CallOnUpdate(diff);
+    }
+
+#if TRINITY_PLAYERBOT_V2
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update playerbot v2"));
+        Playerbot::V2::Module::instance().OnWorldUpdate(std::chrono::milliseconds{diff});
+    }
+#endif
+
     /// <li> Handle all other objects
     ///- Update objects when the timer has passed (maps, transport, creatures, ...)
     {
@@ -2470,11 +2520,6 @@ void World::Update(uint32 diff)
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Process cli commands"));
         // And last, but not least handle the issued cli commands
         ProcessCliCommands();
-    }
-
-    {
-        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update world scripts"));
-        sScriptMgr->OnWorldUpdate(diff);
     }
 
     {

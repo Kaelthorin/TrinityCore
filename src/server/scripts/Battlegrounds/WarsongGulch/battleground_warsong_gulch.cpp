@@ -19,10 +19,13 @@
 #include "BattlegroundScript.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
+#include "BattlegroundPackets.h"
 #include "GameObject.h"
 #include "GameObjectAI.h"
 #include "GameTime.h"
+#include "Log.h"
 #include "Map.h"
+#include "ObjectMgr.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -706,6 +709,29 @@ namespace ClassicWarsongGulch
     static constexpr TeamId OtherTeam(TeamId teamId) { return teamId == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE; }
 }
 
+namespace
+{
+// Removes the spawns of a spawn group for the rest of the match WITHOUT deactivating the group. A deactivated group with no conditions is
+// switched on again by Map::UpdateSpawnGroupConditions every respawn check (Map::Update, and each capture point / GO event), which is why
+// SpawnGroupDespawn brought the AB ghost gates back within seconds. Each spawn that is alive is deleted with a respawn time of one day.
+size_t RemoveGroupSpawnsForMatch(Map* map, uint32 groupId)
+{
+    size_t removed = 0;
+    for (auto const& pair : sObjectMgr->GetSpawnMetadataForGroup(groupId))
+    {
+        SpawnMetadata const* data = pair.second;
+        if (data->type != SPAWN_TYPE_GAMEOBJECT)
+            continue;
+        if (GameObject* go = map->GetGameObjectBySpawnId(data->spawnId))
+        {
+            go->DespawnOrUnsummon(0ms, 24h);
+            ++removed;
+        }
+    }
+    return removed;
+}
+}
+
 struct battleground_classic_warsong_gulch : BattlegroundScript
 {
     explicit battleground_classic_warsong_gulch(BattlegroundMap* map) : BattlegroundScript(map)
@@ -731,11 +757,20 @@ struct battleground_classic_warsong_gulch : BattlegroundScript
     void OnStart() override
     {
         using namespace ClassicWarsongGulch;
+        // The doors are opened and then removed (as the retail script does): an open door that stays has its auto-close timer, and a
+        // player who joins the running match later (the normal path now) was sent a closed gate and could not leave the start room.
         for (ObjectGuid const& guid : _doors)
             if (GameObject* door = battlegroundMap->GetGameObject(guid))
+            {
                 door->UseDoorOrButton();
+                TC_LOG_INFO("bg.battleground", "Classic WSG start: door {} (type {}) at ({:.0f},{:.0f},{:.0f}) opened, state {}, auto close {}s, removed in 3 s", door->GetEntry(),
+                    uint32(door->GetGoType()), door->GetPositionX(), door->GetPositionY(), door->GetPositionZ(), uint32(door->GetGoState()),
+                    door->GetGOInfo()->GetAutoCloseTime() / IN_MILLISECONDS);
+                door->DespawnOrUnsummon(3s);
+            }
 
-        battlegroundMap->SpawnGroupDespawn(SPAWN_GROUP_GHOST_GATES);
+        size_t const ghostGates = RemoveGroupSpawnsForMatch(battlegroundMap, SPAWN_GROUP_GHOST_GATES);
+        TC_LOG_INFO("bg.battleground", "Classic WSG start: {} doors opened, {} ghost gates despawned", _doors.size(), ghostGates);
         battlegroundMap->SpawnGroupSpawn(SPAWN_GROUP_SPIRIT_GUIDES, true);
         UpdateWorldState(WS_BATTLE_IN_PROGRESS, 1, true);
     }
@@ -751,6 +786,16 @@ struct battleground_classic_warsong_gulch : BattlegroundScript
         using namespace ClassicWarsongGulch;
         if (battleground->GetStatus() != STATUS_IN_PROGRESS)
             return;
+
+        // Safety net only: the gates are removed with a one-day respawn at the start; if one is ever alive again it is removed and logged.
+        _ghostGateCheckMs += diff;
+        if (_ghostGateCheckMs >= 5000)
+        {
+            _ghostGateCheckMs = 0;
+            size_t const back = RemoveGroupSpawnsForMatch(battlegroundMap, SPAWN_GROUP_GHOST_GATES);
+            if (back)
+                TC_LOG_INFO("bg.battleground", "Classic WSG: {} ghost gate(s) were back after the start and were despawned again", back);
+        }
 
         Milliseconds const elapsed(diff);
 
@@ -776,6 +821,9 @@ struct battleground_classic_warsong_gulch : BattlegroundScript
                     // carrier left the battleground / lost the aura without the drop handler: back to base (VMaNGOS RemovePlayer)
                     if (!carrier || !carrier->HasAura(CarrierSpell(flagTeam)))
                     {
+                        TC_LOG_INFO("bg.battleground", "Classic WSG: the {} flag carrier {} has no carrier aura {} (present {}): flag back to its stand",
+                            flagTeam == TEAM_ALLIANCE ? "Alliance" : "Horde", carrier ? carrier->GetName() : "(left)", CarrierSpell(flagTeam), carrier ? 1 : 0);
+                        battleground->RemovePlayerPosition(_flagKeepers[flagTeam]);
                         _flagKeepers[flagTeam].Clear();
                         PlaceFlagInBase(flagTeam);
                         UpdateFlagState(OtherTeam(flagTeam), 1);
@@ -835,7 +883,11 @@ private:
     {
         using namespace ClassicWarsongGulch;
         if (battleground->GetStatus() != STATUS_IN_PROGRESS || !player->CanUseBattlegroundObject(nullptr))
+        {
+            TC_LOG_INFO("bg.battleground", "Classic WSG: {} click on flag {} ignored (bg status {}, alive {}, can use {})", player->GetName(), flag->GetEntry(),
+                uint32(battleground->GetStatus()), player->IsAlive() ? 1 : 0, player->CanUseBattlegroundObject(nullptr) ? 1 : 0);
             return;
+        }
 
         Team const team = battleground->GetPlayerTeam(player->GetGUID());
         if (team != ALLIANCE && team != HORDE)
@@ -874,16 +926,29 @@ private:
     {
         using namespace ClassicWarsongGulch;
         if (fromBase)
-            battlegroundMap->SpawnGroupDespawn(FlagSpawnGroup(flagTeam));
+            RemoveGroupSpawnsForMatch(battlegroundMap, FlagSpawnGroup(flagTeam));   // not SpawnGroupDespawn: the stand's group is switched on again by the map's condition update
         else
             RemoveDroppedFlag(flagTeam);
 
         _flagKeepers[flagTeam] = player->GetGUID();
         _flagStates[flagTeam] = WsgFlagState::OnPlayer;
+        TC_LOG_INFO("bg.battleground", "Classic WSG: {} picks up the {} flag ({})", player->GetName(), flagTeam == TEAM_ALLIANCE ? "Alliance" : "Horde",
+            fromBase ? "from its stand" : "from the ground");
 
         player->RemoveAurasByType(SPELL_AURA_MOD_STEALTH);
         player->RemoveAurasByType(SPELL_AURA_MOD_INVISIBILITY);
         player->CastSpell(player, CarrierSpell(flagTeam), true);
+
+        // The map / minimap flag carrier icon (SMSG_BATTLEGROUND_PLAYER_POSITIONS). The classic carrier spells do not reliably carry
+        // the position aura on this client's spell data (no carrier on the Shift-M map), so the script registers the carrier.
+        {
+            WorldPackets::Battleground::BattlegroundPlayerPosition position;
+            position.Guid = player->GetGUID();
+            position.Pos = player->GetPosition();
+            position.IconID = flagTeam == TEAM_ALLIANCE ? PLAYER_POSITION_ICON_ALLIANCE_FLAG : PLAYER_POSITION_ICON_HORDE_FLAG;   // the flag carried
+            position.ArenaSlot = PLAYER_POSITION_ARENA_SLOT_NONE;   // the 70291 client draws a battleground carrier only for slot 1
+            battleground->AddPlayerPosition(position);
+        }
 
         if (flagTeam == TEAM_ALLIANCE)
         {
@@ -913,6 +978,9 @@ private:
             return;
 
         _flagKeepers[flagTeam].Clear();
+        battleground->RemovePlayerPosition(player->GetGUID());
+        TC_LOG_INFO("bg.battleground", "Classic WSG: {} drops the {} flag (alive {}, bg status {})", player->GetName(), flagTeam == TEAM_ALLIANCE ? "Alliance" : "Horde",
+            player->IsAlive() ? 1 : 0, uint32(battleground->GetStatus()));
         UpdateFlagState(OtherTeam(flagTeam), 1);
 
         if (battleground->GetStatus() != STATUS_IN_PROGRESS || player->GetMap() != battlegroundMap)
@@ -956,6 +1024,7 @@ private:
     void ReturnFlag(TeamId flagTeam, Player* player)
     {
         using namespace ClassicWarsongGulch;
+        TC_LOG_INFO("bg.battleground", "Classic WSG: {} returns the {} flag", player->GetName(), flagTeam == TEAM_ALLIANCE ? "Alliance" : "Horde");
         PlaceFlagInBase(flagTeam);
         battleground->SendBroadcastText(flagTeam == TEAM_ALLIANCE ? TEXT_ALLIANCE_FLAG_RETURNED : TEXT_HORDE_FLAG_RETURNED,
             flagTeam == TEAM_ALLIANCE ? CHAT_MSG_BG_SYSTEM_ALLIANCE : CHAT_MSG_BG_SYSTEM_HORDE, player);
@@ -993,14 +1062,17 @@ private:
         TeamId const flagTeam = OtherTeam(carrierTeam);
         Team const team = TeamOf(carrierTeam);
 
+        TC_LOG_INFO("bg.battleground", "Classic WSG: {} captures the {} flag, score {}", player->GetName(), flagTeam == TEAM_ALLIANCE ? "Alliance" : "Horde",
+            battleground->GetTeamScore(carrierTeam) + 1);
         // keeper cleared before the aura goes, so the aura removal is not handled as a drop
         _flagKeepers[flagTeam].Clear();
+        battleground->RemovePlayerPosition(player->GetGUID());
         player->RemoveAurasDueToSpell(CarrierSpell(flagTeam));
 
         // both flags leave the field until they are placed again
         _flagStates[flagTeam] = WsgFlagState::WaitRespawn;
         _flagStates[carrierTeam] = WsgFlagState::WaitRespawn;
-        battlegroundMap->SpawnGroupDespawn(FlagSpawnGroup(carrierTeam));
+        RemoveGroupSpawnsForMatch(battlegroundMap, FlagSpawnGroup(carrierTeam));
         UpdateWorldState(flagTeam == TEAM_ALLIANCE ? WS_FLAG_TAKEN_ALLIANCE : WS_FLAG_TAKEN_HORDE, 0);
 
         if (battleground->GetTeamScore(carrierTeam) < MaxTeamScore)
@@ -1081,6 +1153,7 @@ private:
     std::array<ObjectGuid, PVP_TEAMS_COUNT> _droppedFlags;
     std::array<Milliseconds, PVP_TEAMS_COUNT> _dropTimers = { { 0ms, 0ms } };
     Milliseconds _respawnTimer = 0ms;
+    uint32 _ghostGateCheckMs = 0;
     GuidSet _doors;
     bool _isWeekend = false;
     uint32 _reputationCapture = 35;

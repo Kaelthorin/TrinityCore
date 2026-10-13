@@ -219,10 +219,11 @@ WorldPacket const* FeatureSystemStatus::Write()
     _worldPacket << Bits<1>(LfdEnabled);
     _worldPacket << Bits<1>(LfrEnabled);
     _worldPacket << Bits<1>(PetHappinessEnabled);
-    _worldPacket << Bits<1>(GuildEventsEditsEnabled);
-
-    _worldPacket << Bits<1>(GuildTradeSkillsEnabled);
-    _worldPacket << Bits<10>(ClassicFlagBits10);
+    // Classic 1.60.1.70291 (client reader rva 0x7FF4A0): the bit run is 7 flags, a 10 bit string length (client 0x198; the string follows the
+    // optional blocks), 7 flags, 1 flag. The length is always 0: we never send the string, and a non-zero length makes the client read past
+    // the packet. (The retail layout has two guild flags where this length starts; the Classic client has no such fields.)
+    _worldPacket << Bits<10>(0);
+    _worldPacket << Bits<2>(ClassicFlagsAfterLength);
     _worldPacket << Bits<1>(IsAccountCurrencyTransferEnabled);
     _worldPacket << Bits<1>(NetEaseChatTelemetryEnabled);
     _worldPacket << Bits<1>(LobbyMatchmakerQueueFromMainlineEnabled);

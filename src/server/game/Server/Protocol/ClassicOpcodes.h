@@ -25,6 +25,24 @@
 /// Entries are added as they are discovered; opcodes without an entry are passed through unchanged.
 namespace ClassicOpcodes
 {
+    /// numbering families of the client builds (the wire numbers differ between them, see ClassicOpcodes.cpp)
+    enum class Build : uint32
+    {
+        Build70245 = 70245,     // 70205 .. 70245
+        Build70291 = 70291      // 70291 and later
+    };
+
+    /// the numbering family of the client builds this process serves
+    TC_GAME_API Build CurrentBuild();
+
+    /// core OpcodeServer value -> client number in the numbering of the given build.
+    /// 70291: the explicit table ClassicServerOpcodes70291.inc (generated from the client) wins, the arithmetic translation
+    /// below is only the fallback for entries the table does not cover yet.
+    TC_GAME_API uint32 TranslateServerOpcode(Build build, uint32 coreOpcode);
+
+    /// true if the explicit table of that build has an entry for the core opcode
+    TC_GAME_API bool HasExplicitServerOpcode(Build build, uint32 coreOpcode);
+
     /// client number -> core OpcodeClient value
     TC_GAME_API uint32 TranslateClientOpcode(uint32 classicOpcode);
 
@@ -35,7 +53,7 @@ namespace ClassicOpcodes
     TC_GAME_API uint32 TranslateClientOpcode70245(uint32 classicOpcode);
     TC_GAME_API uint32 TranslateServerOpcode70245(uint32 coreOpcode);
 
-    /// client 70291 or later (Classic.OpcodeGroupShift / realm build): also selects that build's changed packet and update field layouts
+    /// client 70291 or later: also selects that build's changed packet and update field layouts
     TC_GAME_API bool IsBuild70291OrLater();
 
     /// server opcodes whose Classic number is not known yet and that crash the client when sent with the shifted retail number

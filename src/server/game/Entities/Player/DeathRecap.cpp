@@ -296,10 +296,17 @@ namespace
             ChatHandler(victim->GetSession()).SendSysMessage(text);
             return;
         }
+        // A bot's death is never announced (Karrz: the chat was flooded with every bot death, first in Arathi Basin, then in
+        // Molten Core). The recap is still recorded and `.recap <n>` still works.
+        bool const botVictim = victim->GetSession() && victim->GetSession()->IsBot();
+        if (botVictim)
+            return;
         for (auto const& [id, session] : sWorld->GetAllSessions())
         {
             Player* player = session->GetPlayer();
             if (!player || !player->IsInWorld())
+                continue;
+            if (botVictim && (session->IsBot() || !player->GetGroup() || player->GetGroup() != victim->GetGroup()))
                 continue;
             if (Cfg.Announce == 2 && player->GetMapId() != victim->GetMapId())
                 continue;

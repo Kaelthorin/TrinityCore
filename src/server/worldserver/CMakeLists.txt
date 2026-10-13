@@ -40,6 +40,20 @@ target_link_libraries(worldserver
     readline
     gsoap)
 
+# Link Playerbot V2 module if enabled (see v2/BUILD.md). playerbot-v2 is
+# an OBJECT library (no .lib produced; CMake links the individual .obj files
+# into worldserver). Plain target_link_libraries handles this correctly —
+# the earlier TARGET_LINKER_FILE genex workaround is unnecessary because
+# there's no archive path to resolve.
+if(BUILD_PLAYERBOT_V2)
+  target_link_libraries(worldserver PRIVATE playerbot-v2)
+  target_compile_definitions(worldserver PRIVATE TRINITY_PLAYERBOT_V2=1)
+  target_include_directories(worldserver PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/modules/PlayerbotV2
+    ${CMAKE_SOURCE_DIR}/src/server/game/Playerbot)
+endif()
+
 target_include_directories(worldserver
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR})
@@ -54,6 +68,8 @@ if(WORLDSERVER_DYNAMIC_SCRIPT_MODULES_DEPENDENCIES)
   add_dependencies(worldserver ${WORLDSERVER_DYNAMIC_SCRIPT_MODULES_DEPENDENCIES})
 endif()
 
+set(PLAYERBOT_V2_CONF_DIST ${CMAKE_SOURCE_DIR}/src/modules/PlayerbotV2/conf/playerbot.conf.dist)
+
 if(UNIX)
   install(TARGETS worldserver DESTINATION bin)
   if(COPY_CONF)
@@ -62,6 +78,20 @@ if(UNIX)
       COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/worldserver.conf.dist ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../etc/worldserver.conf.dist
     )
     install(FILES worldserver.conf.dist DESTINATION ${CONF_DIR})
+    if(BUILD_PLAYERBOT_V2)
+      # Ship the module config into worldserver.conf.d/, not next to
+      # worldserver.conf. ConfigMgr::LoadAdditionalDir walks that directory and
+      # loads every *.conf it finds, so dropping the .dist suffix in place is all
+      # that is needed to activate it. Placed beside worldserver.conf it would
+      # never be read at all, and every Playerbot.* key would silently fall back
+      # to its compiled-in default.
+      add_custom_command(TARGET worldserver
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../etc/worldserver.conf.d
+        COMMAND ${CMAKE_COMMAND} -E copy ${PLAYERBOT_V2_CONF_DIST} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/../etc/worldserver.conf.d/playerbot.conf.dist
+      )
+      install(FILES ${PLAYERBOT_V2_CONF_DIST} DESTINATION ${CONF_DIR}/worldserver.conf.d)
+    endif()
   endif()
 elseif(WIN32)
   install(TARGETS worldserver DESTINATION "${CMAKE_INSTALL_PREFIX}")
@@ -71,6 +101,16 @@ elseif(WIN32)
       COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/worldserver.conf.dist ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/
     )
     install(FILES worldserver.conf.dist DESTINATION "${CMAKE_INSTALL_PREFIX}")
+    if(BUILD_PLAYERBOT_V2)
+      # See the UNIX branch above: the module config must live in
+      # worldserver.conf.d/ to be loaded at all.
+      add_custom_command(TARGET worldserver
+        POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/worldserver.conf.d
+        COMMAND ${CMAKE_COMMAND} -E copy ${PLAYERBOT_V2_CONF_DIST} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/worldserver.conf.d/playerbot.conf.dist
+      )
+      install(FILES ${PLAYERBOT_V2_CONF_DIST} DESTINATION "${CMAKE_INSTALL_PREFIX}/worldserver.conf.d")
+    endif()
   endif()
 endif()
 

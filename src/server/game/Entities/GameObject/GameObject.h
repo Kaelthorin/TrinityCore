@@ -463,6 +463,9 @@ class TC_GAME_API GameObject : public WorldObject, public GridObject<GameObject>
         UF::UpdateField<UF::GameObjectData, int32(WowCS::EntityFragment::CGObject), TYPEID_GAMEOBJECT> m_gameObjectData;
 
         TeamId GetControllingTeam() const;
+        // Live control-zone capture-bar value (0 horde .. 100 alliance);
+        // -1 when this GO is not a control zone. Diagnostic surface.
+        float GetControlZoneValue() const;
 
     protected:
         void CreateModel();

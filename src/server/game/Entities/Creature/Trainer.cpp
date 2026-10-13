@@ -19,6 +19,7 @@
 #include "BattlePetMgr.h"
 #include "ConditionMgr.h"
 #include "Creature.h"
+#include "DB2Stores.h"
 #include "Log.h"
 #include "NPCPackets.h"
 #include "Player.h"
@@ -131,6 +132,91 @@ namespace Trainer
 
             player->LearnSpell(trainerSpell->SpellId, dependent);
         }
+    }
+
+    uint32 Trainer::GetClassMask() const
+    {
+        if (_classMask)
+            return _classMask;
+
+        // The classes this trainer can teach: every class that owns at least one of its spells. (An intersection over the spells
+        // let a single spell with a stray or foreign class skill line drop the trainer's own class, so warrior, priest, mage and
+        // rogue trainers taught nobody. Each spell is still checked against the player's class by IsSpellFitByClassAndRace.)
+        constexpr uint32 allClasses = (1u << MAX_CLASSES) - 1;
+        uint32 mask = 0;
+        for (Spell const& trainerSpell : _spells)
+        {
+            SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(trainerSpell.SpellId);
+            uint32 spellMask = 0;
+            for (auto itr = bounds.first; itr != bounds.second; ++itr)
+            {
+                SkillLineEntry const* skill = sSkillLineStore.LookupEntry(itr->second->SkillLine);
+                if (!skill || skill->CategoryID != SKILL_CATEGORY_CLASS)
+                    continue;
+                for (uint8 cls = CLASS_WARRIOR; cls < MAX_CLASSES; ++cls)
+                {
+                    if (itr->second->ClassMask && !(itr->second->ClassMask & (1u << (cls - 1))))
+                        continue;
+                    for (uint8 race = 1; race < 40; ++race)
+                        if (sDB2Manager.GetSkillRaceClassInfo(itr->second->SkillLine, race, cls))
+                        {
+                            spellMask |= 1u << (cls - 1);
+                            break;
+                        }
+                }
+            }
+            mask |= spellMask;   // a spell without a class skill line says nothing
+        }
+        _classMask = mask ? mask : allClasses;
+        return _classMask;
+    }
+
+    uint32 Trainer::TeachAvailableSpellsFree(Player* player, FreeTeachTally* tally) const
+    {
+        uint32 learned = 0;
+        if (!(GetClassMask() & player->GetClassMask()))
+            return 0;
+        for (Spell const& trainerSpell : _spells)
+        {
+            if (tally)
+                ++tally->spells;
+            if (trainerSpell.ReqSkillLine)
+            {
+                if (tally) ++tally->skill_line;
+                continue;
+            }
+            if (BattlePets::BattlePetMgr::GetBattlePetSpeciesBySpell(trainerSpell.SpellId))
+            {
+                if (tally) ++tally->battle_pet;
+                continue;
+            }
+            if (!CanTeachSpell(player, &trainerSpell))
+            {
+                if (tally)
+                {
+                    // The same order as GetSpellState.
+                    if (player->HasSpell(trainerSpell.SpellId))                              ++tally->known;
+                    else if (!player->IsSpellFitByClassAndRace(trainerSpell.SpellId))        ++tally->class_race;
+                    else if (std::any_of(trainerSpell.ReqAbility.begin(), trainerSpell.ReqAbility.end(),
+                                [player](int32 req) { return req && !player->HasSpell(req); })) ++tally->ability;
+                    else if (player->GetLevel() < trainerSpell.ReqLevel)                      ++tally->level;
+                    else if (GetSpellState(player, &trainerSpell) == SpellState::Known)       ++tally->known;
+                    else                                                                      ++tally->other;
+                }
+                continue;
+            }
+            if (tally)
+                ++tally->taught;
+
+            TC_LOG_DEBUG("playerbot.api", "[levelup] {} learns trainer spell {} (trainer {}, class mask {:#x})",
+                player->GetName(), trainerSpell.SpellId, _id, GetClassMask());
+            if (trainerSpell.IsCastable())
+                player->CastSpell(player, trainerSpell.SpellId, true);
+            else
+                player->LearnSpell(trainerSpell.SpellId, false);
+            ++learned;
+        }
+        return learned;
     }
 
     Spell const* Trainer::GetSpell(uint32 spellId) const

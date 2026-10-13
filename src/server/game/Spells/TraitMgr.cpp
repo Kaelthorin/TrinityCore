@@ -1065,6 +1065,47 @@ std::vector<TraitDefinitionEffectPointsEntry const*> const* GetTraitDefinitionEf
     return Trinity::Containers::MapGetValuePtr(_traitDefinitionEffectPointModifiers, traitDefinitionId);
 }
 
+std::vector<NodeEntryInfo> GetNodeEntriesForConfig(WorldPackets::Traits::TraitConfig const& traitConfig)
+{
+    std::vector<NodeEntryInfo> result;
+    std::vector<Tree const*> const* trees = GetTreesForConfig(traitConfig);
+    if (!trees)
+        return result;
+
+    for (Tree const* tree : *trees)
+        for (Node const* node : tree->Nodes)
+            for (NodeEntry const& entry : node->Entries)
+                result.push_back({ .TraitNodeID = int32(node->Data->ID), .TraitNodeEntryID = int32(entry.Data->ID),
+                    .MaxRanks = entry.Data->MaxRanks, .TraitDefinitionID = entry.Data->TraitDefinitionID });
+
+    return result;
+}
+
+std::vector<int32> GetCostCurrenciesForNode(int32 traitNodeId)
+{
+    std::vector<int32> currencies;
+    Node const* node = Trinity::Containers::MapGetValuePtr(_traitNodes, traitNodeId);
+    if (!node)
+        return currencies;
+
+    auto add = [&](std::vector<TraitCostEntry const*> const& costs)
+    {
+        for (TraitCostEntry const* cost : costs)
+            currencies.push_back(cost->TraitCurrencyID);
+    };
+    for (NodeGroup const* group : node->Groups)
+        add(group->Costs);
+    for (NodeEntry const& entry : node->Entries)
+        add(entry.Costs);
+    add(node->Costs);
+    if (Tree const* tree = Trinity::Containers::MapGetValuePtr(_traitTrees, node->Data->TraitTreeID))
+        add(tree->Costs);
+
+    std::ranges::sort(currencies);
+    currencies.erase(std::ranges::unique(currencies).begin(), currencies.end());
+    return currencies;
+}
+
 void InitializeStarterBuildTraitConfig(WorldPackets::Traits::TraitConfig& traitConfig, PlayerDataAccessor player)
 {
     traitConfig.Entries.clear();

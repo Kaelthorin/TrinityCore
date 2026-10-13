@@ -57,6 +57,9 @@
 
 using namespace Trinity::ChatCommands;
 
+// PlayerbotV2 companion summon (cs_playerbot_v2.cpp): true when `.summon all` / `.summon <companion>` was handled as `.bot call`.
+bool PlayerbotV2TrySummon(ChatHandler* handler, char const* args);
+
 class misc_commandscript : public CommandScript
 {
 public:
@@ -475,6 +478,9 @@ public:
     // Summon Player
     static bool HandleSummonCommand(ChatHandler* handler, char const* args)
     {
+        // `.summon all` / `.summon <companion>` bring the caller's PlayerbotV2 companions (same as `.bot call`); other names are the GM summon.
+        if (PlayerbotV2TrySummon(handler, args))
+            return true;
         Player* target;
         ObjectGuid targetGuid;
         std::string targetName;
@@ -658,6 +664,12 @@ public:
         ObjectGuid targetGuid;
         if (!handler->extractPlayerTarget((char*)args, &target, &targetGuid))
             return false;
+
+        // A dead GM typing a bare `.revive` means himself: with a living player selected (a raid bot clicked on) the command would
+        // revive that player and do nothing for the caller (Karrz, MC 2026-10-08: ".revive does nothing" while dead).
+        if (target && (!args || !*args) && handler->GetSession())
+            if (Player* self = handler->GetSession()->GetPlayer(); self && !self->IsAlive() && target != self && target->IsAlive())
+                target = self;
 
         if (target)
         {

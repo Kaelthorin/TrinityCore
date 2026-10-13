@@ -27,6 +27,7 @@
 #include "GroupReference.h"
 #include "Hash.h"
 #include "ItemDefines.h"
+#include "IteratorPair.h"
 #include "ItemEnchantmentMgr.h"
 #include "MapReference.h"
 #include "PetDefines.h"
@@ -63,6 +64,7 @@ struct MapEntry;
 struct PvpTalentEntry;
 struct QuestPackageItemEntry;
 struct RewardPackEntry;
+struct SkillLineEntry;
 struct SkillRaceClassInfoEntry;
 struct SpellCastRequest;
 struct TalentEntry;
@@ -1339,6 +1341,12 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void SetCommandStatusOn(uint32 command) { _activeCheats |= command; }
         void SetCommandStatusOff(uint32 command) { _activeCheats &= ~command; }
 
+        // PlayerbotV2 pacing: aura-free multiplier on this bot's cast times and GCD
+        // (1.0 = none, <1 faster). Set on the world thread, read by map threads.
+        // See WorldObject::ModSpellCastTime and Spell::TriggerGlobalCooldown.
+        float GetBotCastSpeedMod() const { return _botCastSpeedMod.load(std::memory_order_relaxed); }
+        void SetBotCastSpeedMod(float mod) { _botCastSpeedMod.store(mod, std::memory_order_relaxed); }
+
         // Played Time Stuff
         time_t m_logintime;
         time_t m_Last_tick;
@@ -1540,6 +1548,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void SetBackpackSellJunkDisabled(bool disabled) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::BackpackSellJunkDisabled), disabled); }
         bool IsBankAutoSortDisabled() const { return m_activePlayerData->BankAutoSortDisabled; }
         void SetBankAutoSortDisabled(bool disabled) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::BankAutoSortDisabled), disabled); }
+        bool IsSortBagsRightToLeft() const { return m_activePlayerData->SortBagsRightToLeft; }
+        void SetSortBagsRightToLeft(bool enabled) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::SortBagsRightToLeft), enabled); }
+        bool IsInsertItemsLeftToRight() const { return m_activePlayerData->InsertItemsLeftToRight; }
+        void SetInsertItemsLeftToRight(bool enabled) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::InsertItemsLeftToRight), enabled); }
         EnumFlag<BagSlotFlags> GetBagSlotFlags(uint32 bagIndex) const { return static_cast<BagSlotFlags>(m_activePlayerData->BagSlotFlags[bagIndex]); }
         void SetBagSlotFlag(uint32 bagIndex, EnumFlag<BagSlotFlags> flags) { SetUpdateFieldFlagValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::BagSlotFlags, bagIndex), flags.AsUnderlyingType()); }
         void RemoveBagSlotFlag(uint32 bagIndex, EnumFlag<BagSlotFlags> flags) { RemoveUpdateFieldFlagValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::BagSlotFlags, bagIndex), flags.AsUnderlyingType()); }
@@ -1668,6 +1680,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Player* GetTrader() const;
         TradeData* GetTradeData() const { return m_trade; }
         void TradeCancel(bool sendback, TradeStatus status = TRADE_STATUS_CANCELLED);
+        // Closes a trade that can no longer finish: the partner is gone, left the map or walked out of range, or the two sides
+        // disagree about being in it. Called every Update, free when no trade is open.
+        void UpdateTradeState();
+        void InitiateTrade(Player* trader); // PlayerBot integration: minimal core hook
 
         CinematicMgr* GetCinematicMgr() const { return _cinematicMgr.get(); }
 
@@ -1972,6 +1988,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void SendRemoveControlBar() const;
         bool HasSpell(uint32 spell) const override;
         bool HasActiveSpell(uint32 spell) const;            // show in spellbook
+        uint32 ResolveSupersededRank(uint32 spellId) const;  // Classic 1.60: the active higher rank of a known but superseded rank, else spellId
         SpellInfo const* GetCastSpellInfo(SpellInfo const* spellInfo, TriggerCastFlags& triggerFlag, GetCastSpellInfoContext* context) const override;
         bool IsSpellFitByClassAndRace(uint32 spell_id) const;
         bool HandlePassiveSpellLearn(SpellInfo const* spellInfo);
@@ -2230,6 +2247,12 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void UpdateMaxHealth() override;
         void UpdateMaxPower(Powers power) override;
         uint32 GetPowerIndex(Powers power) const override;
+
+        // Vanilla combo points: they belong to one unit, which the Classic client reads as the owner-only ComboTarget
+        ObjectGuid GetComboTarget() const { return *m_unitData->ClassicComboTarget; }
+        void SetComboTarget(ObjectGuid const& guid);
+        void GainComboPointsOn(Unit const* victim);
+        void UpdateComboTarget();
         ClassPowerTypes GetPowerTypes() const override;
         void UpdateAttackPowerAndDamage(bool ranged = false) override;
         void ApplySpellPowerBonus(int32 amount, bool apply);
@@ -2301,6 +2324,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         LootRoll* GetLootRoll(ObjectGuid const& lootObjectGuid, uint8 lootListId);
         void AddLootRoll(LootRoll* roll);
         void RemoveLootRoll(LootRoll* roll);
+        // Read-only access to in-flight loot rolls. Lets external systems
+        // (Playerbot V2) enumerate pending rolls without going through
+        // the per-roll GetLootRoll lookup.
+        std::vector<LootRoll*> const& GetLootRolls() const { return m_lootRolls; }
 
         void RemovedInsignia(Player* looterPlr);
 
@@ -2385,6 +2412,13 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Optional<WorldLocation> m_deathRecapReturn;
         void BuildPlayerRepop();
         void RepopAtGraveyard();
+        // A graveyard row whose Z lies under the terrain (retail world_safe_locs rows against Classic terrain) drops the ghost out of the
+        // world. Raises loc to the floor when it is buried (no static surface near it); returns true when it moved the point.
+        bool SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId) const;
+        // Set by RepopAtGraveyard for its teleport, consumed by the worldport ack (the destination map is only known there for far teleports)
+        void SetGraveyardTeleportId(uint32 id) { m_graveyardTeleportId = id; }
+        uint32 ConsumeGraveyardTeleportId() { uint32 id = m_graveyardTeleportId; m_graveyardTeleportId = 0; return id; }
+        uint32 m_graveyardTeleportId = 0;
 
         void DurabilityLossAll(double percent, bool inventory);
         void DurabilityLoss(Item* item, double percent);
@@ -3133,6 +3167,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // Gamemaster whisper whitelist
         GuidList WhisperList;
         TimePoint m_regenInterruptTimestamp;
+        TimePoint m_manaSpentTimestamp;                     // Classic 1.60: the five second rule starts when mana is paid, nothing else
         uint32 m_regenTimerCount;
         float m_healthFraction;
         std::array<float, MAX_POWERS_PER_CLASS> m_powerFraction;
@@ -3286,6 +3321,8 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         bool m_itemUpdateQueueBlocked;
 
         uint32 m_ExtraFlags;
+
+        std::atomic<float> _botCastSpeedMod{ 1.0f };
 
         QuestStatusMap m_QuestStatus;
         QuestObjectiveStatusMap m_questObjectiveStatus;

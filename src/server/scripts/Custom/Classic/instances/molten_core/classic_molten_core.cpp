@@ -25,6 +25,7 @@
 #include "ScriptedCreature.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "World.h"
 #include "classic_molten_core.h"
 #include "classic_script_text.h"
 #include <list>
@@ -304,6 +305,10 @@ struct classic_mob_core_hound : public ScriptedAI
     void DamageTaken(Unit* /*attacker*/, uint32& damage, DamageEffectType /*damageType*/, SpellInfo const* /*spellInfo*/) override
     {
         if (m_bAllowDeath)
+            return;
+
+        // Instance.MoltenCoreHoundsLinked = 0 (default): the hound just dies, a pack can be killed one by one
+        if (!sWorld->getBoolConfig(CONFIG_MC_CORE_HOUNDS_LINKED))
             return;
 
         if (damage >= me->GetHealth())

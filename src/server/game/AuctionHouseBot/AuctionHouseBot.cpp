@@ -16,6 +16,7 @@
  */
 
 #include "AuctionHouseBot.h"
+#include "AuctionHouseBotSellers.h"
 #include "AuctionHouseBotBuyer.h"
 #include "AuctionHouseBotSeller.h"
 #include "Config.h"
@@ -77,6 +78,8 @@ bool AuctionBotConfig::Initialize()
 
     if (uint32 ahBotAccId = GetConfig(CONFIG_AHBOT_ACCOUNT_ID))
     {
+        AuctionBotSellers::EnsureCharacters(ahBotAccId);
+
         // find account guids associated with ahbot account
         CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARS_BY_ACCOUNT_ID);
         stmt->setUInt32(0, ahBotAccId);

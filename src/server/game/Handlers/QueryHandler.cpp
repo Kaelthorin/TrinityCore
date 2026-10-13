@@ -27,6 +27,7 @@
 #include "Map.h"
 #include "NPCHandler.h"
 #include "ObjectAccessor.h"
+#include "Config.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "QueryPackets.h"
@@ -46,6 +47,15 @@ void WorldSession::BuildNameQueryData(ObjectGuid guid, WorldPackets::Query::Name
         lookupData.Result = RESPONSE_SUCCESS; // name known
     else
         lookupData.Result = RESPONSE_FAILURE; // name unknown
+
+    // Playerbot.Behavior.BotWhisperable: log what a name query reports for a bot (compare with the same line for a real
+    // player's name) - bnet id, wow account, virtual realm address and guid are what the client's whisper entry keys on.
+    static bool const logBotNameQuery = sConfigMgr->GetBoolDefault("Playerbot.Behavior.BotWhisperable", true);
+    if (logBotNameQuery && player && player->GetSession() && player->GetSession()->IsBot())
+        TC_LOG_INFO("playerbot.v2", "[namequery] bot {} guid={} result={} bnet={} wowacct={} realm={} native_bnet_session={}",
+            player->GetName(), guid.ToString(), uint32(lookupData.Result),
+            lookupData.Data->BnetAccountID.ToString(), lookupData.Data->AccountID.ToString(),
+            lookupData.Data->VirtualRealmAddress, player->GetSession()->GetBattlenetAccountId());
 }
 
 void WorldSession::HandleQueryPlayerNames(WorldPackets::Query::QueryPlayerNames& queryPlayerNames)

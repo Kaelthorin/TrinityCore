@@ -51,6 +51,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include <G3D/g3dmath.h>
+#include <atomic>
 #include <numeric>
 
 class Aura;
@@ -2819,6 +2820,33 @@ void AuraEffect::HandleAuraMounted(AuraApplication const* aurApp, uint8 mode, bo
                 for (SpellEffectInfo const& effect : GetSpellInfo()->GetEffects())
                     if (effect.IsEffect(SPELL_EFFECT_SUMMON) && effect.MiscValue == GetMiscValue())
                         displayId = 0;
+            }
+
+            // Diagnostic (2026-10-09, a mounted WSG bot looked unmounted on the 70291 client): where the mount display came from. Players only,
+            // capped; remove once the cause is fixed.
+            if (target->GetTypeId() == TYPEID_PLAYER)
+            {
+                static std::atomic<uint32> s_mountLines{ 0 };
+                if (s_mountLines.fetch_add(1, std::memory_order_relaxed) < 300)
+                {
+                    MountEntry const* diagMount = sDB2Manager.GetMount(GetId());
+                    DB2Manager::MountXDisplayContainer const* diagDisplays = diagMount ? sDB2Manager.GetMountDisplays(diagMount->ID) : nullptr;
+                    CreatureTemplate const* diagTemplate = sObjectMgr->GetCreatureTemplate(creatureEntry);
+                    TC_LOG_ERROR("entities.unit", "[mount] {} spell {} creature entry {} (template {}, models {}) mount record {} displays {} -> display {} vehicle {}; "
+                        "scale {} displayScale {} nativeDisplayScale {} boundingRadius {}",
+                        target->GetName(), GetId(), creatureEntry, diagTemplate != nullptr, diagTemplate ? diagTemplate->Models.size() : 0,
+                        diagMount ? int32(diagMount->ID) : -1, diagDisplays ? diagDisplays->size() : 0, displayId, vehicleId,
+                        target->GetObjectScale(), target->GetDisplayScale(), target->GetNativeDisplayScale(), target->GetBoundingRadius());
+
+                    // the server's own copy of the 70291 client data for that display: compare the model file with the client's "Model FileData ... scale: 0"
+                    CreatureDisplayInfoEntry const* diagInfo = sCreatureDisplayInfoStore.LookupEntry(displayId);
+                    CreatureModelDataEntry const* diagModel = diagInfo ? sCreatureModelDataStore.LookupEntry(diagInfo->ModelID) : nullptr;
+                    TC_LOG_ERROR("entities.unit", "[mount] display {}: CreatureDisplayInfo {} (modelId {}, creatureModelScale {}, playerOverrideScale {}, petInstanceScale {}, extended {}) "
+                        "CreatureModelData {} (fileDataId {}, flags 0x{:X})",
+                        displayId, diagInfo != nullptr, diagInfo ? diagInfo->ModelID : 0, diagInfo ? diagInfo->CreatureModelScale : 0.0f,
+                        diagInfo ? diagInfo->PlayerOverrideScale : 0.0f, diagInfo ? diagInfo->PetInstanceScale : 0.0f, diagInfo ? diagInfo->ExtendedDisplayInfoID : 0,
+                        diagModel != nullptr, diagModel ? diagModel->FileDataID : 0, diagModel ? uint32(diagModel->Flags) : 0);
+                }
             }
 
             target->Mount(displayId, vehicleId, creatureEntry);

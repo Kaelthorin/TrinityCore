@@ -55,6 +55,13 @@ std::unordered_map<uint32, uint32> const ServerOpcodes =
     { SMSG_QUERY_GUILD_FOLLOW_INFO_RESPONSE, 0x52002E },  // retail index - 1 (70058 guild switch reader)
 };
 
+// explicit core opcode -> Classic 70291 client opcode table, generated from the client's own message dispatch by
+// tools/protocol/jamre (see tools/protocol/README.md). Entries here win over the arithmetic translation below.
+std::unordered_map<uint32, uint32> const ServerOpcodes70291 =
+{
+#include "ClassicServerOpcodes70291.inc"
+};
+
 // sent with the shifted number these hit a different Classic message (client JamClient size asserts)
 std::unordered_set<uint32> const BlockedServerOpcodes =
 {
@@ -81,6 +88,8 @@ constexpr uint32 FirstRetailServerGroup = 0x45;
 constexpr uint32 LastRetailServerGroup = 0x6A;
 constexpr uint32 ChatRetailServerGroup = 0x4A;
 constexpr uint32 GuildRetailServerGroup = 0x51;
+// 70291 inserted one message into the main server group at this 70245 index (verified in the client binary)
+constexpr uint32 Main70291InsertIndex = 0x98;
 
 // Client 1.60.1.70291 (2026-10-09), the tables above stay in 70245 numbers:
 //  - client: only the connection group moved (CMSG_LOG_DISCONNECT 0x450007 -> 0x460007), CMSG_ENUM_CHARACTERS stayed 0x440014
@@ -88,15 +97,13 @@ constexpr uint32 GuildRetailServerGroup = 0x51;
 //    AUTH_RESPONSE and never asks for the characters), and the main group got one more message: the official 70291 sniff has
 //    70245 index 0x92 (BATTLE_PET_JOURNAL) unchanged and 0xAD (START_ELAPSED_TIMERS) at 0xAE, SET_TIME_ZONE_INFORMATION 0x124,
 //    ACCOUNT_DATA_TIMES 0x1B6, SERVER_TIME_OFFSET 0x1C0, TUTORIAL_FLAGS 0x269, MIRROR_VARS 0x372, BATTLENET_RESPONSE 0x2B0;
-//    the exact index between 0x93 and 0xAD is not known yet (party / ready check / pet battle messages)
-// Classic.OpcodeGroupShift: -1 (default) = from the realm's game build (realmlist.gamebuild >= 70291 -> 1), or 0 / 1.
+//    the inserted message is index 0x98 (one u8; verified in the client binary, see doc/classic-70291-protocol.md): PARTY_UPDATE stays at
+//    0x97 (the class at that index reports id 0x470097 and reads the party layout), UPDATE_RECENT_PLAYER_GUIDS moves to 0x99
+// The only switch between the two numbering families is the realm's game build (realmlist.gamebuild >= 70291 -> 1).
 static uint32 ExtraGroupShift()
 {
     static uint32 const shift = []() -> uint32
     {
-        int32 configured = sConfigMgr->GetIntDefault("Classic.OpcodeGroupShift", -1);
-        if (configured >= 0)
-            return uint32(configured);
         std::shared_ptr<Realm const> realm = sRealmList->GetCurrentRealm();
         return realm && realm->Build >= 70291 ? 1 : 0;
     }();
@@ -126,19 +133,36 @@ uint32 ClassicOpcodes::TranslateClientOpcode(uint32 classicOpcode)
     return TranslateClientOpcode70245(classicOpcode);
 }
 
+ClassicOpcodes::Build ClassicOpcodes::CurrentBuild()
+{
+    return ExtraGroupShift() != 0 ? Build::Build70291 : Build::Build70245;
+}
+
+bool ClassicOpcodes::HasExplicitServerOpcode(Build build, uint32 coreOpcode)
+{
+    return build == Build::Build70291 && ServerOpcodes70291.contains(coreOpcode);
+}
+
 uint32 ClassicOpcodes::TranslateServerOpcode(uint32 coreOpcode)
 {
+    return TranslateServerOpcode(CurrentBuild(), coreOpcode);
+}
+
+uint32 ClassicOpcodes::TranslateServerOpcode(Build build, uint32 coreOpcode)
+{
+    if (build != Build::Build70291)
+        return TranslateServerOpcode70245(coreOpcode);
+
+    if (auto itr = ServerOpcodes70291.find(coreOpcode); itr != ServerOpcodes70291.end())
+        return itr->second;
+
+    // fallback until the generated table covers every opcode: the 70245 numbering plus the group shift and the inserted message (index 0x98, verified in the client)
     uint32 classicOpcode = TranslateServerOpcode70245(coreOpcode);
-    if (uint32 shift = ExtraGroupShift())
-    {
-        uint32 group = OpcodeGroup(classicOpcode);
-        // Classic.MainGroupInsertIndex = the first 70245 main-group index that moved (0x93..0xAD, see above)
-        static uint32 const insertIndex = uint32(sConfigMgr->GetIntDefault("Classic.MainGroupInsertIndex", 0x93));
-        if (group == FirstRetailServerGroup + 1 && (classicOpcode & 0xFFFF) >= insertIndex)
-            ++classicOpcode;
-        if (group >= FirstRetailServerGroup + 1 && group <= LastRetailServerGroup + 1)
-            classicOpcode = WithOpcodeGroup(classicOpcode, group + shift);
-    }
+    uint32 group = OpcodeGroup(classicOpcode);
+    if (group == FirstRetailServerGroup + 1 && (classicOpcode & 0xFFFF) >= Main70291InsertIndex)
+        ++classicOpcode;
+    if (group >= FirstRetailServerGroup + 1 && group <= LastRetailServerGroup + 1)
+        classicOpcode = WithOpcodeGroup(classicOpcode, group + 1);
     return classicOpcode;
 }
 

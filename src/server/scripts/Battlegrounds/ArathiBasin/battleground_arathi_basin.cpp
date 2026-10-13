@@ -25,6 +25,7 @@
 #include "GameTime.h"
 #include "Log.h"
 #include "Map.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 
@@ -716,6 +717,29 @@ namespace ClassicArathiBasin
     static constexpr std::array<int32, 5> StateWorldStateOffset = { 0, 2, 3, 0, 1 };
 }
 
+namespace
+{
+// Removes the spawns of a spawn group for the rest of the match WITHOUT deactivating the group. A deactivated group with no conditions is
+// switched on again by Map::UpdateSpawnGroupConditions every respawn check (Map::Update, and each capture point / GO event), which is why
+// SpawnGroupDespawn brought the AB ghost gates back within seconds. Each spawn that is alive is deleted with a respawn time of one day.
+size_t RemoveGroupSpawnsForMatch(Map* map, uint32 groupId)
+{
+    size_t removed = 0;
+    for (auto const& pair : sObjectMgr->GetSpawnMetadataForGroup(groupId))
+    {
+        SpawnMetadata const* data = pair.second;
+        if (data->type != SPAWN_TYPE_GAMEOBJECT)
+            continue;
+        if (GameObject* go = map->GetGameObjectBySpawnId(data->spawnId))
+        {
+            go->DespawnOrUnsummon(0ms, 24h);
+            ++removed;
+        }
+    }
+    return removed;
+}
+}
+
 struct battleground_classic_arathi_basin : BattlegroundScript
 {
     explicit battleground_classic_arathi_basin(BattlegroundMap* map) : BattlegroundScript(map)
@@ -749,9 +773,16 @@ struct battleground_classic_arathi_basin : BattlegroundScript
     {
         for (ObjectGuid const& guid : _doors)
             if (GameObject* door = battlegroundMap->GetGameObject(guid))
+            {
                 door->UseDoorOrButton();
+                TC_LOG_INFO("bg.battleground", "Classic AB start: door {} (type {}, display {}) at ({:.0f},{:.0f},{:.0f}) opened, state {}, auto close {}s", door->GetEntry(),
+                    uint32(door->GetGoType()), door->GetDisplayId(), door->GetPositionX(), door->GetPositionY(), door->GetPositionZ(), uint32(door->GetGoState()),
+                    door->GetGOInfo()->GetAutoCloseTime() / IN_MILLISECONDS);
+                door->DespawnOrUnsummon(3s);   // gone for a player who joins the running match later (an open door could close again for him)
+            }
 
-        battlegroundMap->SpawnGroupDespawn(ClassicArathiBasin::SPAWN_GROUP_GHOST_GATES);
+        size_t const ghostGates = RemoveGroupSpawnsForMatch(battlegroundMap, ClassicArathiBasin::SPAWN_GROUP_GHOST_GATES);
+        TC_LOG_INFO("bg.battleground", "Classic AB start: {} doors opened, {} ghost gates despawned", _doors.size(), ghostGates);
     }
 
     void OnGameObjectCreate(GameObject* gameObject) override
@@ -772,6 +803,16 @@ struct battleground_classic_arathi_basin : BattlegroundScript
         using namespace ClassicArathiBasin;
         if (battleground->GetStatus() != STATUS_IN_PROGRESS)
             return;
+
+        // Safety net only: the gates are removed with a one-day respawn at the start; if one is ever alive again it is removed and logged.
+        _ghostGateCheckMs += diff;
+        if (_ghostGateCheckMs >= 5000)
+        {
+            _ghostGateCheckMs = 0;
+            size_t const back = RemoveGroupSpawnsForMatch(battlegroundMap, SPAWN_GROUP_GHOST_GATES);
+            if (back)
+                TC_LOG_INFO("bg.battleground", "Classic AB: {} ghost gate(s) were back after the start and were despawned again", back);
+        }
 
         std::array<uint8, PVP_TEAMS_COUNT> occupied = { 0, 0 };
         for (uint8 node = 0; node < NodesCount; ++node)
@@ -959,7 +1000,12 @@ private:
         uint32 const groupBase = SPAWN_GROUP_NODE_BASE + node * 10;
 
         // banners (VMaNGOS battleground_events node / status)
-        battlegroundMap->SpawnGroupDespawn(groupBase + old);
+        // the neutral banner's group is not a manual one: SpawnGroupDespawn would be undone by the map's condition update (the neutral banner
+        // came back beside the contested one: two clickable banners at one pole)
+        if (old == NODE_NEUTRAL)
+            RemoveGroupSpawnsForMatch(battlegroundMap, groupBase + old);
+        else
+            battlegroundMap->SpawnGroupDespawn(groupBase + old);
         if (old == NODE_ALLIANCE_CONTESTED || old == NODE_HORDE_CONTESTED)
             battlegroundMap->SpawnGroupDespawn(groupBase + SPAWN_GROUP_CONTESTED_AURA);
         if (node == NODE_FARM && (old == NODE_ALLIANCE_OCCUPIED || old == NODE_HORDE_OCCUPIED))
@@ -973,6 +1019,7 @@ private:
 
         _prevNodes[node] = old;
         _nodes[node] = status;
+        TC_LOG_INFO("bg.battleground", "Classic AB node {} status {} -> {}", node, uint32(old), uint32(status));
 
         // map icons (graveyard conditions use the occupied states too)
         NodeInfo const& info = NodeData[node];
@@ -1033,6 +1080,7 @@ private:
     static constexpr uint32 PVP_STAT_BASES_ASSAULTED = 926;
     static constexpr uint32 PVP_STAT_BASES_DEFENDED = 927;
 
+    uint32 _ghostGateCheckMs = 0;
     std::array<uint8, ClassicArathiBasin::NodesCount> _nodes = { };
     std::array<uint8, ClassicArathiBasin::NodesCount> _prevNodes = { };
     std::array<Milliseconds, ClassicArathiBasin::NodesCount> _nodeTimers = { { 0ms, 0ms, 0ms, 0ms, 0ms } };

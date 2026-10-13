@@ -424,6 +424,113 @@ DisconnectToleranceInterval = 0
 mmap.enablePathFinding = 1
 
 #
+#    Pathfinding.PreferRoads
+#        Description: Road-aware pathfinding. When enabled, Detour's
+#                     query filter biases shortest-path search toward
+#                     polygons tagged NAV_AREA_ROAD by the mmaps
+#                     generator. Requires mmaps regenerated with the
+#                     road-aware mapextractor + mmaps_generator binaries
+#                     (writes parallel <map>_<y>_<x>.road files alongside
+#                     each <map>_<y>_<x>.map). Polygons without a road
+#                     tag are unaffected — old extracted mmaps without
+#                     .road files behave identically to before.
+#                     See src/modules/PlayerbotV2/docs/ROAD_AWARE_PATHFINDING_PLAN.md.
+#        Default:     0 - (Disabled, neutral cost for road polygons)
+#                     1 - (Enabled, road polygons cost less to traverse)
+
+Pathfinding.PreferRoads = 0
+
+#
+#    Pathfinding.RoadCost
+#        Description: Per-polygon traversal cost for road-tagged
+#                     polygons when Pathfinding.PreferRoads is enabled.
+#                     Default 0.5 means roads cost half as much as
+#                     plain ground — Detour will prefer routes that
+#                     stay on roads even when they're geometrically
+#                     longer (up to 2x). Lower = stronger preference;
+#                     1.0 = neutral; values above 1.0 actively avoid
+#                     roads (unusual).
+#        Default:     0.5
+
+Pathfinding.RoadCost = 0.5
+
+#
+#    Pathfinding.RoadCostMounted
+#        Description: Road cost when the unit is mounted. Mounted bots
+#                     benefit more from roads (mount speed applies
+#                     cleanly, no terrain skidding) so we offer a
+#                     tighter cost than the on-foot RoadCost. Only
+#                     active when PreferRoads = 1.
+#        Default:     0.35
+#
+
+Pathfinding.RoadCostMounted = 0.35
+
+#
+#    Pathfinding.SlopeCoefficient
+#        Description: Road-aware pathfinding Phase 3 — slope-aware cost
+#                     modifier. Each path segment's cost is multiplied by
+#                     `1.0 + slopeAngleDegrees * SlopeCoefficient / 100`
+#                     (clamped to 2.0). At default 1.0: 30° slope costs
+#                     1.3×, 60° costs 1.6×. The slope term tempers raw
+#                     road preference so bots don't switchback up a
+#                     mountain just because there's a road on it.
+#                     Set to 0.0 to disable the slope penalty entirely.
+#                     The dtQueryFilterTC subclass implements this; see
+#                     src/server/game/Movement/dtQueryFilterTC.cpp.
+#        Default:     1.0
+
+Pathfinding.SlopeCoefficient = 1.0
+
+###################################################################################################
+# Handcrafted road segments
+#
+#    HandcraftedRoads.Enable
+#        Description: Apply operator-curated road segments from the handcrafted_road table
+#                     to each map's navmesh at load time.  Tagged polys get the road-bias in
+#                     PathGenerator (slope-aware road bonus). Set to 0 to disable for debugging.
+#        Default:     1
+###################################################################################################
+HandcraftedRoads.Enable = 1
+
+###################################################################################################
+# Handcrafted road centerline routing (bots)
+#
+#    RoadGraph.Enable
+#        Description: Build a routable centerline graph from the handcrafted_road table and have
+#                     bots FOLLOW the authored road polylines for long ground trips (via a waypoint
+#                     spline) instead of only getting the NAV_AREA_ROAD area-cost nudge. The
+#                     area-cost bias (HandcraftedRoads.Enable above) remains the fallback.
+#        Default:     1 (enabled)
+#
+#    RoadGraph.MinDistance
+#        Description: Minimum straight-line distance (yards) before road routing is considered.
+#                     Shorter hops use direct navmesh movement.
+#        Default:     150.0
+#
+#    RoadGraph.MaxDetourRatio
+#        Description: Max allowed ratio of (entry + road + exit) length to the direct distance.
+#                     A road route longer than this is rejected in favour of the direct path.
+#        Default:     1.6
+#
+#    RoadGraph.MaxEntryDistance
+#        Description: Max distance (yards) a bot will treat a road node as a viable on/off ramp.
+#                     If no road node is within this range of the start or destination, the bot
+#                     uses direct movement.
+#        Default:     120.0
+#
+#    RoadGraph.NodeMergeEpsilon
+#        Description: Authored segment endpoints within this distance (yards) collapse into one
+#                     shared junction node when building the graph.
+#        Default:     3.0
+###################################################################################################
+RoadGraph.Enable = 1
+RoadGraph.MinDistance = 150.0
+RoadGraph.MaxDetourRatio = 1.6
+RoadGraph.MaxEntryDistance = 120.0
+RoadGraph.NodeMergeEpsilon = 3.0
+
+#
 #    vmap.enableLOS
 #    vmap.enableHeight
 #        Description: Vmap support for line of sight and height calculation.
@@ -1074,6 +1181,82 @@ Instance.IgnoreLevel = 0
 #                     1 - (Enabled)
 
 Instance.IgnoreRaid = 0
+
+#
+#    Instance.BindOnEntry
+#        Description: Save a raid lockout (instance id, boss states) for every real player the moment
+#                     they enter a raid with a reset schedule, instead of waiting for the first boss
+#                     kill. Players who are game masters or bots are never bound by this.
+#                     The instance, its boss states and (with Instance.PersistRaidTrash) its dead
+#                     creatures then survive logout, instance unload and server restarts until the
+#                     normal lockout reset.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+Instance.BindOnEntry = 0
+
+#
+#    Instance.PersistRaidTrash
+#        Description: Keep creatures killed inside a locked raid dead until the lockout resets
+#                     (their respawn time is stored in the characters.respawn table). Without this
+#                     all trash returns whenever the instance map is unloaded or the server restarts.
+#                     Only applies to raid instances that carry a lockout.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+Instance.PersistRaidTrash = 0
+
+#
+#    Instance.IgnoreAttunement
+#        Description: Optional server-owner option. The attunement item and quest of an instance
+#                     (access_requirement item / quest columns: Molten Core, Onyxia, Blackwing Lair,
+#                     Naxxramas ...) are not required to enter. Level limits are Instance.IgnoreLevel.
+#        Default:     0 - (Disabled, Blizzlike)
+#                     1 - (Enabled)
+
+Instance.IgnoreAttunement = 0
+
+#
+#    Instance.AhnQirajGatesOpen
+#        Description: Optional server-owner option. The Gate of Ahn'Qiraj (door plug 176146 and gate
+#                     176149) stands open, so neither the war effort nor ringing the Scarab Gong is
+#                     needed to reach the two Ahn'Qiraj instances.
+#        Default:     0 - (Disabled, Blizzlike)
+#                     1 - (Enabled)
+
+Instance.AhnQirajGatesOpen = 0
+
+#
+#    Instance.MoltenCoreHoundsLinked
+#        Description: Molten Core Core Hounds as in 1.12: a hound that would die feigns death at 1 hp
+#                     and rises again at full health after 10 seconds unless every hound of the pack
+#                     dies within that time. Disabled: every hound simply dies when its health runs
+#                     out and stays dead, so a pack can be killed one by one.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+Instance.MoltenCoreHoundsLinked = 0
+
+#
+#    Instance.MoltenCoreSkipRunes
+#        Description: The Molten Core bosses are all up from the start: the seven runes count as doused
+#                     (no Aqual Quintessence needed), Majordomo Executus stands in his hall, and
+#                     Ragnaros is in his lair ready to fight. A boss that is already killed in the
+#                     instance (raid lock) stays dead.
+#        Default:     0 - (Disabled, the 1.12 way: douse the runes, kill Majordomo, summon Ragnaros)
+#                     1 - (Enabled, optional shortcut for private servers)
+
+Instance.MoltenCoreSkipRunes = 0
+
+#
+#    Instance.CombatResurrectionLimit
+#        Description: Retail rule: during a raid boss encounter a resurrection spell needs a combat
+#                     resurrection charge (one charge, refilled on a timer). Classic has no such limit:
+#                     off, any resurrection works at any time, also with the boss still in combat.
+#        Default:     0 - (Disabled, the classic way)
+#                     1 - (Enabled)
+
+Instance.CombatResurrectionLimit = 0
 
 #
 #    Instance.UnloadDelay
@@ -4086,6 +4269,7 @@ BlackMarket.UpdatePeriod = 24
 #                         1 - (Console)
 #                         2 - (File)
 #                         3 - (DB)
+#                         4 - (Crash ring, in memory, see CrashRing below)
 #
 #                     LogLevel
 #                         0 - (Disabled)
@@ -4139,11 +4323,21 @@ BlackMarket.UpdatePeriod = 24
 #                         NOTE: Does not work with dynamic filenames.
 #                         Example:  536870912 (512 MB)
 #
+#                     MaxBackups: Number of rotated backups ("<file>.<timestamp>") to keep; older ones are deleted
+#                     (read as optional4 if Type = File). Leave blank to keep all. With MaxFileSize this caps the disk space.
+#                         Example:  5
+#
+#                     CrashRing (Type = 4): keeps the last N log lines in memory for the crash report (the .log file next to the
+#                     .dmp and .txt in the Crashes folder). optional1 = N (default 200, at most 1024). Link it to the loggers whose
+#                     lines should appear, as done for root, server and playerbot below.
+#
 
 Appender.Console=1,3,0
-Appender.Server=2,2,0,Server.log,w
+Appender.Server=2,2,0,Server.log,w,104857600,3
 Appender.GM=2,2,1,GM.log
 Appender.DBErrors=2,2,0,DBErrors.log,w
+Appender.Playerbot=2,3,0,Playerbot.log,w,67108864,5
+Appender.CrashRing=4,3,7,300
 
 #  Logger config values: Given a logger "name"
 #    Logger.name
@@ -4163,13 +4357,16 @@ Appender.DBErrors=2,2,0,DBErrors.log,w
 #                     (Using spaces as separator).
 #
 
-Logger.root=5,Console Server
-Logger.server=3,Console Server
+Logger.root=5,Console Server CrashRing
+Logger.server=3,Console Server CrashRing
 Logger.commands.gm=3,Console GM
 Logger.scripts.hotswap=3,Console Server
 Logger.sql.sql=5,Console DBErrors
 Logger.sql.updates=3,Console Server
 Logger.mmaps=3,Server
+# PlayerbotV2 diagnostics ([wedge], [move_lock], [path_fail] ...) go to Playerbot.log only; add Console to watch them live
+Logger.playerbot.v2=3,Playerbot CrashRing
+Logger.playerbot.api=3,Playerbot CrashRing
 
 #Logger.addon=3,Console Server
 #Logger.ahbot=3,Console Server
@@ -4478,21 +4675,14 @@ Recap.Announce = 3
 
 Classic.GuildFinder = 0
 
-#    Classic.OpcodeGroupShift
-#        Description: Client 1.60.1.70291 numbers the message groups one higher than 70245 (and changed some packet and
-#                     update field layouts). -1 picks it from the realm's game build (realmlist.gamebuild >= 70291).
-#        Default:     -1 - (From the realm build)
-#                      0 - (70245 and older)
-#                      1 - (70291 and newer)
+#    Classic.SharedEncounterLoot
+#        Description: Bosses (dungeon encounters) drop their whole loot table on one shared corpse under the group's
+#                     loot rules, like vanilla (Molten Core: 2-3 epics per boss). Off: retail personal loot, where each
+#                     table roll goes to one random player.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
 
-Classic.OpcodeGroupShift = -1
-
-#    Classic.MainGroupInsertIndex
-#        Description: Client 70291+: first 70245 index (decimal) of the main server message group that moved up by one.
-#                     The official sniff narrows it to 147..173 (0x93..0xAD: party, ready check, pet battle messages).
-#        Default:     147
-
-Classic.MainGroupInsertIndex = 147
+Classic.SharedEncounterLoot = 1
 
 #    Classic.ClientMainGroupInsertIndex
 #        Description: Client 70291+: 70291 index (decimal) of the message added to the main client group; the client messages
@@ -4501,13 +4691,16 @@ Classic.MainGroupInsertIndex = 147
 
 Classic.ClientMainGroupInsertIndex = 315
 
-#    Classic.OfficialFeatureFlags
-#        Description: Send the client feature flags exactly as the official server does (sniffs 70205/70235).
-#                     0 goes back to the older hand-picked flags.
-#        Default:     1 - (Enabled)
-#                     0 - (Disabled)
-
-Classic.OfficialFeatureFlags = 1
+#    Classic.Feature.*
+#        Description: Per-field overrides for SMSG_FEATURE_SYSTEM_STATUS, read at every
+#                     login (".reload config" and relog, no restart). Unset = the value the server chose. For bisecting which flag
+#                     makes the 70291 client lose its own /w handler (doc/whisper-feature-bisect.md).
+#        Keys (bool unless noted): VoiceEnabled, VoiceChatParentalDisabled, VoiceChatParentalMuted, SpeakForMeAllowed,
+#                     NetEaseChatTelemetryEnabled, GlobalUserGeneratedContentMuteEnabled, AccountUserGeneratedContentIsRisky,
+#                     FriendsDisabled, DoesAccountNeedAADCPrompt, IsAccountOptedInToAADC;
+#                     SocialRestriction (int, 0 = none; 2 = age verification, blocks chat).
+#        Example:     Classic.Feature.VoiceChatParentalDisabled = 0
+#
 
 #    Classic.Shop.Enabled
 #        Description: In-game Store: shop points, products from world.shop_* (.shop reload), the Gold Market, character
@@ -4554,3 +4747,6 @@ Discord.Channel.Enable = 0
 #        Default:     "Discord"
 
 Discord.Channel.Name = "Discord"
+#
+###################################################################################################
+

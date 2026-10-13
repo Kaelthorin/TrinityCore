@@ -16,6 +16,7 @@
  */
 
 #include "AuctionHouseBotSeller.h"
+#include "AuctionHouseBotVanilla.h"
 #include "AuctionHouseMgr.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
@@ -25,6 +26,7 @@
 #include "Containers.h"
 #include "ObjectMgr.h"
 #include "Random.h"
+#include <limits>
 #include <sstream>
 
 AuctionBotSeller::AuctionBotSeller()
@@ -44,6 +46,8 @@ bool AuctionBotSeller::Initialize()
     std::unordered_set<uint32> lootItems;
     std::unordered_set<uint32> includeItems;
     std::unordered_set<uint32> excludeItems;
+
+    AuctionBotVanilla::LoadConfig();
 
     TC_LOG_DEBUG("ahbot", "AHBot seller filters:");
 
@@ -93,11 +97,12 @@ bool AuctionBotSeller::Initialize()
         {
             Field* fields = result->Fetch();
 
-            uint32 entry = fields[0].GetUInt32();
-            if (!entry)
+            // Use GetUInt64 to handle databases with BIGINT item columns
+            uint64 rawEntry = fields[0].GetUInt64();
+            if (!rawEntry || rawEntry > std::numeric_limits<uint32>::max())
                 continue;
 
-            lootItems.insert(entry);
+            lootItems.insert(static_cast<uint32>(rawEntry));
         } while (result->NextRow());
     }
 
@@ -127,6 +132,10 @@ bool AuctionBotSeller::Initialize()
             ++itemsAdded;
             continue;
         }
+
+        // vanilla-era filter (AuctionHouseBot.Vanilla.Only)
+        if (!AuctionBotVanilla::IsAllowed(prototype))
+            continue;
 
         // bounding filters
         switch (prototype->GetBonding())

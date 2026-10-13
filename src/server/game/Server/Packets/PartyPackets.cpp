@@ -16,7 +16,10 @@
  */
 
 #include "PartyPackets.h"
+#include "ClassicOpcodes.h"
 #include "CharacterCache.h"
+#include "Log.h"
+#include "Playerbot/DiagProbes.h"
 #include "Group.h"
 #include "PacketOperators.h"
 #include "Pet.h"
@@ -344,6 +347,8 @@ WorldPacket const* MinimapPing::Write()
     return &_worldPacket;
 }
 
+// The client sends the retail icon order (0 star, 1 circle, 2 diamond, 3 triangle, 4 moon, 5 square, 6 cross, 7 skull), the same
+// numbering the core uses: verified in the live log of 2026-10-08 (7 = skull, 6 = cross), so the symbol is passed through unchanged.
 void UpdateRaidTarget::Read()
 {
     _worldPacket >> OptionalInit(PartyIndex);
@@ -351,6 +356,7 @@ void UpdateRaidTarget::Read()
     _worldPacket >> Symbol;
     if (PartyIndex)
         _worldPacket >> *PartyIndex;
+    PROBE_LOG("[raid_icon] client symbol {} on {}", int32(Symbol), Target.ToString());
 }
 
 WorldPacket const* SendRaidTargetUpdateSingle::Write()
@@ -489,10 +495,14 @@ ByteBuffer& operator<<(ByteBuffer& data, LeaverInfo const& leaverInfo)
     return data;
 }
 
-ByteBuffer& operator<<(ByteBuffer& data, PartyPlayerInfo const& playerInfo)
+static ByteBuffer& WritePlayerInfo(ByteBuffer& data, PartyPlayerInfo const& playerInfo, bool classic70291)
 {
     data << SizedString::BitsSize<6>(playerInfo.Name);
-    data << SizedCString::BitsSize<6>(playerInfo.VoiceStateID);
+    // client 70291 reads the voice state id size in 9 bits (6 in retail and 70245): header 6 + 9 + 3 flags = 3 bytes
+    if (classic70291)
+        data << SizedCString::BitsSize<9>(playerInfo.VoiceStateID);
+    else
+        data << SizedCString::BitsSize<6>(playerInfo.VoiceStateID);
     data << Bits<1>(playerInfo.Connected);
     data << Bits<1>(playerInfo.FromSocialQueue);
     data << Bits<1>(playerInfo.VoiceChatSilenced);
@@ -570,13 +580,17 @@ WorldPacket const* PartyUpdate::Write()
     _worldPacket << int32(MyIndex);
     _worldPacket << PartyGUID;
     _worldPacket << uint32(SequenceNum);
+    if (Classic70291)
+        _worldPacket << int8(Classic70291_BeforeLeader);
     _worldPacket << LeaderGUID;
     _worldPacket << uint8(LeaderFactionGroup);
     _worldPacket << int32(PingRestriction);
+    if (Classic70291)
+        _worldPacket << uint64(Classic70291_BeforeMemberCount);
     _worldPacket << Size<uint32>(PlayerList);
 
     for (PartyPlayerInfo const& playerInfos : PlayerList)
-        _worldPacket << playerInfos;
+        WritePlayerInfo(_worldPacket, playerInfos, Classic70291);
 
     _worldPacket << OptionalInit(ChallengeMode);
     _worldPacket << OptionalInit(LfgInfos);

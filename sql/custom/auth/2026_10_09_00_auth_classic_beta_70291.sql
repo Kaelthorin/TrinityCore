@@ -5,4 +5,4 @@ INSERT INTO `build_info` (`build`,`majorVersion`,`minorVersion`,`bugfixVersion`,
 
 -- No auth key is known for Win-x64-WoWB 70291 yet; see Network.SkipBuildAuthKeyCheck in worldserver.conf
 
-UPDATE `realmlist` SET `gamebuild`=70291 WHERE `id` IN (70,71,72,73);
+-- Forever (this fork): upstream moves realmlist.gamebuild to 70291 here; ours does it in 2026_10_09_01_auth_forever_move_to_70291.sql, so this file no longer touches the realm.

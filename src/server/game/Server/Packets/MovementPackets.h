@@ -174,6 +174,17 @@ namespace WorldPackets
             TaggedPosition<Position::XYZ> Pos;
         };
 
+        // A segment of the path as the client rebuilds it from a MonsterMove (start = Pos, then the points, or last point plus the
+        // quantized deltas of a compressed path) whose two ends coincide. The 70291 client normalizes every segment of a moving path
+        // and faults (FLT_DIVIDE_BY_ZERO, 2026-10-09 Thorium Point) on a zero-length one.
+        struct ZeroLengthSegment
+        {
+            uint32 Index = 0;   // segment i joins node i to node i + 1 (node 0 is Pos)
+            uint32 Nodes = 0;
+            float Length = 0.0f;
+        };
+        Optional<ZeroLengthSegment> FindZeroLengthSegment(MonsterMove const& packet, float minLength = 0.1f);
+
         class FlightSplineSync final : public ServerPacket
         {
         public:

@@ -98,6 +98,7 @@
 #include "MiscPackets.h"
 #include "MotionMaster.h"
 #include "MovementPackets.h"
+#include "ComboTargetRules.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -110,6 +111,7 @@
 #include "PetitionMgr.h"
 #include "PhasingHandler.h"
 #include "PlayerChoice.h"
+#include "Playerbot/PlayerbotHooks.h"
 #include "QueryCallback.h"
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
@@ -129,6 +131,7 @@
 #include "SpellAuras.h"
 #include "SpellCastRequest.h"
 #include "SpellHistory.h"
+#include "ClassicSpellRank.h"
 #include "SpellMgr.h"
 #include "SpellPackets.h"
 #include "StringConvert.h"
@@ -146,6 +149,8 @@
 #include "Vehicle.h"
 #include "VehiclePackets.h"
 #include "Vignette.h"
+#include "VMapFactory.h"
+#include "VMapManager.h"
 #include "VignettePackets.h"
 #include "World.h"
 #include "WorldPacket.h"
@@ -191,6 +196,7 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
         SetAcceptWhispers(true);
 
     m_regenInterruptTimestamp = GameTime::Now();
+    m_manaSpentTimestamp = GameTime::Now();
     m_regenTimer = 0;
     m_regenTimerCount = 0;
     m_weaponChangeTimer = 0;
@@ -924,6 +930,31 @@ void Player::UpdateInvisibilityDrunkDetect()
         UpdateObjectVisibility();
 }
 
+void Player::SetComboTarget(ObjectGuid const& guid)
+{
+    if (*m_unitData->ClassicComboTarget != guid)
+        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ClassicComboTarget), guid);
+}
+
+void Player::GainComboPointsOn(Unit const* victim)
+{
+    ObjectGuid victimGuid = victim ? victim->GetGUID() : ObjectGuid::Empty;
+    if (ComboTargetRules::GainResetsPoints(GetComboTarget(), victimGuid))
+        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
+    SetComboTarget(victimGuid);
+}
+
+void Player::UpdateComboTarget()
+{
+    ObjectGuid comboTarget = GetComboTarget();
+    if (comboTarget.IsEmpty())
+        return;
+
+    Unit* target = ObjectAccessor::GetUnit(*this, comboTarget);
+    if (ComboTargetRules::ShouldDrop(comboTarget, target && target->IsAlive()))
+        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
+}
+
 void Player::Update(uint32 p_time)
 {
     if (!IsInWorld())
@@ -963,6 +994,8 @@ void Player::Update(uint32 p_time)
 
     UpdatePvPFlag(now);
 
+    UpdateComboTarget();
+
     UpdateContestedPvP(p_time);
 
     UpdateDuelFlag(now);
@@ -970,6 +1003,7 @@ void Player::Update(uint32 p_time)
     CheckDuelDistance(now);
 
     UpdateAfkReport(now);
+    UpdateTradeState();
 
     if (GetCombatManager().HasPvPCombat())
         if (Aura* aura = GetAura(SPELL_PVP_RULES_ENABLED))
@@ -1306,7 +1340,11 @@ bool Player::TeleportTo(TeleportLocation const& teleportLocation, TeleportToOpti
     if (duel && GetMapId() != teleportLocation.Location.GetMapId() && GetMap()->GetGameObject(m_playerData->DuelArbiter))
         DuelComplete(DUEL_FLED);
 
-    if (GetMapId() == teleportLocation.Location.GetMapId() && (!teleportLocation.InstanceId || GetInstanceId() == teleportLocation.InstanceId))
+    // A near teleport needs a player standing in a map's grid. One that is out of the world (removed from its map for a far
+    // teleport that then failed, e.g. the worldport ack porting it to homebind on the map it just left) still reports its old map
+    // id; as a near teleport it would be acked into Map::PlayerRelocation and assert on RemoveFromGrid. It takes the far path,
+    // which already handles "no old map".
+    if (IsInWorld() && GetMapId() == teleportLocation.Location.GetMapId() && (!teleportLocation.InstanceId || GetInstanceId() == teleportLocation.InstanceId))
     {
         SetTeleportState(TeleportState::Initiated);
         //if teleport spell is cast in Unit::Update() func
@@ -1559,13 +1597,18 @@ void Player::RemoveFromWorld()
         UnsummonPetTemporaryIfAny();
         UnsummonBattlePetTemporaryIfAny();
         SetPower(POWER_COMBO_POINTS, 0);
-        m_session->DoLootReleaseAll();
+        // Null-session guard: a Player can sit briefly in its grid after
+        // its WorldSession has been torn down (logout race). Bot session
+        // churn at scale exposes this routinely; same surface as the
+        // SendDirectMessage crash we already patched.
+        if (m_session) m_session->DoLootReleaseAll();
         m_lootRolls.clear();
         sOutdoorPvPMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
         sBattlefieldMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
     }
 
-    GetSession()->GetBattlenetAccount().RemoveFromWorld();
+    if (WorldSession* sess = GetSession())
+        sess->GetBattlenetAccount().RemoveFromWorld();
 
     // Remove items from world before self - player must be found in Item::RemoveFromObjectUpdate
     for (uint8 i = PLAYER_SLOT_START; i < PLAYER_SLOT_END; ++i)
@@ -1752,6 +1795,8 @@ void Player::InterruptPowerRegen(Powers power)
         return;
 
     m_regenInterruptTimestamp = GameTime::Now();
+    if (power == POWER_MANA)
+        m_manaSpentTimestamp = m_regenInterruptTimestamp;
     m_powerFraction[powerIndex] = 0.0f;
     SendDirectMessage(WorldPackets::Combat::InterruptPowerRegen(power).Write());
 }
@@ -2315,6 +2360,9 @@ void Player::GiveLevel(uint8 level)
     UpdateClassicLegacyUnlock();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
+
+    if (level > oldLevel)
+        Playerbot::Hooks::OnLevelUp(this, level);
 
     BattlenetPresence::OnCharacterChanged(this);
 }
@@ -3116,7 +3164,50 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
     if (uint32 freeProfs = GetFreePrimaryProfessionPoints())
     {
         if (spellInfo->IsPrimaryProfessionFirstRank())
-            SetFreePrimaryProfessions(freeProfs - 1);
+        {
+            // A primary-profession slot must be consumed ONCE PER PROFESSION,
+            // not once per spell. Modern (12.0) profession data ships MULTIPLE
+            // first-rank spells that all teach the SAME profession skill — e.g.
+            // classic "Apprentice Skinning" (8613) and modern "Skinning"
+            // (205243) both grant skill 393 (Skinning) — and the skill-reward
+            // cascade auto-learns the modern one when the character has the
+            // profession. The old "decrement per first-rank spell" logic then
+            // counted one profession twice, exhausting the 2-slot cap (bots
+            // with only Skinning ended up with freeProf=0 and could never learn
+            // a real 2nd profession like Leatherworking). Only decrement when no
+            // OTHER known spell already teaches this same profession skill.
+            uint32 profSkill = 0;
+            for (SpellEffectInfo const& eff : spellInfo->GetEffects())
+                if (eff.IsEffect(SPELL_EFFECT_SKILL) && IsPrimaryProfessionSkill(uint32(eff.MiscValue)))
+                {
+                    profSkill = uint32(eff.MiscValue);
+                    break;
+                }
+
+            bool alreadyCounted = false;
+            if (profSkill)
+            {
+                for (auto const& [knownSpellId, knownSpell] : m_spells)
+                {
+                    if (knownSpellId == spellId || knownSpell.state == PLAYERSPELL_REMOVED)
+                        continue;
+                    SpellInfo const* knownInfo = sSpellMgr->GetSpellInfo(knownSpellId, DIFFICULTY_NONE);
+                    if (!knownInfo || !knownInfo->IsPrimaryProfessionFirstRank())
+                        continue;
+                    for (SpellEffectInfo const& e2 : knownInfo->GetEffects())
+                        if (e2.IsEffect(SPELL_EFFECT_SKILL) && uint32(e2.MiscValue) == profSkill)
+                        {
+                            alreadyCounted = true;
+                            break;
+                        }
+                    if (alreadyCounted)
+                        break;
+                }
+            }
+
+            if (!alreadyCounted)
+                SetFreePrimaryProfessions(freeProfs - 1);
+        }
     }
 
     SkillLineAbilityMapBounds skill_bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellId);
@@ -3167,6 +3258,29 @@ bool Player::AddSpell(uint32 spellId, bool active, bool learning, bool dependent
 
                     if (rcInfo->Flags & SKILL_FLAG_ALWAYS_MAX_VALUE)
                         skill_value = new_skill_max_value;
+                }
+                else if (IsPrimaryProfessionSkill(spellLearnSkill->skill))
+                {
+                    // Modern 12.0+ client DB2 dropped SkillRaceClassInfo for
+                    // the classic primary-profession skill lines while the
+                    // foundation spells (2108 Apprentice LW etc.) are still
+                    // present with SPELL_EFFECT_SKILL. Without this branch,
+                    // learning the foundation spell adds it to the spellbook
+                    // but SetSkill writes value=0 max=0, leaving the player
+                    // unable to use the profession. Fall back to the classic
+                    // apprentice/journeyman/expert/artisan/master/grand-master
+                    // tier caps (75/150/225/300/375/450) — same tiering
+                    // BotSetupPipeline::DoLearnProfessions uses for L10+ bots
+                    // (verified working for 1351+ bots). Pinning value=1
+                    // matches an in-game "Learn Apprentice X" UX where the
+                    // profession appears at rank 1 of 75 immediately.
+                    static constexpr uint16 kPrimaryProfessionTierMax[] = { 75, 150, 225, 300, 375, 450 };
+                    uint8 stepIdx = spellLearnSkill->step ? spellLearnSkill->step - 1 : 0;
+                    if (stepIdx >= std::size(kPrimaryProfessionTierMax))
+                        stepIdx = std::size(kPrimaryProfessionTierMax) - 1;
+                    new_skill_max_value = kPrimaryProfessionTierMax[stepIdx];
+                    if (skill_value < 1)
+                        skill_value = 1;
                 }
             }
 
@@ -3848,6 +3962,17 @@ bool Player::HasSpell(uint32 spell) const
     PlayerSpellMap::const_iterator itr = m_spells.find(spell);
     return (itr != m_spells.end() && itr->second.state != PLAYERSPELL_REMOVED &&
         !itr->second.disabled);
+}
+
+uint32 Player::ResolveSupersededRank(uint32 spellId) const
+{
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+    if (!spellInfo || !spellInfo->IsRanked())
+        return spellId;
+
+    return ClassicSpellRank::Resolve(spellId, HasSpell(spellId) && !HasActiveSpell(spellId),
+        [](uint32 id) { return sSpellMgr->GetNextSpellInChain(id); },
+        [this](uint32 id) { return HasActiveSpell(id); });
 }
 
 bool Player::HasTalent(uint32 talentId, uint8 group) const
@@ -4589,6 +4714,7 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
             }
         }
     }
+
 }
 
 void Player::KillPlayer()
@@ -4920,6 +5046,46 @@ void Player::DurabilityRepair(uint16 pos, bool takeCost, float discountMod)
         _ApplyItemMods(item, pos & 255, true);
 }
 
+bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId) const
+{
+    float const x = loc.GetPositionX();
+    float const y = loc.GetPositionY();
+    float const z = loc.GetPositionZ();
+
+    float const terrain = map->GetGridHeight(GetPhaseShift(), x, y);
+    if (terrain <= INVALID_HEIGHT)
+    {
+        // A battleground floor is WMO only (no terrain grid): the rez rows 771/772 sit ~24 y under it. Raise to the surface found above.
+        if (!map->IsBattleground())
+            return false;
+
+        float const ground = map->GetHeight(GetPhaseShift(), x, y, z + 30.0f, true, 40.0f);
+        if (ground <= INVALID_HEIGHT || ground <= z + 1.0f)
+            return false;
+
+        TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is below the floor ({:.1f}); using the floor. Fix the world_safe_locs row.",
+            safeLocId, map->GetId(), x, y, z, ground);
+        loc.Relocate(x, y, ground + 0.5f);
+        return true;
+    }
+
+    // Buried = more than a yard under the terrain and no WMO / model surface within reach of the point (a graveyard inside a building or
+    // a cave under the terrain stands on that surface and is left alone).
+    if (z >= terrain - 1.0f)
+        return false;
+
+    float const nearFloor = map->GetHeight(GetPhaseShift(), x, y, z + 2.0f, true, 6.0f);
+    if (nearFloor > INVALID_HEIGHT && nearFloor >= z - 1.0f && nearFloor <= z + 2.5f)
+        return false;
+
+    float const floor = map->GetHeight(GetPhaseShift(), x, y, terrain + 1.0f, true, 6.0f);
+    float const newZ = std::max(floor, terrain) + 0.5f;
+    TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is under the terrain ({:.1f}); using {:.1f}. Fix the world_safe_locs row.",
+        safeLocId, map->GetId(), x, y, z, terrain, newZ);
+    loc.Relocate(x, y, newZ);
+    return true;
+}
+
 void Player::RepopAtGraveyard()
 {
     // note: this can be called also when the player is alive
@@ -4944,6 +5110,13 @@ void Player::RepopAtGraveyard()
     if (!closestGrave)
         closestGrave = sObjectMgr->GetClosestGraveyard(*this, GetTeam(), this);
 
+    if (GetMap()->IsBattlegroundOrArena())
+        TC_LOG_INFO("playerbot.v2", "[bg_repop] {} (team {}) died at map {} ({:.1f},{:.1f},{:.1f}) zone {} -> safe loc {} map {} ({:.1f},{:.1f},{:.1f})",
+            GetName(), uint32(GetTeam()), GetMapId(), GetPositionX(), GetPositionY(), GetPositionZ(), GetZoneId(),
+            closestGrave ? closestGrave->ID : 0u, closestGrave ? closestGrave->Loc.GetMapId() : 0u,
+            closestGrave ? closestGrave->Loc.GetPositionX() : 0.0f, closestGrave ? closestGrave->Loc.GetPositionY() : 0.0f,
+            closestGrave ? closestGrave->Loc.GetPositionZ() : 0.0f);
+
     // stop countdown until repop
     m_deathTimer = 0;
 
@@ -4951,12 +5124,21 @@ void Player::RepopAtGraveyard()
     // and don't show spirit healer location
     if (closestGrave)
     {
-        TeleportTo({ .Location = closestGrave->Loc, .TransportGuid = closestGrave->TransportSpawnId ? ObjectGuid::Create<HighGuid::Transport>(*closestGrave->TransportSpawnId) : ObjectGuid::Empty }, shouldResurrect ? TELE_REVIVE_AT_TELEPORT : TELE_TO_NONE);
+        // A graveyard whose Z lies under the terrain drops the ghost out of the world: the retail world_safe_locs rows keep retail Z values
+        // that the Classic terrain does not match (WSG rows 771/772 sat ~24 y under the floor, Karrz 2026-10-08; Sentinel Hill graveyard 4 on
+        // release from the Deadmines, Karrz 2026-10-10). Same map: raise it to the floor here. Another map (an instance releasing to the
+        // continent) is not loaded yet; the worldport ack does the same once the destination map exists.
+        WorldLocation graveLoc = closestGrave->Loc;
+        if (graveLoc.GetMapId() == GetMapId())
+            SnapBuriedLocToFloor(GetMap(), graveLoc, closestGrave->ID);
+        else
+            SetGraveyardTeleportId(closestGrave->ID);
+        TeleportTo({ .Location = graveLoc, .TransportGuid = closestGrave->TransportSpawnId ? ObjectGuid::Create<HighGuid::Transport>(*closestGrave->TransportSpawnId) : ObjectGuid::Empty }, shouldResurrect ? TELE_REVIVE_AT_TELEPORT : TELE_TO_NONE);
         if (isDead())                                        // not send if alive, because it used in TeleportTo()
         {
             WorldPackets::Misc::DeathReleaseLoc packet;
-            packet.MapID = closestGrave->Loc.GetMapId();
-            packet.Loc = closestGrave->Loc;
+            packet.MapID = graveLoc.GetMapId();
+            packet.Loc = graveLoc;
             SendDirectMessage(packet.Write());
         }
     }
@@ -6577,6 +6759,20 @@ void Player::SendMessageToSet(WorldPacket const* data, Player const* skipped_rcv
 
 void Player::SendDirectMessage(WorldPacket const* data) const
 {
+    // Null-session guard. A Player can sit briefly in its map's grid
+    // *after* its WorldSession has been torn down — the logout flow
+    // detaches the session and queues the Player for grid removal, but
+    // the next world tick may still visit this Player via packet
+    // broadcasts (MessageDistDeliverer iterating a creature spell's
+    // visibility range), and this code dereferenced m_session
+    // unconditionally. Crash signature observed under V2 bot session
+    // churn: ACCESS_VIOLATION at this line, RAX=0, called from
+    // Spell::SendSpellStart → SendMessageToSetInRange → ... visiting a
+    // logging-out Player. Drop the packet silently — the player won't
+    // see the spell visual, which is the correct outcome since they're
+    // already gone.
+    if (!m_session)
+        return;
     m_session->SendPacket(data);
 }
 
@@ -6729,6 +6925,10 @@ void Player::UpdateIndoorsOutdoorsAuras()
 {
     if (sWorld->getBoolConfig(CONFIG_VMAP_INDOOR_CHECK))
         RemoveAurasWithAttribute(IsOutdoors() ? SPELL_ATTR0_ONLY_INDOORS : SPELL_ATTR0_ONLY_OUTDOORS);
+
+    // Classic: walking into a building or cave dismounts (see Spell::CheckCast, SPELL_AURA_MOUNTED).
+    if (!IsOutdoors() && HasAuraType(SPELL_AURA_MOUNTED) && VMAP::VMapFactory::createOrGetVMapManager()->isLineOfSightCalcEnabled())
+        RemoveAurasByType(SPELL_AURA_MOUNTED);
 }
 
 void Player::UpdateTavernRestingState()
@@ -13796,6 +13996,8 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     if (m_trade)
     {
         Player* trader = m_trade->GetTrader();
+        if (GetSession()->IsBot() || trader->GetSession()->IsBot())
+            TC_LOG_INFO("playerbot.v2", "[trade] cancel {} <-> {} (status {})", GetName(), trader->GetName(), uint32(status));
 
         if (sendback)
             GetSession()->SendCancelTrade(status);
@@ -13808,6 +14010,47 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
         delete trader->m_trade;
         trader->m_trade = nullptr;
     }
+}
+
+void Player::UpdateTradeState()
+{
+    if (!m_trade)
+        return;
+    Player* trader = m_trade->GetTrader();
+    TradeStatus why = TRADE_STATUS_CANCELLED;
+    char const* reason = nullptr;
+    if (!trader || !trader->IsInWorld() || !IsInWorld())
+        reason = "partner gone";
+    else if (!trader->m_trade || trader->m_trade->GetTrader() != this)
+        reason = "partner is not in this trade";
+    else if (!IsWithinDistInMap(trader, TRADE_DISTANCE, false))
+    {
+        reason = "out of range";
+        why = TRADE_STATUS_TOO_FAR_AWAY;
+    }
+    if (!reason)
+        return;
+    TC_LOG_INFO("playerbot.v2", "[trade] closing {}'s trade with {}: {}", GetName(), trader ? trader->GetName() : std::string("?"), reason);
+    if (trader && trader->m_trade && trader->m_trade->GetTrader() == this)
+        TradeCancel(true, why);
+    else
+    {
+        // The partner's side is gone or unrelated: drop only ours.
+        GetSession()->SendCancelTrade(why);
+        delete m_trade;
+        m_trade = nullptr;
+    }
+}
+
+void Player::InitiateTrade(Player* trader)
+{
+    // PlayerBot integration: minimal core hook for trade initiation
+    // Pattern from TradeHandler.cpp:714-715
+    if (!trader || m_trade || trader->m_trade)
+        return;
+
+    m_trade = new TradeData(this, trader);
+    trader->m_trade = new TradeData(trader, this);
 }
 
 void Player::UpdateSoulboundTradeItems()
@@ -14680,7 +14923,20 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
             }
             break;
         case GossipOptionNpc::Vendor:
-            GetSession()->SendListInventory(guid);
+            PlayerTalkClass->SendCloseGossip();
+            // Send NIOR only; don't send VendorInventory in the same flush.
+            // The client's NIOR case 5 handler queues a UI event that sets
+            // PIM+48 = Merchant(5) and opens MerchantFrame. The frame then
+            // requests vendor data via CMSG_LIST_INVENTORY in a second round-trip,
+            // by which time PIM+48 is set and IsSellAllJunkEnabled works.
+            PlayerTalkClass->GetInteractionData().StartInteraction(guid, PlayerInteractionType::Vendor);
+            {
+                WorldPackets::NPC::NPCInteractionOpenResult npcInteraction;
+                npcInteraction.Npc = guid;
+                npcInteraction.InteractionType = PlayerInteractionType::Merchant;
+                npcInteraction.Success = true;
+                SendDirectMessage(npcInteraction.Write());
+            }
             break;
         case GossipOptionNpc::Taxinode:
             GetSession()->SendTaxiMenu(source->ToCreature());
@@ -16305,7 +16561,9 @@ bool Player::SatisfyQuestRace(Quest const* qInfo, bool msg) const
 bool Player::SatisfyQuestMinReputation(Quest const* qInfo, bool msg) const
 {
     uint32 fIdMin = qInfo->GetRequiredMinRepFaction();      //Min required rep
-    if (fIdMin && GetReputationMgr().GetReputation(fIdMin) < qInfo->GetRequiredMinRepValue())
+    // Classic 1.60: quest_template carries later-expansion factions (e.g. #922, #967) missing from the
+    // client data; look them up as an entry (unknown = 0 standing, same result) so quest scans don't flood the error log
+    if (fIdMin && GetReputationMgr().GetReputation(sFactionStore.LookupEntry(fIdMin)) < qInfo->GetRequiredMinRepValue())
     {
         if (msg)
         {
@@ -16322,7 +16580,7 @@ bool Player::SatisfyQuestMinReputation(Quest const* qInfo, bool msg) const
 bool Player::SatisfyQuestMaxReputation(Quest const* qInfo, bool msg) const
 {
     uint32 fIdMax = qInfo->GetRequiredMaxRepFaction();      //Max required rep
-    if (fIdMax && GetReputationMgr().GetReputation(fIdMax) >= qInfo->GetRequiredMaxRepValue())
+    if (fIdMax && GetReputationMgr().GetReputation(sFactionStore.LookupEntry(fIdMax)) >= qInfo->GetRequiredMaxRepValue())
     {
         if (msg)
         {
@@ -16605,7 +16863,10 @@ QuestStatus Player::GetQuestStatus(uint32 quest_id) const
 bool Player::CanShareQuest(uint32 quest_id) const
 {
     Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
-    if (qInfo && qInfo->HasFlag(QUEST_FLAGS_SHARABLE))
+    // Vanilla: every ordinary quest can be shared. The imported Forever quest data does not reliably carry the
+    // SHARABLE flag, which left the Share button (and the bots) without any quest to push, so a quest that is
+    // not repeatable / daily / weekly counts as sharable too.
+    if (qInfo && (qInfo->HasFlag(QUEST_FLAGS_SHARABLE) || (!qInfo->IsRepeatable() && !qInfo->IsDailyOrWeekly())))
     {
         QuestStatusMap::const_iterator itr = m_QuestStatus.find(quest_id);
         return (itr != m_QuestStatus.end());
@@ -18025,6 +18286,7 @@ void Player::SendQuestConfirmAccept(Quest const* quest, Player* receiver) const
     packet.QuestTitle = quest->GetLogTitle();
     uint32 questID = quest->GetQuestId();
 
+    if (!receiver->GetSession()) return;   // logging-out — drop quest-share confirm
     LocaleConstant localeConstant = receiver->GetSession()->GetSessionDbLocaleIndex();
     if (localeConstant != LOCALE_enUS)
         if (QuestTemplateLocale const* questTemplateLocale = sObjectMgr->GetQuestLocale(questID))
@@ -19193,7 +19455,13 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         m_InstanceValid = false;
 
     if (player_at_bg)
+    {
+        // Back in a running battleground after a reconnect: the saved bgTeam was read straight into m_bgData, but the ArenaFaction
+        // update field (which the client uses for friend / foe inside a BG) is only written by SetBGTeam, so it stayed 0 = Horde
+        // (Karrz, WSG 2026-10-08: an Alliance player came back with the Horde shown green and friendly while they killed him).
+        SetBGTeam(GetBGTeam());
         map->ToBattlegroundMap()->GetBG()->AddPlayer(this, m_bgData.queueId);
+    }
 
     // randomize first save time in range [CONFIG_INTERVAL_SAVE] around [CONFIG_INTERVAL_SAVE]
     // this must help in case next save after mass player load after server startup
@@ -20696,7 +20964,10 @@ void Player::SendRaidInfo()
         lockInfos.Extended = instanceLock->IsExtended();
     }
 
-    SendDirectMessage(instanceInfo.Write());
+    WorldPacket const* data = instanceInfo.Write();
+    TC_LOG_INFO("instance.lock", "[raid_info] sending {} lock(s) to {} ({} bytes)", instanceInfo.LockList.size(), GetName(), data->size());
+
+    SendDirectMessage(data);
 }
 
 bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbortParams* params, bool report)
@@ -20742,19 +21013,23 @@ bool Player::Satisfy(AccessRequirement const* ar, uint32 target_map, TransferAbo
                     LevelMax = ar->levelMax;
             }
 
-            if (ar->item)
+            // Instance.IgnoreAttunement: the attunement item and quest of the instance are not required (optional server option)
+            if (!sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_ATTUNEMENT))
             {
-                if (!HasItemCount(ar->item) &&
-                    (!ar->item2 || !HasItemCount(ar->item2)))
-                    missingItem = ar->item;
-            }
-            else if (ar->item2 && !HasItemCount(ar->item2))
-                missingItem = ar->item2;
+                if (ar->item)
+                {
+                    if (!HasItemCount(ar->item) &&
+                        (!ar->item2 || !HasItemCount(ar->item2)))
+                        missingItem = ar->item;
+                }
+                else if (ar->item2 && !HasItemCount(ar->item2))
+                    missingItem = ar->item2;
 
-            if (GetTeam() == ALLIANCE && ar->quest_A && !GetQuestRewardStatus(ar->quest_A))
-                missingQuest = ar->quest_A;
-            else if (GetTeam() == HORDE && ar->quest_H && !GetQuestRewardStatus(ar->quest_H))
-                missingQuest = ar->quest_H;
+                if (GetTeam() == ALLIANCE && ar->quest_A && !GetQuestRewardStatus(ar->quest_A))
+                    missingQuest = ar->quest_A;
+                else if (GetTeam() == HORDE && ar->quest_H && !GetQuestRewardStatus(ar->quest_H))
+                    missingQuest = ar->quest_H;
+            }
 
             Player* leader = this;
             ObjectGuid leaderGuid = group ? group->GetLeaderGUID() : GetGUID();
@@ -20822,18 +21097,31 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
     // raid instances require the player to be in a raid group to be valid
     if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID) && (map->GetEntry()->Expansion() >= sWorld->getIntConfig(CONFIG_EXPANSION)))
         if (!group || !group->isRaidGroup())
+        {
+            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: {}", GetName(), map->GetId(), map->GetInstanceId(),
+                !group ? "not in a group" : "group is not a raid group");
             return false;
+        }
 
     if (group)
     {
         if (group != instance->GetOwningGroup())
+        {
+            Group const* owner = instance->GetOwningGroup();
+            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: group {} is not the owning group ({})", GetName(), map->GetId(),
+                map->GetInstanceId(), group->GetGUID().ToString(), owner ? owner->GetGUID().ToString() : "none");
             return false;
+        }
     }
     else
     {
         // instance is invalid if we are not grouped and there are other players
         if (map->GetPlayersCountExceptGMs() > 1)
+        {
+            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: not grouped with {} other players inside", GetName(), map->GetId(),
+                map->GetInstanceId(), map->GetPlayersCountExceptGMs() - 1);
             return false;
+        }
     }
 
     return true;
@@ -22222,6 +22510,11 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
+            // CHAR_DEL_CHARACTER_AURA_STORED_LOCATION is "... WHERE Guid=? AND
+            // Spell=?". The Spell (itr->first) param was never bound, so the
+            // DELETE matched nothing — a removed teleport-aura location lingered
+            // in the DB. Bind it.
+            stmt->setUInt32(1, itr->first);
             trans->Append(stmt);
             itr = m_storedAuraTeleportLocations.erase(itr);
             continue;
@@ -22231,6 +22524,11 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
         {
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_AURA_STORED_LOCATION);
             stmt->setUInt64(0, GetGUID().GetCounter());
+            // Same unbound-Spell bug: without this the DELETE matched nothing, so
+            // the INSERT below collided on the (Guid,Spell) PRIMARY KEY every save
+            // — a [1062] duplicate-key storm (4,176 identical errors in a 4-day
+            // bot run, ~1 per 90s character save).
+            stmt->setUInt32(1, itr->first);
             trans->Append(stmt);
 
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_AURA_STORED_LOCATION);
@@ -22242,6 +22540,10 @@ void Player::_SaveStoredAuraTeleportLocations(CharacterDatabaseTransaction trans
             stmt->setFloat(5, storedLocation.Loc.GetPositionZ());
             stmt->setFloat(6, storedLocation.Loc.GetOrientation());
             trans->Append(stmt);
+
+            // Mark persisted so an unchanged location isn't DELETE+INSERTed on
+            // every subsequent 90s save (redundant writes amplified fleet-wide).
+            storedLocation.State = StoredAuraTeleportLocation::UNCHANGED;
         }
 
         ++itr;
@@ -22991,7 +23293,7 @@ void Player::WhisperAddon(std::string const& text, std::string const& prefix, bo
     std::string _text(text);
     sScriptMgr->OnPlayerChat(this, CHAT_MSG_WHISPER, uint32(isLogged ? LANG_ADDON_LOGGED : LANG_ADDON), _text, receiver);
 
-    if (!receiver->GetSession()->IsAddonRegistered(prefix))
+    if (!receiver->GetSession() || !receiver->GetSession()->IsAddonRegistered(prefix))
         return;
 
     WorldPackets::Chat::Chat packet;
@@ -23018,6 +23320,10 @@ void Player::Whisper(std::string_view text, Language language, Player* target, b
 
     WorldPackets::Chat::Chat packet;
     packet.Initialize(CHAT_MSG_WHISPER, language, this, this, _text);
+    // Both names travel with a whisper line (stock leaves them to the client's name cache): the Forever client showed no or
+    // grey whispers with bots (Karrz 2026-10-08); a name in the packet cannot be wrong.
+    packet.SenderName = GetName();
+    packet.TargetName = GetName();
     target->SendDirectMessage(packet.Write());
 
     // rest stuff shouldn't happen in case of addon message
@@ -23025,6 +23331,8 @@ void Player::Whisper(std::string_view text, Language language, Player* target, b
         return;
 
     packet.Initialize(CHAT_MSG_WHISPER_INFORM, language, target, target, _text);
+    packet.SenderName = target->GetName();
+    packet.TargetName = target->GetName();
     SendDirectMessage(packet.Write());
 
     RecentAllies::OnWhisper(this, target);
@@ -23054,6 +23362,7 @@ void Player::Whisper(uint32 textId, Player* target, bool /*isBossWhisper = false
         return;
     }
 
+    if (!target->GetSession()) return;   // logging-out target — drop the whisper
     LocaleConstant locale = target->GetSession()->GetSessionDbLocaleIndex();
     WorldPackets::Chat::Chat packet;
     packet.Initialize(CHAT_MSG_WHISPER, LANG_UNIVERSAL, this, target, DB2Manager::GetBroadcastTextValue(bct, locale, GetGender()));
@@ -25735,7 +26044,15 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     GetSession()->SendLoadCUFProfiles();
 
-    CastSpell(this, 836, true);                             // LOGINEFFECT
+    // saved raid locks; the Classic client does not ask for them on its own
+    SendRaidInfo();
+
+    // Skip LOGINEFFECT for bots - visual effect requires client rendering
+    // Bots don't send CMSG_CAST_SPELL ACKs, causing m_spellModTakingSpell assertion failures (Spell.cpp:603)
+#if defined(TRINITY_PLAYERBOT_V2)
+    if (!GetSession()->IsBot())
+#endif
+        CastSpell(this, 836, true);                         // LOGINEFFECT
 
     WorldPackets::Movement::MoveSetCompoundState setCompoundState;
 
@@ -26528,6 +26845,7 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
     if (bounds.first == bounds.second)
         return true;
 
+    bool primaryProfFitsByMasks = false;
     for (SkillLineAbilityMap::const_iterator _spell_idx = bounds.first; _spell_idx != bounds.second; ++_spell_idx)
     {
         // skip wrong race skills
@@ -26540,12 +26858,28 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id) const
 
         // skip wrong class and race skill saved in SkillRaceClassInfo.dbc
         if (!sDB2Manager.GetSkillRaceClassInfo(_spell_idx->second->SkillLine, GetRace(), GetClass()))
+        {
+            // Modern 12.0+ client DB2 dropped SkillRaceClassInfo entries
+            // for the classic primary-profession skill lines (165 LW, 164
+            // BS, 186 Mining, 182 Herbalism, 393 Skinning, etc.) while the
+            // spells (2108 Apprentice LW, 2018 Apprentice BS, ...) still
+            // exist and function via direct SetSkill — that's how
+            // BotSetupPipeline::DoLearnProfessions grants LW to 1351+ L10+
+            // bots. Without this fallback, trainer learn rejects every
+            // classic foundation profession spell for every race/class
+            // (manual play "click yes → nothing happens"), even though the
+            // race/class masks on the SkillLineAbility itself pass. Allow
+            // primary profession spells through when race+class masks
+            // pass and only rcInfo is missing.
+            if (IsPrimaryProfessionSkill(_spell_idx->second->SkillLine))
+                primaryProfFitsByMasks = true;
             continue;
+        }
 
         return true;
     }
 
-    return false;
+    return primaryProfFitsByMasks;
 }
 
 bool Player::HasQuestForGO(int32 GOId) const
@@ -27902,6 +28236,8 @@ void Player::StoreLootItem(ObjectGuid lootWorldObjectGuid, uint8 lootSlot, Loot*
             }
 
             Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomBonusListId, item->GetAllowedLooters(), item->context);
+            if (newitem)
+                Playerbot::Hooks::OnItemLooted(this, item->itemid);
 
             if (newitem && (newitem->GetQuality() > ITEM_QUALITY_EPIC || (newitem->GetQuality() == ITEM_QUALITY_EPIC && newitem->GetItemLevel(this) >= MinNewsItemLevel)))
                 if (Guild* guild = GetGuild())
@@ -29160,11 +29496,33 @@ void Player::_SaveTransmogOutfits(CharacterDatabaseTransaction trans)
 
 void Player::_SaveBGData(CharacterDatabaseTransaction trans)
 {
-    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_PLAYER_BGDATA);
-    stmt->setUInt64(0, GetGUID().GetCounter());
-    trans->Append(stmt);
+    // A character not in (or queued for) a battleground has no BG data worth
+    // persisting. Re-writing an all-zeros row every 90s save for a mostly-non-BG
+    // fleet produced a DELETE(of-nonexistent-row, gap-lock)+INSERT storm on
+    // character_battleground_data — 87 of the [1213] deadlocks in a 6-min bot run.
+    // Skip the write entirely when there is nothing to save. A stale row left by a
+    // since-ended BG is harmless: on relog the instance no longer exists and the
+    // load path drops it; and re-entering a BG rewrites the row.
+    // NOTE: BattlegroundQueueTypeId::GetPacked() unconditionally OR's in the
+    // 0x1F10000000000000 protocol tag, so it is NEVER 0 — even for
+    // BATTLEGROUND_QUEUE_NONE. A `GetPacked() != 0` test is therefore always true
+    // and silently defeated this skip, letting the all-zeros DELETE+INSERT deadlock
+    // storm continue. Compare against the NONE sentinel via the defaulted operator==.
+    const bool hasBgData =
+        m_bgData.bgInstanceID != 0 ||
+        m_bgData.joinPos.GetMapId() != MAPID_INVALID ||
+        m_bgData.taxiPath[0] != 0 || m_bgData.taxiPath[1] != 0 ||
+        m_bgData.mountSpell != 0 ||
+        m_bgData.queueId != BATTLEGROUND_QUEUE_NONE;
+    if (!hasBgData)
+        return;
+
+    // Single atomic upsert (REPLACE INTO, keyed on the guid PK) instead of
+    // DELETE-then-INSERT. The old two-statement form gap-locked the non-existent
+    // row on DELETE and then INSERTed, which under concurrent fleet saves produced
+    // the [1213] deadlock storm. REPLACE collapses both into one lock acquisition.
     /* guid, bgInstanceID, bgTeam, x, y, z, o, map, taxi[0], taxi[1], mountSpell */
-    stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_PLAYER_BGDATA);
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_PLAYER_BGDATA);
     stmt->setUInt64(0, GetGUID().GetCounter());
     stmt->setUInt32(1, m_bgData.bgInstanceID);
     stmt->setUInt16(2, m_bgData.bgTeam);
@@ -29505,21 +29863,36 @@ void Player::_SaveTalents(CharacterDatabaseTransaction trans)
         }
     }
 
-    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
-    stmt->setUInt64(0, GetGUID().GetCounter());
-    trans->Append(stmt);
-
-    for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
+    // PvP talents: skip the DELETE+per-group-INSERT entirely for a character with
+    // none in any spec group (the whole leveling fleet) — the unconditional write
+    // of MAX_SPECIALIZATIONS all-zeros rows every save is the same gap-lock
+    // deadlock source as BG data above (23 of the run's [1213] deadlocks). A stale
+    // row is harmless — it's overwritten the moment a real PvP talent is chosen.
+    bool hasPvpTalent = false;
+    for (uint8 group = 0; group < MAX_SPECIALIZATIONS && !hasPvpTalent; ++group)
     {
-        PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
-        stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
+        PlayerPvpTalentMap const& t = GetPvpTalentMap(group);
+        if (t[0] || t[1] || t[2] || t[3])
+            hasPvpTalent = true;
+    }
+    if (hasPvpTalent)
+    {
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_PVP_TALENT);
         stmt->setUInt64(0, GetGUID().GetCounter());
-        stmt->setUInt32(1, talents[0]);
-        stmt->setUInt32(2, talents[1]);
-        stmt->setUInt32(3, talents[2]);
-        stmt->setUInt32(4, talents[3]);
-        stmt->setUInt8(5, group);
         trans->Append(stmt);
+
+        for (uint8 group = 0; group < MAX_SPECIALIZATIONS; ++group)
+        {
+            PlayerPvpTalentMap const& talents = GetPvpTalentMap(group);
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHAR_PVP_TALENT);
+            stmt->setUInt64(0, GetGUID().GetCounter());
+            stmt->setUInt32(1, talents[0]);
+            stmt->setUInt32(2, talents[1]);
+            stmt->setUInt32(3, talents[2]);
+            stmt->setUInt32(4, talents[3]);
+            stmt->setUInt8(5, group);
+            trans->Append(stmt);
+        }
     }
 }
 
@@ -29894,6 +30267,17 @@ void Player::StartLoadingActionButtons(std::function<void()>&& callback /*= null
 void Player::LoadActions(PreparedQueryResult result)
 {
     _LoadActions(result);
+
+    // Classic 1.60: buttons that still hold a rank the character has outgrown get the active rank (ClassicSpellRank.h)
+    for (auto& [button, actionButton] : m_actionButtons)
+    {
+        if (actionButton.uState == ACTIONBUTTON_DELETED || actionButton.GetType() != ACTION_BUTTON_SPELL)
+            continue;
+
+        uint32 const resolved = ResolveSupersededRank(uint32(actionButton.GetAction()));
+        if (resolved != actionButton.GetAction())
+            AddActionButton(button, resolved, ACTION_BUTTON_SPELL);
+    }
 
     SendActionButtons(1);
 }

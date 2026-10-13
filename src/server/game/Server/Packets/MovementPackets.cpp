@@ -16,12 +16,15 @@
  */
 
 #include "MovementPackets.h"
+#include "Log.h"
 #include "MoveSpline.h"
 #include "MoveSplineFlag.h"
 #include "MovementTypedefs.h"
 #include "PacketOperators.h"
 #include "UnitDefines.h"
 #include "Util.h"
+#include <atomic>
+#include <cmath>
 
 ByteBuffer& operator<<(ByteBuffer& data, MovementInfo::TransportInfo const& transportInfo)
 {
@@ -561,6 +564,14 @@ void CommonMovement::WriteMovementForceWithDirection(MovementForce const& moveme
     data.FlushBits();
 }
 
+// What the client reads back from one coordinate of a packed delta (11/11/10 bit two's complement, quarter yards, truncated toward zero).
+static float QuantizePackedDelta(float value, int32 bits)
+{
+    int32 const packed = int32(value * 4.0f) & ((1 << bits) - 1);
+    int32 const shift = 32 - bits;
+    return float((packed << shift) >> shift) * 0.25f;
+}
+
 void MonsterMove::InitializeSplineData(::Movement::MoveSpline const& moveSpline)
 {
     SplineData.ID = moveSpline.m_Id;
@@ -614,11 +625,25 @@ void MonsterMove::InitializeSplineData(::Movement::MoveSpline const& moveSpline)
     ::Movement::Spline<int32> const& spline = moveSpline.spline;
     std::vector<G3D::Vector3> const& array = spline.getPoints();
 
+    // The 70291 client divides by the length of every segment of the path it builds (start, points, end) and faults on a zero one
+    // (FLT_DIVIDE_BY_ZERO at client RVA 0x27DFC5E, 2026-10-09 Thorium Point: a compressed path whose first two intermediate points
+    // quantized onto the same quarter-yard node). Points that would sit closer than MinClientSegment to the previous node of the
+    // path the client rebuilds are left out of the packet; the last point is always kept.
+    constexpr float MinClientSegment = 0.1f;
+    auto const tooClose = [](G3D::Vector3 const& a, G3D::Vector3 const& b) { return (a - b).squaredLength() < MinClientSegment * MinClientSegment; };
+
     if (splineFlags.UncompressedPath)
     {
         uint32 count = spline.getPointCount() - (splineFlags.Cyclic ? 4 : 3);
+        G3D::Vector3 previous = array[1];   // the start node
         for (uint32 i = 0; i < count; ++i)
-            movementSpline.Points.emplace_back(array[i + 2].x, array[i + 2].y, array[i + 2].z);
+        {
+            G3D::Vector3 const& point = array[i + 2];
+            if (i + 1 < count && tooClose(point, previous))
+                continue;
+            movementSpline.Points.emplace_back(point.x, point.y, point.z);
+            previous = point;
+        }
     }
     else
     {
@@ -631,18 +656,75 @@ void MonsterMove::InitializeSplineData(::Movement::MoveSpline const& moveSpline)
         {
             G3D::Vector3 middle = (realPath[0] + realPath[lastIdx]) / 2.f;
 
-            // first and last points already appended
+            // first and last points already appended; an intermediate point is sent as middle - point in quarter yards, so compare the
+            // node the client gets (middle - quantized delta), not the point
+            G3D::Vector3 previous = realPath[0];
             for (uint32 i = 1; i < lastIdx; ++i)
             {
                 G3D::Vector3 delta = middle - realPath[i];
+                G3D::Vector3 const node = middle - G3D::Vector3(QuantizePackedDelta(delta.x, 11), QuantizePackedDelta(delta.y, 11), QuantizePackedDelta(delta.z, 10));
+                if (tooClose(node, previous) || tooClose(node, realPath[lastIdx]))
+                    continue;
                 movementSpline.PackedDeltas.emplace_back(delta.x, delta.y, delta.z);
+                previous = node;
             }
         }
     }
 }
 
+Optional<ZeroLengthSegment> FindZeroLengthSegment(MonsterMove const& packet, float minLength)
+{
+    MovementSpline const& spline = packet.SplineData.Move;
+    if (spline.Points.empty())
+        return {};
+
+    std::vector<Position> nodes;
+    nodes.reserve(1 + spline.Points.size() + spline.PackedDeltas.size());
+    nodes.push_back(packet.Pos.Pos);
+    if (spline.PackedDeltas.empty())
+    {
+        for (TaggedPosition<Position::XYZ> const& point : spline.Points)
+            nodes.push_back(point.Pos);
+    }
+    else
+    {
+        // compressed path: the wire carries the last point and, for every point in between, middle - point quantized to 1/4 yard
+        // (11/11/10 bit two's complement, truncated toward zero), middle being the centre of start and last point
+        Position const& last = spline.Points.front().Pos;
+        float const mx = (packet.Pos.Pos.GetPositionX() + last.GetPositionX()) * 0.5f;
+        float const my = (packet.Pos.Pos.GetPositionY() + last.GetPositionY()) * 0.5f;
+        float const mz = (packet.Pos.Pos.GetPositionZ() + last.GetPositionZ()) * 0.5f;
+        for (TaggedPosition<Position::PackedXYZ> const& delta : spline.PackedDeltas)
+            nodes.emplace_back(mx - QuantizePackedDelta(delta.Pos.GetPositionX(), 11), my - QuantizePackedDelta(delta.Pos.GetPositionY(), 11),
+                mz - QuantizePackedDelta(delta.Pos.GetPositionZ(), 10));
+        nodes.push_back(last);
+    }
+
+    for (uint32 i = 0; i + 1 < nodes.size(); ++i)
+    {
+        float const dx = nodes[i + 1].GetPositionX() - nodes[i].GetPositionX();
+        float const dy = nodes[i + 1].GetPositionY() - nodes[i].GetPositionY();
+        float const dz = nodes[i + 1].GetPositionZ() - nodes[i].GetPositionZ();
+        float const length = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (!(length >= minLength))
+            return ZeroLengthSegment{ i, uint32(nodes.size()), length };
+    }
+    return {};
+}
+
 WorldPacket const* MonsterMove::Write()
 {
+    if (Optional<ZeroLengthSegment> zero = FindZeroLengthSegment(*this))
+    {
+        static std::atomic<uint32> s_count{ 0 };
+        uint32 const n = ++s_count;
+        if (n <= 200 || n % 1000 == 0)
+            TC_LOG_ERROR("playerbot.v2", "[spline_zero] #{} mover={} segment {}/{} len={:.3f} flags={:#x} face={} points={} deltas={} pos=({:.2f},{:.2f},{:.2f}) first=({:.2f},{:.2f},{:.2f})",
+                n, MoverGUID.ToString(), zero->Index, zero->Nodes, zero->Length, SplineData.Move.Flags, int32(SplineData.Move.Face),
+                SplineData.Move.Points.size(), SplineData.Move.PackedDeltas.size(), Pos.Pos.GetPositionX(), Pos.Pos.GetPositionY(), Pos.Pos.GetPositionZ(),
+                SplineData.Move.Points.front().Pos.GetPositionX(), SplineData.Move.Points.front().Pos.GetPositionY(), SplineData.Move.Points.front().Pos.GetPositionZ());
+    }
+
     _worldPacket << MoverGUID;
     _worldPacket << SplineData;
     _worldPacket << Pos;

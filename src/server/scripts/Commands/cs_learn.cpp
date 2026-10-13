@@ -30,6 +30,7 @@ EndScriptData */
 #include "LanguageMgr.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "PlayerbotAPI.h"
 #include "RBAC.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
@@ -50,6 +51,7 @@ public:
             { "crafts",     HandleLearnAllCraftsCommand,     LANG_COMMAND_LEARN_ALL_CRAFTS_HELP,    rbac::RBAC_PERM_COMMAND_LEARN_ALL_CRAFTS,    Console::No },
             { "default",    HandleLearnAllDefaultCommand,    LANG_COMMAND_LEARN_ALL_DEFAULT_HELP,   rbac::RBAC_PERM_COMMAND_LEARN_ALL_DEFAULT,   Console::No },
             { "languages",  HandleLearnAllLangCommand,       LANG_COMMAND_LEARN_ALL_LANGUAGES_HELP, rbac::RBAC_PERM_COMMAND_LEARN_ALL_LANG,      Console::No },
+            { "mylevel",    HandleLearnAllMyLevelCommand,                                           rbac::RBAC_PERM_COMMAND_LEARN_ALL_MY_SPELLS, Console::No },
             { "recipes",    HandleLearnAllRecipesCommand,    LANG_COMMAND_LEARN_ALL_RECIPES_HELP,   rbac::RBAC_PERM_COMMAND_LEARN_ALL_RECIPES,   Console::No },
             { "talents",    HandleLearnAllTalentsCommand,    LANG_COMMAND_LEARN_ALL_TALENTS_HELP,   rbac::RBAC_PERM_COMMAND_LEARN_ALL_TALENTS,   Console::No },
             { "pettalents", HandleLearnAllPetTalentsCommand, LANG_COMMAND_LEARN_ALL_PETTALENT_HELP, rbac::RBAC_PERM_COMMAND_LEARN_MY_PETTALENTS, Console::No },
@@ -315,6 +317,27 @@ public:
         player->LearnSpell(64238, false); /* 64238 - Berserk (+900% damage, +150% melee haste, 30m duration) */
         player->LearnSpell(72525, false); /* 72525 - Berserk (+240% damage, +160% haste, infinite duration) */
         player->LearnSpell(66776, false); /* 66776 - Rage (+300% damage, -95% damage taken, +100% speed, infinite duration) */
+        return true;
+    }
+
+    // .learn all mylevel [player]: what a visit to the class trainers, the class quests and the weapon masters would have
+    // taught at the player's current level, for free and without the NPCs (the same code the owner companions are levelled with).
+    // No spell above the level, no talents.
+    static bool HandleLearnAllMyLevelCommand(ChatHandler* handler, Optional<PlayerIdentifier> player)
+    {
+        if (!player)
+            player = PlayerIdentifier::FromTargetOrSelf(handler);
+        if (!player || !player->IsConnected())
+            return false;
+
+        Player* target = player->GetConnectedPlayer();
+        ::Playerbot::API api(target);
+        uint32 const quest = api.learn_class_quest_spells_free();
+        uint32 const trainer = api.learn_trainer_spells_free();
+        uint32 const weapons = api.learn_weapon_skills_free();
+
+        handler->PSendSysMessage("%s: level %u, learned %u class spells, %u class quest spells, %u weapon skills.",
+            handler->GetNameLink(target).c_str(), uint32(target->GetLevel()), trainer, quest, weapons);
         return true;
     }
 
