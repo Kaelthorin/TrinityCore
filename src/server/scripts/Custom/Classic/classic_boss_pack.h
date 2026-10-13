@@ -59,8 +59,6 @@ inline void ClassicRespawnBossPack(Map* map, uint32 bossEntry, std::vector<uint3
     for (ObjectGuid::LowType spawnId : due)
         map->Respawn(SPAWN_TYPE_CREATURE, spawnId);
 
-    if (!dead.empty() || !due.empty())
-        TC_LOG_INFO("playerbot.v2", "[boss_pack] boss {} reset: {} dead adds respawned, {} unloaded", bossEntry, dead.size(), due.size());
 }
 
 #endif

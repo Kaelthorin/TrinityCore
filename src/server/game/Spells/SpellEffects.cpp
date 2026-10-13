@@ -468,13 +468,8 @@ void Spell::EffectResurrectNew()
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
-    // [raid_rez] the Classic 70291 rez spells are this effect (329, loaded as an effect with no handler and no implicit target until
-    // 2026-10-10: the casts completed, spent their mana and offered nothing); every early return says why, and the offer says it was sent.
-    bool const logRez = m_caster->IsPlayer();
     if (!m_corpseTarget && !unitTarget)
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed with no target (unit or corpse)", m_caster->GetName(), m_spellInfo->Id);
         return;
     }
 
@@ -487,17 +482,11 @@ void Spell::EffectResurrectNew()
 
     if (!player || player->IsAlive() || !player->IsInWorld())
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: not offered (player={} alive={} in_world={})", m_caster->GetName(),
-                m_spellInfo->Id, m_corpseTarget ? "a corpse" : "a unit", int(player != nullptr), player ? int(player->IsAlive()) : -1,
-                player ? int(player->IsInWorld()) : -1);
         return;
     }
 
     if (player->IsResurrectRequested())       // already have one active request
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: an offer is already pending", m_caster->GetName(), m_spellInfo->Id, player->GetName());
         return;
     }
 
@@ -506,9 +495,6 @@ void Spell::EffectResurrectNew()
     ExecuteLogEffectResurrect(effectInfo->Effect, player);
     player->SetResurrectRequestData(m_caster, health, mana, 0);
     SendResurrectRequest(player);
-    if (logRez)
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} offered a resurrection to {} (health {} mana {})", m_caster->GetName(), m_spellInfo->Id,
-            player->GetName(), health, mana);
 }
 
 void Spell::EffectInstaKill()
@@ -1618,10 +1604,6 @@ void Spell::EffectEnergize()
         return;
 
     Powers power = Powers(effectInfo->MiscValue);
-    if (power == POWER_COMBO_POINTS && unitTarget->IsPlayer())
-        TC_LOG_INFO("playerbot.v2", "[combo] energize {} {} ({}) on {}: power {} max {} amount {} victim {}", unitCaster->GetName(), m_spellInfo->Id,
-            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], unitTarget->GetName(), unitTarget->GetPower(power), unitTarget->GetMaxPower(power),
-            GetEffectValueAsInt(), m_targets.GetUnitTargetGUID().ToString());
     if (unitTarget->GetMaxPower(power) == 0)
         return;
 
@@ -3741,13 +3723,8 @@ void Spell::EffectResurrect()
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
-    // [raid_rez] where a landed resurrection goes (Karrz, MC 2026-10-10: bot casts ran to the end and the owner was never offered one):
-    // every early return says why, and the offer says it was sent.
-    bool const logRez = m_caster->IsPlayer();
     if (!m_corpseTarget && !unitTarget)
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed with no target (unit or corpse)", m_caster->GetName(), m_spellInfo->Id);
         return;
     }
 
@@ -3760,17 +3737,11 @@ void Spell::EffectResurrect()
 
     if (!player || player->IsAlive() || !player->IsInWorld())
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: not offered (player={} alive={} in_world={})", m_caster->GetName(),
-                m_spellInfo->Id, m_corpseTarget ? "a corpse" : "a unit", int(player != nullptr), player ? int(player->IsAlive()) : -1,
-                player ? int(player->IsInWorld()) : -1);
         return;
     }
 
     if (player->IsResurrectRequested())       // already have one active request
     {
-        if (logRez)
-            TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} landed on {}: an offer is already pending", m_caster->GetName(), m_spellInfo->Id, player->GetName());
         return;
     }
 
@@ -3781,9 +3752,6 @@ void Spell::EffectResurrect()
 
     player->SetResurrectRequestData(m_caster, health, mana, 0);
     SendResurrectRequest(player);
-    if (logRez)
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} offered a resurrection to {} (health {} mana {}, effect value {})", m_caster->GetName(),
-            m_spellInfo->Id, player->GetName(), health, mana, effectValue);
 }
 
 void Spell::EffectAddExtraAttacks()

@@ -26,6 +26,16 @@
 Playerbot.SharedDatabase = "playerbot"
 
 #-----------------------------------------------------------------------------
+# Logging
+#-----------------------------------------------------------------------------
+
+# Bot diagnostics ([wedge], [move_lock], [path_fail] ...) go to Playerbot.log; add Console to watch them live.
+# CrashRing is the worldserver.conf appender that keeps the last lines for the crash report.
+Appender.Playerbot=2,3,0,Playerbot.log,w,67108864,5
+Logger.playerbot.v2=3,Playerbot CrashRing
+Logger.playerbot.api=3,Playerbot CrashRing
+
+#-----------------------------------------------------------------------------
 # Core / threading
 #-----------------------------------------------------------------------------
 

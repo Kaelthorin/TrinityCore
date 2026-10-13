@@ -1998,21 +1998,6 @@ void Map::SendObjectUpdates()
 {
     UpdateDataMapType update_players;
 
-#if defined(TRINITY_PLAYERBOT_V2)
-    // [netstat] human players on this map whose sessions count outgoing traffic: attribute
-    // each object's value-update bytes to it (one hash lookup per object per such player).
-    std::vector<Player*> netStatPlayers;
-    for (MapReference const& ref : GetPlayers())
-        if (Player* player = ref.GetSource())
-            if (player->GetSession() && player->GetSession()->IsNetStatEnabled())
-                netStatPlayers.push_back(player);
-    std::vector<std::size_t> netStatSizes(netStatPlayers.size());
-    auto const netStatBufferSize = [&update_players](Player* player) -> std::size_t
-    {
-        auto itr = update_players.find(player);
-        return itr != update_players.end() ? itr->second.GetBuffer().size() : 0;
-    };
-#endif
 
     while (!_updateObjects.empty())
     {
@@ -2041,18 +2026,9 @@ void Map::SendObjectUpdates()
             continue;
         }
 
-#if defined(TRINITY_PLAYERBOT_V2)
-        for (std::size_t i = 0; i < netStatPlayers.size(); ++i)
-            netStatSizes[i] = netStatBufferSize(netStatPlayers[i]);
-#endif
 
         obj->BuildUpdate(update_players);
 
-#if defined(TRINITY_PLAYERBOT_V2)
-        for (std::size_t i = 0; i < netStatPlayers.size(); ++i)
-            if (std::size_t const after = netStatBufferSize(netStatPlayers[i]); after > netStatSizes[i])
-                netStatPlayers[i]->GetSession()->NetStatAddUpdateSource(obj->GetGUID(), uint32(after - netStatSizes[i]));
-#endif
     }
 
     WorldPacket packet;                                     // here we allocate a std::vector with a size of 0x10000
@@ -3105,14 +3081,12 @@ void InstanceMap::BindPlayerOnEntry(Player* player)
     if (playerLock && !playerLock->IsNew() && !playerLock->IsExpired())
     {
         i_respawnsPersisted = true; // already bound (re-entry after logout or restart)
-        TC_LOG_INFO("playerbot.v2", "[raid_lock] {} map {} instance {} persisted=1 lock=existing gm={}", player->GetName(), GetId(), GetInstanceId(), player->IsGameMaster());
         return;
     }
 
     i_respawnsPersisted = true;
 
     CreateInstanceLockForPlayer(player);
-    TC_LOG_INFO("playerbot.v2", "[raid_lock] {} map {} instance {} persisted=1 lock=new gm={}", player->GetName(), GetId(), GetInstanceId(), player->IsGameMaster());
 }
 
 bool InstanceMap::PersistsRespawnTimes() const

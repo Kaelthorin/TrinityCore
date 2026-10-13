@@ -61,9 +61,7 @@ class FollowMovementGenerator : public MovementGenerator, public AbstractFollowe
         Optional<TimeTracker> _duration;
         std::unique_ptr<PathGenerator> _path;
         Optional<Position> _lastTargetPosition;
-#if defined(TRINITY_PLAYERBOT_V2)
         bool _throttleRepath = false;   // owner is a playerbot: see Update
-#endif
 };
 
 #endif

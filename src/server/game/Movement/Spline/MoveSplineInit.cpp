@@ -226,9 +226,6 @@ namespace Movement
                     float const flat = std::sqrt(d.x * d.x + d.y * d.y);
                     if (std::fabs(d.z) > 3.0f && flat < 1.5f * std::fabs(d.z))
                     {
-                        TC_LOG_INFO("playerbot.v2", "[spline_cut] unit={} segment {}/{} dz={:.1f} flat={:.1f} at ({:.1f},{:.1f},{:.1f})",
-                                    unit->GetGUID().GetCounter(), i, args.path.size(), d.z, flat,
-                                    args.path[i - 1].x, args.path[i - 1].y, args.path[i - 1].z);
                         args.path.resize(i);
                         break;
                     }

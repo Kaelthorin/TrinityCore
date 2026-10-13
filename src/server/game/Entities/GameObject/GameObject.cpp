@@ -1690,22 +1690,7 @@ void GameObject::Update(uint32 diff)
                             target->CastSpell(target, goInfo->trap.spell, CastSpellExtraArgs(TRIGGERED_FULL_MASK));
                         else if (goInfo->trap.spell)
                         {
-                            SpellCastResult trapResult = CastSpell(target, goInfo->trap.spell, args);
-                            // Diagnostic [trap_cast]: a failed cast despawns the trap with no visible effect (hunter Explosive Trap report)
-                            if (SpellInfo const* trapSpellInfo = sSpellMgr->GetSpellInfo(goInfo->trap.spell, GetMap()->GetDifficultyID()))
-                            {
-                                std::string effects;
-                                for (SpellEffectInfo const& effectInfo : trapSpellInfo->GetEffects())
-                                    if (effectInfo.IsEffect())
-                                        effects += Trinity::StringFormat(" [eff{} effect={} aura={} targetA={} targetB={} radiusA={:.1f} radiusB={:.1f}]",
-                                            uint32(effectInfo.EffectIndex), uint32(effectInfo.Effect), uint32(effectInfo.ApplyAuraName),
-                                            uint32(effectInfo.TargetA.GetTarget()), uint32(effectInfo.TargetB.GetTarget()),
-                                            effectInfo.CalcRadius(this, SpellTargetIndex::TargetA).Max, effectInfo.CalcRadius(this, SpellTargetIndex::TargetB).Max);
-                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} target {} owner {} goRadius {}{}",
-                                    GetEntry(), goInfo->trap.spell, uint32(trapResult), target->GetGUID(), GetOwnerGUID(), goInfo->trap.radius, effects);
-                            }
-                            else
-                                TC_LOG_INFO("playerbot.v2", "[trap_cast] trap {} spell {} result {} (no SpellInfo)", GetEntry(), goInfo->trap.spell, uint32(trapResult));
+                            CastSpell(target, goInfo->trap.spell, args);
                         }
 
                         // Template value or 4 seconds

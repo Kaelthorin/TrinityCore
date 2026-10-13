@@ -252,14 +252,6 @@ void Battleground::_ProcessPlayerPositionBroadcast(uint32 diff)
             playerPositions.FlagCarriers.push_back(playerPosition);
         }
 
-        // Only an empty list is skipped; the log line lets the PC confirm what the client is sent (map / minimap flag carrier icons).
-        if (!playerPositions.FlagCarriers.empty())
-        {
-            auto const& first = playerPositions.FlagCarriers.front();
-            TC_LOG_INFO("playerbot.v2", "[bg_positions] bg={} instance={} carriers={} first={} icon={} slot={} at ({:.0f},{:.0f}) players={}",
-                GetTypeID(), GetInstanceID(), playerPositions.FlagCarriers.size(), first.Guid.ToString(), int32(first.IconID), int32(first.ArenaSlot),
-                first.Pos.Pos.GetPositionX(), first.Pos.Pos.GetPositionY(), GetPlayersSize());
-        }
         SendPacketToAll(playerPositions.Write());
     }
 }
@@ -1000,7 +992,6 @@ void Battleground::RemovePlayerAtLeave(ObjectGuid guid, bool Transport, bool Sen
             // keeps its PvP match (restricted addon environment) active until told otherwise and leaves the chat box broken (audit F-3).
             if (SendPacket && player->GetSession() && !player->GetSession()->IsBot())
             {
-                TC_LOG_INFO("playerbot.v2", "[bg_leave] {} leaves the battleground (status {}): PVP_MATCH_SET_STATE(Inactive)", player->GetName(), uint32(GetStatus()));
                 player->SendDirectMessage(WorldPackets::Battleground::PVPMatchSetState(WorldPackets::Battleground::PVPMatchState::Inactive).Write());
             }
 

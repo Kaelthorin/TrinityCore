@@ -212,11 +212,6 @@ target_link_libraries(scripts
   PUBLIC
     game-interface)
 
-# WorldSession's layout depends on TRINITY_PLAYERBOT_V2; scripts link game-interface, not game, so set it here as well.
-if(BUILD_PLAYERBOT_V2)
-  target_compile_definitions(scripts PRIVATE TRINITY_PLAYERBOT_V2=1)
-endif()
-
 set_target_properties(scripts
   PROPERTIES
     COMPILE_WARNING_AS_ERROR ${WITH_WARNINGS_AS_ERRORS}

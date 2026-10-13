@@ -174,10 +174,6 @@ public:
                     SetBossState(data.type, DONE);
                     // TEMP DIAG (remove after door-credit confirmed): prove the
                     // AI-less boss kill credits the encounter + opens its door.
-                    TC_LOG_INFO("playerbot.v2",
-                        "[dm_credit] entry={} data_type={} new_state={}",
-                        creature->GetEntry(), uint32(data.type),
-                        uint32(GetBossState(data.type)));
                 }
                 break;
             }

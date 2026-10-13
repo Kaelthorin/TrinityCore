@@ -617,9 +617,6 @@ void WorldSession::HandleMovementOpcode(OpcodeClient opcode, MovementInfo& movem
             if (floor > INVALID_HEIGHT && movementInfo.pos.GetPositionZ() >= floor - 2.0f)
             {
                 under_map = false;
-                if (plrMover->IsAlive())
-                    TC_LOG_INFO("playerbot.v2", "[under_map] {} z={:.1f} is below map min height {:.1f} but stands on geometry at {:.1f}: not out of bounds (map {} {:.1f},{:.1f})",
-                        plrMover->GetName(), movementInfo.pos.GetPositionZ(), min_height, floor, plrMover->GetMapId(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY());
             }
         }
         if (under_map)

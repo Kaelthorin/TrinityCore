@@ -1234,11 +1234,6 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
 
     SpellSchoolMask damageSchoolMask = SpellSchoolMask(damageInfo->schoolMask);
 
-    // Diagnostic (2026-10-09, low spell damage): the stages after the damage bonus, logged once absorb / resist are known.
-    int32 const diagInDamage = damage;
-    int32 diagAfterCrit = damage;
-    int32 diagAfterResilience = damage;
-
     // Spells with SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS ignore resilience because their damage is based off another spell's damage.
     if (!spellInfo->HasAttribute(SPELL_ATTR4_IGNORE_DAMAGE_TAKEN_MODIFIERS))
     {
@@ -1305,11 +1300,9 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
                     damageInfo->HitInfo |= SPELL_HIT_TYPE_CRIT;
                     damage = Unit::SpellCriticalDamageBonus(this, spellInfo, damage, victim);
                 }
-                diagAfterCrit = damage;
 
                 if (CanApplyResilience())
                     Unit::ApplyResilience(victim, &damage);
-                diagAfterResilience = damage;
                 break;
 
             }
@@ -1340,25 +1333,6 @@ void Unit::CalculateSpellDamageTaken(SpellNonMeleeDamage* damageInfo, int32 dama
 
     damageInfo->damage = dmgInfo.GetDamage();
 
-    // Capped at 400 lines like the [spell_dmg] line before it; remove once the low-damage report is explained.
-    if (GetTypeId() == TYPEID_PLAYER && spellInfo->DmgClass == SPELL_DAMAGE_CLASS_MAGIC)
-    {
-        static uint32 s_mitigationDiagLines = 0;
-        WorldSession const* diagSession = ToPlayer()->GetSession();
-        Player const* diagVictim = victim->ToPlayer();
-        bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
-        if (s_mitigationDiagLines < 1500 && humanInvolved)
-        {
-            ++s_mitigationDiagLines;
-            // The resistance steps of the hit: the victim's school resistance, the caster's penetration (spell penetration gear and talents),
-            // and the average resisted share the roll in CalcSpellResistedDamage works from (level gap 8 per level included).
-            float const avgResist = Unit::CalculateAverageResistReduction(this, damageSchoolMask, victim, spellInfo);
-            TC_LOG_INFO("playerbot.v2", "[spell_dmg_post] caster={} spell={} in={} crit={} after_crit={} after_resilience={} resist={} absorb={} final={} (victim={} lvl={} caster_lvl={} school_mask={} victim_resistance={} avg_resist_pct={:.1f})",
-                GetName(), spellInfo->Id, diagInDamage, crit ? 1 : 0, diagAfterCrit, diagAfterResilience, damageInfo->resist, damageInfo->absorb,
-                damageInfo->damage, victim->GetName(), uint32(victim->GetLevelForTarget(this)), uint32(GetLevelForTarget(victim)), uint32(damageSchoolMask),
-                victim->GetResistance(damageSchoolMask), avgResist * 100.0f);
-        }
-    }
 }
 
 void Unit::DealSpellDamage(SpellNonMeleeDamage const* damageInfo, bool durabilityLoss)
@@ -7038,18 +7012,6 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     // Some spells don't benefit from done mods
     if (damagetype == DIRECT_DAMAGE || spellProto->HasAttribute(SPELL_ATTR3_IGNORE_CASTER_MODIFIERS))
     {
-        // Diagnostic (2026-10-08, low spell damage): a player's spell that skips spell power altogether never reaches the line below.
-        if (GetTypeId() == TYPEID_PLAYER)
-        {
-            static uint32 s_skipDiagLines = 0;
-            WorldSession const* skipSession = ToPlayer()->GetSession();
-            if (s_skipDiagLines < 100 && skipSession && !skipSession->IsBot())
-            {
-                ++s_skipDiagLines;
-                TC_LOG_INFO("playerbot.v2", "[spell_dmg] caster={} spell={} base={} NO caster modifiers (damagetype={} ignore_attr={})",
-                    GetName(), spellProto->Id, pdamage, uint32(damagetype), spellProto->HasAttribute(SPELL_ATTR3_IGNORE_CASTER_MODIFIERS) ? 1 : 0);
-            }
-        }
         callDamageScript(pdamage, DoneTotal, DoneTotalMod);
         return int32(std::max(float(pdamage + DoneTotal) * DoneTotalMod, 0.0f));
     }
@@ -7117,34 +7079,11 @@ int32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, int3
     callDamageScript(pdamage, DoneTotal, DoneTotalMod);
 
     float tmpDamage = float(pdamage + DoneTotal) * DoneTotalMod;
-    float const diagBeforeSpellMod = tmpDamage;
 
     // apply spellmod to Done damage (flat and pct)
     if (Player* modOwner = GetSpellModOwner())
         modOwner->ApplySpellMod(spellProto, damagetype == DOT ? SpellModOp::PeriodicHealingAndDamage : SpellModOp::HealingAndDamage, tmpDamage);
 
-    // Diagnostic (2026-10-08, "Shadow Bolt crit only ~800 in T2.5"): what a player's direct/periodic spell damage is made of.
-    // Capped at 400 lines; remove once the low-damage report is explained.
-    if (GetTypeId() == TYPEID_PLAYER && victim)
-    {
-        static uint32 s_dmgDiagLines = 0;
-        WorldSession const* diagSession = ToPlayer()->GetSession();
-        Player const* diagVictim = victim->ToPlayer();
-        bool const humanInvolved = (diagSession && !diagSession->IsBot()) || (diagVictim && diagVictim->GetSession() && !diagVictim->GetSession()->IsBot());
-        if (s_dmgDiagLines < 1500 && humanInvolved)
-        {
-            ++s_dmgDiagLines;
-            // Which auras make up pct_done: the caster's "damage done %" auras that match the spell's school (spell id:amount), so a
-            // talent that is missing or holds a later-era value (Shadow Mastery, Demonic Sacrifice...) is visible by its id.
-            std::string pctAuras;
-            for (AuraEffect const* aurEff : GetAuraEffectsByType(SPELL_AURA_MOD_DAMAGE_PERCENT_DONE))
-                if (aurEff->GetMiscValue() & spellProto->GetSchoolMask())
-                    pctAuras += fmt::format("{}:{} ", aurEff->GetId(), aurEff->GetAmount());
-            TC_LOG_INFO("playerbot.v2","[spell_dmg] caster={} spell={} base={} power={} coeff={:.3f} stack={} pct_done={:.3f} before_spellmod={} -> {} pct_auras=[{}] (victim={} lvl={})",
-                GetName(), spellProto->Id, pdamage, DoneAdvertisedBenefit, spellEffectInfo.BonusCoefficient, stack, DoneTotalMod,
-                int32(std::max(diagBeforeSpellMod, 0.0f)), int32(std::max(tmpDamage, 0.0f)), pctAuras, victim->GetName(), uint32(victim->GetLevel()));
-        }
-    }
 
     return int32(std::max(tmpDamage, 0.0f));
 }
@@ -11786,8 +11725,6 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
                         if (proto->GetQuality() >= ITEM_QUALITY_EPIC)
                             ++epics;
 
-                TC_LOG_INFO("playerbot.v2", "[boss_loot] {} ({}) shared corpse: {} items ({} epic), group {}, loot method {}, tappers {}",
-                    creature->GetName(), creature->GetEntry(), loot->items.size(), epics, group ? "yes" : "no", uint32(loot->GetLootMethod()), tappers.size());
             }
             else if (creature->GetMap()->IsDungeon())
             {

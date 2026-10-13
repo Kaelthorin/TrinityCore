@@ -41,12 +41,6 @@ target_include_directories(game
   PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR})
 
-if(BUILD_PLAYERBOT_V2)
-  target_compile_definitions(game
-    PUBLIC
-      TRINITY_PLAYERBOT_V2=1)
-endif()
-
 target_link_libraries(game
   PRIVATE
     trinity-core-interface

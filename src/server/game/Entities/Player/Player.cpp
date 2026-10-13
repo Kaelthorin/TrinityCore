@@ -5106,12 +5106,6 @@ void Player::RepopAtGraveyard()
     if (!closestGrave)
         closestGrave = sObjectMgr->GetClosestGraveyard(*this, GetTeam(), this);
 
-    if (GetMap()->IsBattlegroundOrArena())
-        TC_LOG_INFO("playerbot.v2", "[bg_repop] {} (team {}) died at map {} ({:.1f},{:.1f},{:.1f}) zone {} -> safe loc {} map {} ({:.1f},{:.1f},{:.1f})",
-            GetName(), uint32(GetTeam()), GetMapId(), GetPositionX(), GetPositionY(), GetPositionZ(), GetZoneId(),
-            closestGrave ? closestGrave->ID : 0u, closestGrave ? closestGrave->Loc.GetMapId() : 0u,
-            closestGrave ? closestGrave->Loc.GetPositionX() : 0.0f, closestGrave ? closestGrave->Loc.GetPositionY() : 0.0f,
-            closestGrave ? closestGrave->Loc.GetPositionZ() : 0.0f);
 
     // stop countdown until repop
     m_deathTimer = 0;
@@ -13992,8 +13986,6 @@ void Player::TradeCancel(bool sendback, TradeStatus status /*= TRADE_STATUS_CANC
     if (m_trade)
     {
         Player* trader = m_trade->GetTrader();
-        if (GetSession()->IsBot() || trader->GetSession()->IsBot())
-            TC_LOG_INFO("playerbot.v2", "[trade] cancel {} <-> {} (status {})", GetName(), trader->GetName(), uint32(status));
 
         if (sendback)
             GetSession()->SendCancelTrade(status);
@@ -14026,7 +14018,6 @@ void Player::UpdateTradeState()
     }
     if (!reason)
         return;
-    TC_LOG_INFO("playerbot.v2", "[trade] closing {}'s trade with {}: {}", GetName(), trader ? trader->GetName() : std::string("?"), reason);
     if (trader && trader->m_trade && trader->m_trade->GetTrader() == this)
         TradeCancel(true, why);
     else
@@ -21094,28 +21085,19 @@ bool Player::CheckInstanceValidity(bool /*isLogin*/)
     if (map->IsRaid() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID) && (map->GetEntry()->Expansion() >= sWorld->getIntConfig(CONFIG_EXPANSION)))
         if (!group || !group->isRaidGroup())
         {
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: {}", GetName(), map->GetId(), map->GetInstanceId(),
-                !group ? "not in a group" : "group is not a raid group");
             return false;
         }
 
     if (group)
     {
         if (group != instance->GetOwningGroup())
-        {
-            Group const* owner = instance->GetOwningGroup();
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: group {} is not the owning group ({})", GetName(), map->GetId(),
-                map->GetInstanceId(), group->GetGUID().ToString(), owner ? owner->GetGUID().ToString() : "none");
             return false;
-        }
     }
     else
     {
         // instance is invalid if we are not grouped and there are other players
         if (map->GetPlayersCountExceptGMs() > 1)
         {
-            TC_LOG_INFO("playerbot.v2", "[raid_lock] {} invalid in map {} instance {}: not grouped with {} other players inside", GetName(), map->GetId(),
-                map->GetInstanceId(), map->GetPlayersCountExceptGMs() - 1);
             return false;
         }
     }
@@ -26045,9 +26027,7 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     // Skip LOGINEFFECT for bots - visual effect requires client rendering
     // Bots don't send CMSG_CAST_SPELL ACKs, causing m_spellModTakingSpell assertion failures (Spell.cpp:603)
-#if defined(TRINITY_PLAYERBOT_V2)
     if (!GetSession()->IsBot())
-#endif
         CastSpell(this, 836, true);                         // LOGINEFFECT
 
     WorldPackets::Movement::MoveSetCompoundState setCompoundState;

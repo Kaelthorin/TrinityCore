@@ -380,7 +380,6 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
 
     if (!group->IsLeader(GetPlayer()->GetGUID()))
     {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} is not the leader of its group, request ignored", GetPlayer()->GetName());
         return;
     }
 
@@ -396,23 +395,19 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
         case NEED_BEFORE_GREED:
             break;
         default:
-            TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent unsupported loot method {}", GetPlayer()->GetName(), uint32(packet.LootMethod));
             return;
     }
 
     if (packet.LootThreshold < ITEM_QUALITY_UNCOMMON || packet.LootThreshold > ITEM_QUALITY_ARTIFACT)
     {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} sent loot threshold {} out of range", GetPlayer()->GetName(), packet.LootThreshold);
         return;
     }
 
     if (packet.LootMethod == MASTER_LOOT && !group->IsMember(packet.LootMasterGUID))
     {
-        TC_LOG_INFO("playerbot.v2", "[loot_method] {} chose a master looter outside the group", GetPlayer()->GetName());
         return;
     }
 
-    TC_LOG_INFO("playerbot.v2", "[loot_method] {} sets loot method {} threshold {}", GetPlayer()->GetName(), uint32(packet.LootMethod), packet.LootThreshold);
     group->SetLootMethod(static_cast<LootMethod>(packet.LootMethod));
     group->SetMasterLooterGuid(packet.LootMethod == MASTER_LOOT ? packet.LootMasterGUID : ObjectGuid::Empty);
     group->SetLootThreshold(static_cast<ItemQualities>(packet.LootThreshold));

@@ -89,7 +89,6 @@ void WorldSession::HandleBattlemasterJoinUnknownLayout(WorldPackets::Battlegroun
     std::string hex;
     for (size_t i = 0; i < data.size() && i < 48; ++i)
         hex += Trinity::StringFormat("{:02X} ", uint32(data[i]));
-    TC_LOG_INFO("playerbot.v2", "[bg_join] opcode 0x{:X} from {}: size {} bytes {}", uint32(packet.GetOpcode()), _player->GetName(), data.size(), hex);
 
     BattlegroundQueueTypeId queueId = BATTLEGROUND_QUEUE_NONE;
     for (size_t offset = 0; offset + sizeof(uint64) <= data.size() && queueId == BATTLEGROUND_QUEUE_NONE; ++offset)
@@ -120,12 +119,10 @@ void WorldSession::HandleBattlemasterJoinUnknownLayout(WorldPackets::Battlegroun
 
     if (queueId == BATTLEGROUND_QUEUE_NONE)
     {
-        TC_LOG_ERROR("playerbot.v2", "[bg_join] {} sent opcode 0x{:X} with no queue id and no open battlemaster", _player->GetName(), uint32(packet.GetOpcode()));
         ChatHandler(this).PSendSysMessage("The battleground join could not be read. Talk to the battlemaster again, or use .playerbot bgjoin wsg|ab|av.");
         return;
     }
 
-    TC_LOG_INFO("playerbot.v2", "[bg_join] {} queues for battleground {}", _player->GetName(), uint32(queueId.BattlemasterListId));
     JoinBattlegroundQueue(queueId);
 }
 
@@ -138,7 +135,6 @@ void WorldSession::HandleBattlemasterJoinBlitz(WorldPackets::Battleground::Battl
 // battleground join has its own opcode (0x3F00C0 -> CMSG_BATTLEMASTER_JOIN): only log it.
 void WorldSession::HandleBattlemasterJoinArenaRaw(WorldPackets::Battleground::BattlemasterJoinArenaRaw& packet)
 {
-    TC_LOG_INFO("playerbot.v2", "[bg_join] arena opcode from {}: size {} (ignored)", _player->GetName(), packet.Data.size());
 }
 
 void WorldSession::JoinBattlegroundQueue(BattlegroundQueueTypeId bgQueueTypeId)
@@ -398,16 +394,6 @@ void WorldSession::HandleBattlefieldListOpcode(WorldPackets::Battleground::Battl
 
 void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::BattlefieldPort& battlefieldPort)
 {
-    TC_LOG_INFO("playerbot.v2", "[bg_port] {} ticket id {} type {} time {} accepted {} queues: {}", _player->GetName(), battlefieldPort.Ticket.Id,
-        uint32(battlefieldPort.Ticket.Type), battlefieldPort.Ticket.Time.AsUnderlyingType(), uint32(battlefieldPort.AcceptedInvite),
-        [&]
-        {
-            std::string slots;
-            for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
-                if (BattlegroundQueueTypeId q = _player->GetBattlegroundQueueTypeId(i); q != BATTLEGROUND_QUEUE_NONE)
-                    slots += Trinity::StringFormat("{}={} ", uint32(i), uint32(q.BattlemasterListId));
-            return slots;
-        }());
 
     if (!_player->InBattlegroundQueue())
     {
@@ -426,8 +412,6 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
             BattlegroundQueueTypeId queued = _player->GetBattlegroundQueueTypeId(i);
             if (queued == BATTLEGROUND_QUEUE_NONE)
                 continue;
-            TC_LOG_ERROR("playerbot.v2", "[bg_port] {} leave with ticket slot {} matched no queue: removed from queue slot {} (battleground {})",
-                _player->GetName(), battlefieldPort.Ticket.Id, uint32(i), uint32(queued.BattlemasterListId));
             WorldPackets::Battleground::BattlefieldStatusNone battlefieldStatus;
             battlefieldStatus.Ticket = battlefieldPort.Ticket;
             battlefieldStatus.Ticket.Id = i;
@@ -451,8 +435,6 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
             for (uint8 i = 0; i < PLAYER_MAX_BATTLEGROUND_QUEUES; ++i)
                 if (isInvited(_player->GetBattlegroundQueueTypeId(i)))
                 {
-                    TC_LOG_ERROR("playerbot.v2", "[bg_port] {} accepted with ticket slot {} but the invite is in queue slot {}: using that slot",
-                        _player->GetName(), battlefieldPort.Ticket.Id, uint32(i));
                     battlefieldPort.Ticket.Id = i;
                     break;
                 }
@@ -635,7 +617,6 @@ void WorldSession::HandleBattleFieldPortOpcode(WorldPackets::Battleground::Battl
 
 void WorldSession::HandleBattlefieldLeaveOpcode(WorldPackets::Battleground::BattlefieldLeave& /*battlefieldLeave*/)
 {
-    TC_LOG_INFO("playerbot.v2", "[bg_leave] {} CMSG_BATTLEFIELD_LEAVE in battleground {} queued {}", _player->GetName(), _player->InBattleground(), _player->InBattlegroundQueue());
 
     // not allow leave battleground in combat
     if (_player->IsInCombat())
@@ -664,7 +645,6 @@ void WorldSession::HandleBattlefieldLeaveOpcode(WorldPackets::Battleground::Batt
                     sBattlegroundMgr->GetBattlegroundQueue(qid).RemovePlayer(member->GetGUID(), true);
                     member->RemoveBattlegroundQueueId(qid);
                 }
-                TC_LOG_INFO("playerbot.v2", "[bg_leave] {} leaves with group owner {}", member->GetName(), _player->GetName());
             }
 }
 

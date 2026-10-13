@@ -3661,17 +3661,6 @@ void Spell::cancel(SpellCastResult result /*= SPELL_FAILED_INTERRUPTED*/, Option
     SpellState oldState = m_spellState;
     m_spellState = SPELL_STATE_FINISHED;
 
-    // [raid_rez] a resurrection cancelled before it landed (Karrz, MC 2026-10-10: bot rez casts run their 10 s down and the owner is never
-    // offered one; the start and the completion refusal were logged, a cancel was not): who, what state, how much cast bar was left.
-    if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-    {
-        Unit const* uc = m_caster->ToUnit();
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} cancelled: result {} state {} timer {} ms target {} moving={} in_combat={} alive={}",
-            m_caster->GetName(), m_spellInfo->Id, uint32(result), uint32(oldState), m_timer,
-            m_targets.GetUnitTarget() ? m_targets.GetUnitTarget()->GetName() : std::string("-"),
-            uc ? int(uc->isMoving()) : -1, uc ? int(uc->IsInCombat()) : -1, uc ? int(uc->IsAlive()) : -1);
-    }
-
     m_autoRepeat = false;
     switch (oldState)
     {
@@ -3801,10 +3790,6 @@ void Spell::_cast(bool skipCheck)
         {
             // [raid_rez] (Garr test 2026-10-08: rez casts of 10 s that never landed and never failed at the start): the result of a
             // resurrection that is refused when its cast bar completes.
-            if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-                TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} refused when the cast bar completed: result {}, target {}",
-                    m_caster->GetName(), m_spellInfo->Id, uint32(res),
-                    m_targets.GetUnitTarget() ? m_targets.GetUnitTarget()->GetName() : std::string("-"));
             SendCastResult(res, p1, p2);
             SendInterrupted(res);
 
@@ -4444,11 +4429,6 @@ void Spell::finish(SpellCastResult result)
 
     // [raid_rez] how a resurrection ended (Karrz, MC 2026-10-10): the result, and how many targets survived target selection (a target
     // dropped by CheckTarget / the effect mask leaves a cast that "succeeds" and offers nothing).
-    if ((m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT) || m_spellInfo->HasEffect(SPELL_EFFECT_RESURRECT_NEW)) && m_caster->IsPlayer())
-        TC_LOG_INFO("playerbot.v2", "[raid_rez] {} spell {} finished: result {} unit targets {} corpse targets {} (first unit mask {:#x} miss {})",
-            m_caster->GetName(), m_spellInfo->Id, uint32(result), m_UniqueTargetInfo.size(), m_UniqueCorpseTargetInfo.size(),
-            m_UniqueTargetInfo.empty() ? 0u : m_UniqueTargetInfo.front().EffectMask,
-            m_UniqueTargetInfo.empty() ? 0u : uint32(m_UniqueTargetInfo.front().MissCondition));
 
     // successful cast of the initial autorepeat spell is moved to idle state so that it is not deleted as long as autorepeat is active
     if (IsAutoRepeat() && unitCaster->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL) == this)
@@ -5577,19 +5557,6 @@ void Spell::TakePower()
 
     for (SpellPowerCost& cost : m_powerCost)
     {
-        if (cost.Power == POWER_COMBO_POINTS && unitCaster->IsPlayer())
-            TC_LOG_INFO("playerbot.v2", "[combo] finisher {} {} ({}): cost {} power {} max {} target {}", unitCaster->GetName(), m_spellInfo->Id,
-                (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], cost.Amount, unitCaster->GetPower(POWER_COMBO_POINTS),
-                unitCaster->GetMaxPower(POWER_COMBO_POINTS), m_targets.GetUnitTargetGUID().ToString());
-        // [mana_cast] every mana payment of a healer-capable class in a group (raid or 5-man) (MC Garr 2026-10-10: healers lost 20 % mana in 30 s while only a
-        // handful of [heal_cast] lines were logged: heals, HoTs, buffs, rezzes and every other spell show here with the mana paid).
-        if (cost.Power == POWER_MANA && cost.Amount > 0 && unitCaster->IsPlayer())
-            if (Player const* castPlayer = unitCaster->ToPlayer())
-                if (castPlayer->GetGroup())
-                    if (uint8 const castClass = castPlayer->GetClass(); castClass == CLASS_PRIEST || castClass == CLASS_PALADIN || castClass == CLASS_DRUID || castClass == CLASS_SHAMAN)
-                        TC_LOG_INFO("playerbot.v2", "[mana_cast] {} {} ({}) cost {} mana {}/{} target {}", castPlayer->GetName(), m_spellInfo->Id,
-                            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], cost.Amount, unitCaster->GetPower(POWER_MANA),
-                            unitCaster->GetMaxPower(POWER_MANA), m_targets.GetUnitTargetGUID().ToString());
         if (!hit)
         {
             // skipping granting power through negative cost only when spell has SPELL_ATTR1_DISCOUNT_POWER_ON_MISS is correct behavior
@@ -5643,8 +5610,6 @@ void Spell::SpendPendingComboPoints()
     m_comboPointsPending = 0;
     if (Unit* unitCaster = m_caster ? m_caster->ToUnit() : nullptr)
     {
-        TC_LOG_INFO("playerbot.v2", "[combo] spent {} {} ({}): {} of {} points", unitCaster->GetName(), m_spellInfo->Id,
-            (*m_spellInfo->SpellName)[sWorld->GetDefaultDbcLocale()], points, unitCaster->GetPower(POWER_COMBO_POINTS));
         unitCaster->ModifyPower(POWER_COMBO_POINTS, -points);
     }
 }
@@ -7040,9 +7005,6 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                             if (lastLog == 0 || getMSTime() - lastLog >= 20000u)
                             {
                                 lastLog = getMSTime();
-                                TC_LOG_INFO("playerbot.v2", "[bg_mount] {} refused: {} (at {:.0f},{:.0f},{:.0f}, bg status {}){}", unitCaster->GetName(), why,
-                                            unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), uint32(bg->GetStatus()),
-                                            !unitCaster->IsOutdoors() ? " - " + bg->DescribeIndoors(unitCaster->ToPlayer()) : std::string());
                             }
                             return SPELL_FAILED_ONLY_OUTDOORS;
                         }
@@ -7055,9 +7017,6 @@ SpellCastResult Spell::CheckCast(bool strict, int32* param1 /*= nullptr*/, int32
                             if (lastOk == 0 || getMSTime() - lastOk >= 5000u)
                             {
                                 lastOk = getMSTime();
-                                TC_LOG_INFO("playerbot.v2", "[bg_mount_ok] {} mount allowed at ({:.0f},{:.0f},{:.0f}), bg status {}: {}", unitCaster->GetName(),
-                                            unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), uint32(bg->GetStatus()),
-                                            bg->DescribeIndoors(unitCaster->ToPlayer()));
                             }
                         }
                 break;

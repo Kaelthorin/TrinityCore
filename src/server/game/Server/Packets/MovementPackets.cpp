@@ -714,17 +714,6 @@ Optional<ZeroLengthSegment> FindZeroLengthSegment(MonsterMove const& packet, flo
 
 WorldPacket const* MonsterMove::Write()
 {
-    if (Optional<ZeroLengthSegment> zero = FindZeroLengthSegment(*this))
-    {
-        static std::atomic<uint32> s_count{ 0 };
-        uint32 const n = ++s_count;
-        if (n <= 200 || n % 1000 == 0)
-            TC_LOG_ERROR("playerbot.v2", "[spline_zero] #{} mover={} segment {}/{} len={:.3f} flags={:#x} face={} points={} deltas={} pos=({:.2f},{:.2f},{:.2f}) first=({:.2f},{:.2f},{:.2f})",
-                n, MoverGUID.ToString(), zero->Index, zero->Nodes, zero->Length, SplineData.Move.Flags, int32(SplineData.Move.Face),
-                SplineData.Move.Points.size(), SplineData.Move.PackedDeltas.size(), Pos.Pos.GetPositionX(), Pos.Pos.GetPositionY(), Pos.Pos.GetPositionZ(),
-                SplineData.Move.Points.front().Pos.GetPositionX(), SplineData.Move.Points.front().Pos.GetPositionY(), SplineData.Move.Points.front().Pos.GetPositionZ());
-    }
-
     _worldPacket << MoverGUID;
     _worldPacket << SplineData;
     _worldPacket << Pos;

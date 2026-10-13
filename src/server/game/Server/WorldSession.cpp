@@ -54,27 +54,6 @@
 #include "World.h"
 #include "WorldSocket.h"
 #include <boost/circular_buffer.hpp>
-#if defined(TRINITY_PLAYERBOT_V2)
-#include "CharacterCache.h"
-#include "Config.h"
-#include <algorithm>
-#include <mutex>
-#include <unordered_map>
-#include <vector>
-
-// [netstat] per-opcode outgoing counters for one human session. Allocated only for
-// non-bot sessions with Playerbot.NetStat.Enable=1 (~20 KB each).
-struct WorldSession::NetStatCounters
-{
-    std::array<std::atomic<uint32>, NUM_SMSG_OPCODES> Count{};
-    std::array<std::atomic<uint64>, NUM_SMSG_OPCODES> Bytes{};
-    std::array<std::atomic<char const*>, NUM_SMSG_OPCODES> Name{};
-
-    // SMSG_UPDATE_OBJECT value-update bytes by source object (written by map threads).
-    std::mutex SourceLock;
-    std::unordered_map<ObjectGuid, std::pair<uint32, uint64>> UpdateSources;
-};
-#endif
 
 namespace {
 
@@ -128,11 +107,8 @@ bool WorldSessionFilter::Process(WorldPacket* packet)
 /// WorldSession constructor
 WorldSession::WorldSession(uint32 id, std::string&& name, uint32 battlenetAccountId, std::string&& battlenetAccountEmail,
     std::shared_ptr<WorldSocket>&& sock, AccountTypes sec, uint8 expansion, time_t mute_time, std::string&& os, Minutes timezoneOffset,
-    uint32 build, ClientBuild::VariantId clientBuildVariant, LocaleConstant locale, uint32 recruiter, bool isARecruiter
-#if defined(TRINITY_PLAYERBOT_V2)
-    , bool is_bot
-#endif
-    ) :
+    uint32 build, ClientBuild::VariantId clientBuildVariant, LocaleConstant locale, uint32 recruiter, bool isARecruiter,
+    bool isBot) :
     m_muteTime(mute_time),
     m_timeOutTime(0),
     AntiDOS(this),
@@ -175,10 +151,8 @@ WorldSession::WorldSession(uint32 id, std::string&& name, uint32 battlenetAccoun
     _timeSyncTimer(0),
     _calendarEventCreationCooldown(0),
     _battlePetMgr(std::make_unique<BattlePets::BattlePetMgr>(this)),
-    _collectionMgr(std::make_unique<CollectionMgr>(this))
-#if defined(TRINITY_PLAYERBOT_V2)
-    , _isBot(is_bot)
-#endif
+    _collectionMgr(std::make_unique<CollectionMgr>(this)),
+    _isBot(isBot)
 {
     if (m_Socket[CONNECTION_TYPE_REALM])
     {
@@ -186,15 +160,8 @@ WorldSession::WorldSession(uint32 id, std::string&& name, uint32 battlenetAccoun
         ResetTimeOutTime(false);
         LoginDatabase.PExecute("UPDATE account SET online = 1 WHERE id = {};", GetAccountId());     // One-time query
     }
-#if defined(TRINITY_PLAYERBOT_V2)
-    else if (is_bot)
-    {
+    else if (_isBot)
         m_Address = "bot";
-    }
-
-    if (!is_bot && sConfigMgr->GetBoolDefault("Playerbot.NetStat.Enable", false))
-        _netStat = std::make_unique<NetStatCounters>();
-#endif
 
     _instanceConnectKey.Raw = UI64LIT(0);
 }
@@ -211,9 +178,7 @@ WorldSession::~WorldSession()
     {
         if (m_Socket[i])
         {
-#if defined(TRINITY_PLAYERBOT_V2)
-            if (!IsBot())  // Bot sessions have nullptr sockets
-#endif
+            if (!IsBot())  // bot sessions have no socket
                 m_Socket[i]->CloseSocket();
             m_Socket[i].reset();
         }
@@ -226,90 +191,14 @@ WorldSession::~WorldSession()
     while (_recvQueue.next(packet))
         delete packet;
 
-#if defined(TRINITY_PLAYERBOT_V2)
     // Bot sessions share the owner GM's account id. The ctor never sets
     // online=1 for them (the ctor's online=1 query is gated on a non-null
     // socket), so the dtor must symmetrically skip clearing it — otherwise
     // a bot logging out flips the GM's account.online to 0 while the GM is
     // still in-world.
     if (!IsBot())
-#endif
         LoginDatabase.PExecute("UPDATE account SET online = 0 WHERE id = {};", GetAccountId());     // One-time query
 }
-
-#if defined(TRINITY_PLAYERBOT_V2)
-void WorldSession::NetStatAddUpdateSource(ObjectGuid const& source, uint32 bytes)
-{
-    if (!_netStat || !bytes)
-        return;
-
-    std::lock_guard<std::mutex> lock(_netStat->SourceLock);
-    std::pair<uint32, uint64>& entry = _netStat->UpdateSources[source];
-    ++entry.first;
-    entry.second += bytes;
-}
-
-void WorldSession::NetStatFlush(uint32 elapsedMs)
-{
-    struct OpcodeStat { char const* Name; uint32 Count; uint64 Bytes; };
-    std::vector<OpcodeStat> stats;
-    uint64 totalCount = 0;
-    uint64 totalBytes = 0;
-    for (std::size_t i = 0; i < NUM_SMSG_OPCODES; ++i)
-    {
-        uint32 const count = _netStat->Count[i].exchange(0, std::memory_order_relaxed);
-        uint64 const bytes = _netStat->Bytes[i].exchange(0, std::memory_order_relaxed);
-        if (!count)
-            continue;
-        totalCount += count;
-        totalBytes += bytes;
-        char const* name = _netStat->Name[i].load(std::memory_order_relaxed);
-        stats.push_back({ name ? name : "?", count, bytes });
-    }
-
-    std::unordered_map<ObjectGuid, std::pair<uint32, uint64>> sources;
-    {
-        std::lock_guard<std::mutex> lock(_netStat->SourceLock);
-        sources.swap(_netStat->UpdateSources);
-    }
-
-    if (!_player || !totalCount || !sLog->ShouldLog("playerbot.v2", LOG_LEVEL_INFO))
-        return;
-
-    auto const byCount = [](OpcodeStat const& a, OpcodeStat const& b) { return a.Count > b.Count; };
-    std::size_t const topN = std::min<std::size_t>(10, stats.size());
-    std::partial_sort(stats.begin(), stats.begin() + topN, stats.end(), byCount);
-
-    std::string line = Trinity::StringFormat("[netstat] {} {}s: total {} pkts / {} bytes ({:.0f} pkt/s); top:",
-        _player->GetName(), (elapsedMs + 500) / 1000, totalCount, totalBytes, totalCount * 1000.0 / std::max<uint32>(elapsedMs, 1));
-    for (std::size_t i = 0; i < topN; ++i)
-        line += Trinity::StringFormat("{} {} x{} ({} bytes)", i ? "," : "", stats[i].Name, stats[i].Count, stats[i].Bytes);
-
-    if (!sources.empty())
-    {
-        std::vector<std::pair<ObjectGuid, std::pair<uint32, uint64>>> top(sources.begin(), sources.end());
-        std::size_t const topSources = std::min<std::size_t>(5, top.size());
-        std::partial_sort(top.begin(), top.begin() + topSources, top.end(),
-            [](auto const& a, auto const& b) { return a.second.second > b.second.second; });
-        uint64 sourceBytes = 0;
-        for (auto const& [guid, stat] : top)
-            sourceBytes += stat.second;
-        line += Trinity::StringFormat("; update-values {} objs / {} bytes, top:", top.size(), sourceBytes);
-        for (std::size_t i = 0; i < topSources; ++i)
-        {
-            ObjectGuid const& guid = top[i].first;
-            std::string name;
-            if (guid.IsPlayer())
-                sCharacterCache->GetCharacterNameByGuid(guid, name);
-            if (name.empty())
-                name = Trinity::StringFormat("{}:{}", guid.GetTypeName(), guid.GetEntry());
-            line += Trinity::StringFormat("{} {} x{} ({} bytes)", i ? "," : "", name, top[i].second.first, top[i].second.second);
-        }
-    }
-
-    TC_LOG_INFO("playerbot.v2", "{}", line);
-}
-#endif
 
 bool WorldSession::PlayerDisconnected() const
 {
@@ -424,16 +313,6 @@ void WorldSession::SendPacket(WorldPacket const* packet, bool forced /*= false*/
     }
 #endif                                                      // !TRINITY_DEBUG
 
-#if defined(TRINITY_PLAYERBOT_V2)
-    if (_netStat)
-    {
-        std::ptrdiff_t const idx = GetOpcodeArrayIndex(static_cast<OpcodeServer>(packet->GetOpcode()));   // validated by IsValid above
-        if (_netStat->Count[idx].fetch_add(1, std::memory_order_relaxed) == 0)
-            _netStat->Name[idx].store(handler->Name, std::memory_order_relaxed);
-        _netStat->Bytes[idx].fetch_add(packet->size(), std::memory_order_relaxed);
-    }
-#endif
-
     sScriptMgr->OnPacketSend(this, *packet);
 
     TC_LOG_TRACE("network.opcode", "S->C: {} {}", GetPlayerInfo(), GetOpcodeNameForLogging(static_cast<OpcodeServer>(packet->GetOpcode())));
@@ -489,11 +368,7 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
     /// If necessary, kick the player because the client didn't send anything for too long
     /// (or they've been idling in character select)
     /// Note: Bots don't have sockets, so skip idle check for them
-#if defined(TRINITY_PLAYERBOT_V2)
     if (!IsBot() && IsConnectionIdle() && !HasPermission(rbac::RBAC_PERM_IGNORE_IDLE_CONNECTION) && m_Socket[CONNECTION_TYPE_REALM])
-#else
-    if (IsConnectionIdle() && !HasPermission(rbac::RBAC_PERM_IGNORE_IDLE_CONNECTION))
-#endif
         m_Socket[CONNECTION_TYPE_REALM]->CloseSocket();
 
     // Classic 1.60: character list mail data, sent once the character list is shown (see HandleCharEnum)
@@ -508,19 +383,6 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
         else
             _classicCharacterMailDataTimer -= diff;
     }
-
-#if defined(TRINITY_PLAYERBOT_V2)
-    // [netstat] flush on the world-thread pass only (the map-thread pass uses MapSessionFilter).
-    if (_netStat && updater.ProcessUnsafe())
-    {
-        _netStatTimer += diff;
-        if (_netStatTimer >= 10 * IN_MILLISECONDS)
-        {
-            NetStatFlush(_netStatTimer);
-            _netStatTimer = 0;
-        }
-    }
-#endif
 
     ///- Retrieve packets from the receive queue and call the appropriate handlers
     /// not process packets if socket already closed
@@ -730,11 +592,9 @@ void WorldSession::LogoutPlayer(bool save)
 
     if (_player)
     {
-#if defined(TRINITY_PLAYERBOT_V2)
         // Captured early because the bot-only per-character offline write
         // below runs after _player is nulled out by SetPlayer(nullptr).
         uint64 const playerGuidLow = _player->GetGUID().GetCounter();
-#endif
 
         if (!_player->GetLootGUID().IsEmpty())
             DoLootReleaseAll();
@@ -862,7 +722,6 @@ void WorldSession::LogoutPlayer(bool save)
         SendPacket(WorldPackets::Character::LogoutComplete().Write());
         TC_LOG_DEBUG("network", "SESSION: Sent SMSG_LOGOUT_COMPLETE Message");
 
-#if defined(TRINITY_PLAYERBOT_V2)
         // Bots violate the "one online char per account" assumption: a GM can
         // be in-world alongside several bot chars on the same account. The
         // bulk `WHERE account = ?` query below would mark the GM's own char
@@ -873,7 +732,6 @@ void WorldSession::LogoutPlayer(bool save)
             CharacterDatabase.PExecute("UPDATE characters SET online = 0 WHERE guid = {}", playerGuidLow);
         }
         else
-#endif
         {
             //! Since each account can only have one online character at any given time, ensure all characters for active account are marked as offline
             CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_ACCOUNT_ONLINE);
