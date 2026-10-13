@@ -469,9 +469,7 @@ void Spell::EffectResurrectNew()
         return;
 
     if (!m_corpseTarget && !unitTarget)
-    {
         return;
-    }
 
     Player* player = nullptr;
 
@@ -481,14 +479,10 @@ void Spell::EffectResurrectNew()
         player = unitTarget->ToPlayer();
 
     if (!player || player->IsAlive() || !player->IsInWorld())
-    {
         return;
-    }
 
     if (player->IsResurrectRequested())       // already have one active request
-    {
         return;
-    }
 
     uint32 health = GetEffectValueAsInt();
     uint32 mana = effectInfo->MiscValue;
@@ -1630,9 +1624,20 @@ void Spell::EffectEnergize()
             break;
     }
 
-    if (power == POWER_COMBO_POINTS)
-        if (Player* comboPlayer = unitTarget->ToPlayer())
-            comboPlayer->GainComboPointsOn(m_targets.GetUnitTarget());
+    // Classic 1.60 (game rule 112): combo points belong to one target. The client shows them and allows finishers only while
+    // UnitData ClassicComboTarget is the current target (official sniff: set when Sinister Strike awards the first point), and
+    // building points on another target starts over from zero
+    if (power == POWER_COMBO_POINTS && unitTarget == unitCaster && unitCaster->IsPlayer())
+    {
+        if (Unit* comboTarget = m_targets.GetUnitTarget(); comboTarget && comboTarget != unitCaster)
+        {
+            if (unitCaster->GetClassicComboTarget() != comboTarget->GetGUID())
+            {
+                unitCaster->SetPower(POWER_COMBO_POINTS, 0);
+                unitCaster->SetClassicComboTarget(comboTarget->GetGUID());
+            }
+        }
+    }
 
     unitCaster->EnergizeBySpell(unitTarget, m_spellInfo, energizeAmount, power);
 }
@@ -3724,9 +3729,7 @@ void Spell::EffectResurrect()
         return;
 
     if (!m_corpseTarget && !unitTarget)
-    {
         return;
-    }
 
     Player* player = nullptr;
 
@@ -3736,14 +3739,10 @@ void Spell::EffectResurrect()
         player = unitTarget->ToPlayer();
 
     if (!player || player->IsAlive() || !player->IsInWorld())
-    {
         return;
-    }
 
     if (player->IsResurrectRequested())       // already have one active request
-    {
         return;
-    }
 
     uint32 health = player->CountPctFromMaxHealth(effectValue);
     uint32 mana   = CalculatePct(player->GetMaxPower(POWER_MANA), effectValue);

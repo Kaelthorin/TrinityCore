@@ -2251,12 +2251,6 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void UpdateMaxHealth() override;
         void UpdateMaxPower(Powers power) override;
         uint32 GetPowerIndex(Powers power) const override;
-
-        // Vanilla combo points: they belong to one unit, which the Classic client reads as the owner-only ComboTarget
-        ObjectGuid GetComboTarget() const { return *m_unitData->ClassicComboTarget; }
-        void SetComboTarget(ObjectGuid const& guid);
-        void GainComboPointsOn(Unit const* victim);
-        void UpdateComboTarget();
         ClassPowerTypes GetPowerTypes() const override;
         void UpdateAttackPowerAndDamage(bool ranged = false) override;
         void ApplySpellPowerBonus(int32 amount, bool apply);

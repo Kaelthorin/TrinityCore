@@ -99,7 +99,6 @@
 #include "MiscPackets.h"
 #include "MotionMaster.h"
 #include "MovementPackets.h"
-#include "ComboTargetRules.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -927,31 +926,6 @@ void Player::UpdateInvisibilityDrunkDetect()
 
     if (IsInWorld())
         UpdateObjectVisibility();
-}
-
-void Player::SetComboTarget(ObjectGuid const& guid)
-{
-    if (*m_unitData->ClassicComboTarget != guid)
-        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::ClassicComboTarget), guid);
-}
-
-void Player::GainComboPointsOn(Unit const* victim)
-{
-    ObjectGuid victimGuid = victim ? victim->GetGUID() : ObjectGuid::Empty;
-    if (ComboTargetRules::GainResetsPoints(GetComboTarget(), victimGuid))
-        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
-    SetComboTarget(victimGuid);
-}
-
-void Player::UpdateComboTarget()
-{
-    ObjectGuid comboTarget = GetComboTarget();
-    if (comboTarget.IsEmpty())
-        return;
-
-    Unit* target = ObjectAccessor::GetUnit(*this, comboTarget);
-    if (ComboTargetRules::ShouldDrop(comboTarget, target && target->IsAlive()))
-        SetPower(POWER_COMBO_POINTS, 0);        // clears the combo target too
 }
 
 void Player::Update(uint32 p_time)
