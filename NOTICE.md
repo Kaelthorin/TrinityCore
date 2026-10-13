@@ -30,7 +30,7 @@ redistributing. Source files of the module do not carry per-file headers; this n
 
 - This branch is advocaite's TrinityCore `forever` tree (https://github.com/advocaite/TrinityCore, GPL-2.0, copyright the TrinityCore
   project and contributors) plus WoW Forever Bots. The files that were changed are derived from TrinityCore and stay under its GPL-2.0.
-- The 1.12 numbers (spell values, creature stats, ...) are read from the VMaNGOS database dump by `tools/classic_spell_values/`. The dump is
+- The 1.12 numbers (spell values, creature stats, ...) are read from the VMaNGOS database dump by a builder script that is not part of this branch. The dump is
   not part of this repository; it belongs to its authors.
 - Libraries under `dep/` keep their own licenses (see each folder).
 - mod-playerbots (AzerothCore) is AGPL-3.0: used only as a reference for ideas, no code copied. SimulationCraft is GPL-3.0: data used as reference.

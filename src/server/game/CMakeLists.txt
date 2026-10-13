@@ -56,8 +56,8 @@ target_link_libraries(game
 # `add_subdirectory(tools)`, which means `if(TARGET extractor_common)` is
 # ALWAYS false at this point — the tools subtree hasn't been visited yet.
 # Gate on the build option instead so the define is set and the apply path
-# actually compiles in.  Linking is deferred to a CMAKE_DIRECTORY scope hook
-# (or relies on a transitive dep) — see end of file.
+# actually compiles in.  The link itself is added in src/CMakeLists.txt once
+# both subtrees are configured.
 if(TOOLS)
   target_include_directories(game
     PRIVATE

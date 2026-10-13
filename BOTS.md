@@ -6,27 +6,26 @@ This is the bot system for advocaite's TrinityCore `forever` tree (this branch i
 one click, raid / dungeon / battleground bots, an optional ambient population of bots around
 real players, and a vanilla-style auction house bot. Take what is useful.
 
-Base: `advocaite/TrinityCore` branch `forever` at `440d365e`. With `-DBUILD_PLAYERBOT_V2=0` (the default) the module is not built.
+Base: `advocaite/TrinityCore` branch `forever`. With `-DBUILD_PLAYERBOT_V2=0` (the default) the module is not built.
 
 ## What is in it
 
 | Part | Where |
 |---|---|
 | Bot module (AI, raid brain, BG scripts, world bots, fleet, travel) | `src/modules/PlayerbotV2/` |
-| Core side: a small API plus hooks | `src/server/game/Playerbot/`, `src/server/game/Modules/`, `src/server/scripts/Commands/cs_playerbot_v2.cpp`, hooks in login, group, chat, spell, threat, BG/LFG queue, map, session |
+| Core side: a small API plus hooks | `WorldSession::IsBot()` and hooks in login, group, chat, spell, threat, BG/LFG queue, map, session; the `.playerbot` commands are in `src/modules/PlayerbotV2/Commands/` |
 | Bot database migrations and seed data | `sql/playerbot_v2/`, `sql/playerbot_shared/` |
 | Settings | `src/modules/PlayerbotV2/conf/playerbot.conf.dist` (every key documented), `examples/zz-forever-bots.conf` (optional extras, off unless you copy it in) |
 | In-game window (addon) | `src/modules/PlayerbotV2/Addon/ForeverBots/` |
 | Everything players can type or click | `src/modules/PlayerbotV2/BOT_COMMANDS.md` |
 
-Besides the module, this tree carries Classic changes the bots depend on or were tested with:
-vanilla auction house seller (`src/server/game/AuctionHouseBot/`), road-aware pathing
-(`HandcraftedRoad*`, `dtQueryFilterTC`, `RoadOverrides`), Classic battleground scripts
-(`src/server/scripts/Custom/Classic/battlegrounds/`), the code that uses vanilla (1.12) spell, creature and mana numbers, some Classic
-data fixes (`sql/custom/world/2026_10_*`), and several smaller core fixes.
+Besides the module, this tree carries the core changes the bots depend on or were tested with: road-aware pathing
+(`HandcraftedRoad*`, `dtQueryFilterTC`, `RoadOverrides`, the road extractor tools), the code that uses vanilla (1.12) spell and creature
+numbers (`ClassicSpellValue.h`, the `classic_*` tables in `sql/custom/world/2026_10_1*`), bot battleground and raid rules, and the raid
+options listed below. General fixes are merged into `forever`.
 
-The vanilla numbers themselves are **not** in the repository: `tools/classic_spell_values/` builds them from the VMaNGOS database dump that you download
-yourself (`tools/classic_spell_values/README.md`). Without them the tables stay empty and the client's own values apply.
+The vanilla numbers themselves are **not** in the repository: they are built from the VMaNGOS database dump that you download yourself,
+with a builder script that is not part of this branch. Without them the tables stay empty and the client's own values apply.
 
 Extras that are not Blizzlike are server switches, **all off in `worldserver.conf.dist`**: `Instance.IgnoreRaid`, `Instance.BindOnEntry`,
 `Instance.PersistRaidTrash`, `Instance.MoltenCoreSkipRunes`, `Instance.IgnoreAttunement`, `Instance.AhnQirajGatesOpen`,
@@ -36,7 +35,7 @@ Extras that are not Blizzlike are server switches, **all off in `worldserver.con
 ## Build
 
 The module is only built with `-DBUILD_PLAYERBOT_V2=1` (default `0`). Without it the hooks
-compile to empty inlines and `WorldSession::IsBot()` is a constant `false`.
+do nothing: no bot session exists, so `WorldSession::IsBot()` is always `false`.
 
 ```
 cmake -S . -B build -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1

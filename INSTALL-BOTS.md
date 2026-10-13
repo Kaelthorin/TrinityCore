@@ -31,8 +31,8 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
 
 ## Steps for everyone
 
-Optional first: the vanilla (1.12) numbers. They are not in the repository; you build them from the VMaNGOS database dump you download yourself
-(`tools/classic_spell_values/README.md`, one command). Without them the bots and the server use the client's own values.
+Optional first: the vanilla (1.12) numbers. They are not in the repository; they are built from the VMaNGOS database dump you download yourself,
+with a builder script that is not part of this branch. Without them the bots and the server use the client's own values.
 
 3. **Create the shared bot database (once).** In a command prompt, from this folder
    (use your own MySQL user; `mysql.exe` is in your MySQL `bin` folder):
