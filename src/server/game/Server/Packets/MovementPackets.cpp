@@ -625,10 +625,10 @@ void MonsterMove::InitializeSplineData(::Movement::MoveSpline const& moveSpline)
     ::Movement::Spline<int32> const& spline = moveSpline.spline;
     std::vector<G3D::Vector3> const& array = spline.getPoints();
 
-    // The 70291 client divides by the length of every segment of the path it builds (start, points, end) and faults on a zero one
-    // (FLT_DIVIDE_BY_ZERO at client RVA 0x27DFC5E, 2026-10-09 Thorium Point: a compressed path whose first two intermediate points
-    // quantized onto the same quarter-yard node). Points that would sit closer than MinClientSegment to the previous node of the
-    // path the client rebuilds are left out of the packet; the last point is always kept.
+    // The Classic client divides by the length of every segment of the path it rebuilds (start, points, end) and crashes on a
+    // zero one (FLT_DIVIDE_BY_ZERO, seen at Thorium Point: two intermediate points of a compressed path quantized onto the same
+    // quarter-yard node). Points that would sit closer than MinClientSegment to the previous node are left out of the packet;
+    // the last point is always kept.
     constexpr float MinClientSegment = 0.1f;
     auto const tooClose = [](G3D::Vector3 const& a, G3D::Vector3 const& b) { return (a - b).squaredLength() < MinClientSegment * MinClientSegment; };
 

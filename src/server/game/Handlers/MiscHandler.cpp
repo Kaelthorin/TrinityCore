@@ -67,7 +67,7 @@ void WorldSession::HandleRepopRequest(WorldPackets::Misc::RepopRequest& /*packet
 
     // A second Release Spirit click while the first one's teleport is still under way (a dungeon release sends the player to
     // the graveyard of another map): the repop would teleport again into the loading screen of the first, and the client
-    // arrives with no terrain under it and falls through the world (Karrz, Deadmines -> Sentinel Hill, 2026-10-09, z -1409).
+    // arrives with no terrain under it and falls through the world.
     if (GetPlayer()->IsBeingTeleported())
         return;
 

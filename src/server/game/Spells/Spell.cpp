@@ -26,6 +26,7 @@
 #include "BattlePetMgr.h"
 #include "CellImpl.h"
 #include "CharmInfo.h"
+#include "ClassicOpcodes.h"
 #include "CollectionMgr.h"
 #include "CombatLogPackets.h"
 #include "Common.h"
@@ -5444,10 +5445,9 @@ void Spell::SendResurrectRequest(Player* target)
     resurrectRequest.Name = sentName;
     resurrectRequest.Sickness = m_caster->IsUnit() && m_caster->ToUnit()->IsSpiritHealer(); // "you'll be afflicted with resurrection sickness"
     resurrectRequest.UseTimer = !m_spellInfo->HasAttribute(SPELL_ATTR3_NO_RES_TIMER);
-    // Classic 70291 (Karrz, MC 2026-10-10: a priest bot's Resurrection showed "wants to resurrect you and will be able to in 10 Seconds. You
-    // will be afflicted with resurrection sickness", Accept greyed, from UseTimer=1 / Sickness=0): a player's rez in Classic is accepted at
-    // once and carries no sickness, and the client reads this packet's two flag bits at a different alignment than retail does, so a set bit
-    // lands on the wrong flag. Both clear is read as "no timer, no sickness" at any alignment.
+    // Classic 70291: a player's resurrection is accepted at once and carries no sickness. That client reads the two flag bits of this
+    // packet at a different alignment than retail, so a set UseTimer showed a 10 second wait with resurrection sickness and a greyed
+    // Accept; both bits clear reads as "no timer, no sickness" at any alignment.
     if (ClassicOpcodes::IsBuild70291OrLater() && !resurrectRequest.Sickness)
         resurrectRequest.UseTimer = false;
     if (Pet* pet = target->GetPet())
@@ -5585,7 +5585,8 @@ void Spell::TakePower()
             continue;
         }
 
-        // a finisher's damage, auras and procs read the combo points: they are spent after the effects (SpendPendingComboPoints)
+        // a finisher's damage, durations and procs read the caster's combo points while its effects run (SpellEffectInfo::CalcValue),
+        // so the points are spent after the effects (SpendPendingComboPoints), not here
         if (cost.Power == POWER_COMBO_POINTS && cost.Amount > 0 && unitCaster->IsPlayer())
         {
             m_comboPointsPending += cost.Amount;
@@ -5608,10 +5609,8 @@ void Spell::SpendPendingComboPoints()
 
     int32 const points = m_comboPointsPending;
     m_comboPointsPending = 0;
-    if (Unit* unitCaster = m_caster ? m_caster->ToUnit() : nullptr)
-    {
+    if (Unit* unitCaster = m_caster->ToUnit())
         unitCaster->ModifyPower(POWER_COMBO_POINTS, -points);
-    }
 }
 
 void Spell::RefundPower()

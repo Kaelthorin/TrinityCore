@@ -1988,7 +1988,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void SendRemoveControlBar() const;
         bool HasSpell(uint32 spell) const override;
         bool HasActiveSpell(uint32 spell) const;            // show in spellbook
-        uint32 ResolveSupersededRank(uint32 spellId) const;  // Classic 1.60: the active higher rank of a known but superseded rank, else spellId
+        uint32 ResolveSupersededRank(uint32 spellId) const; // Classic 1.60: the active higher rank of a known but superseded rank, else spellId
         SpellInfo const* GetCastSpellInfo(SpellInfo const* spellInfo, TriggerCastFlags& triggerFlag, GetCastSpellInfoContext* context) const override;
         bool IsSpellFitByClassAndRace(uint32 spell_id) const;
         bool HandlePassiveSpellLearn(SpellInfo const* spellInfo);
@@ -2412,13 +2412,12 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Optional<WorldLocation> m_deathRecapReturn;
         void BuildPlayerRepop();
         void RepopAtGraveyard();
-        // A graveyard row whose Z lies under the terrain (retail world_safe_locs rows against Classic terrain) drops the ghost out of the
-        // world. Raises loc to the floor when it is buried (no static surface near it); returns true when it moved the point.
+        // Classic 1.60: a graveyard row whose Z lies under the terrain (retail world_safe_locs Z against Classic terrain) drops the ghost
+        // out of the world. Raises loc to the floor when it is buried (no static surface near it); returns true when it moved the point.
         bool SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId) const;
-        // Set by RepopAtGraveyard for its teleport, consumed by the worldport ack (the destination map is only known there for far teleports)
+        // Set by RepopAtGraveyard for a far teleport, consumed by the worldport ack (the destination map only exists there)
         void SetGraveyardTeleportId(uint32 id) { m_graveyardTeleportId = id; }
         uint32 ConsumeGraveyardTeleportId() { uint32 id = m_graveyardTeleportId; m_graveyardTeleportId = 0; return id; }
-        uint32 m_graveyardTeleportId = 0;
 
         void DurabilityLossAll(double percent, bool inventory);
         void DurabilityLoss(Item* item, double percent);
@@ -3168,6 +3167,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         GuidList WhisperList;
         TimePoint m_regenInterruptTimestamp;
         TimePoint m_manaSpentTimestamp;                     // Classic 1.60: the five second rule starts when mana is paid, nothing else
+        uint32 m_graveyardTeleportId = 0;                   // graveyard of a far repop teleport, checked by the worldport ack
         uint32 m_regenTimerCount;
         float m_healthFraction;
         std::array<float, MAX_POWERS_PER_CLASS> m_powerFraction;

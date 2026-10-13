@@ -47,6 +47,7 @@
 #include "ChatPackets.h"
 #include "ChatTextBuilder.h"
 #include "ClassicOpcodes.h"
+#include "ClassicSpellRank.h"
 #include "CinematicMgr.h"
 #include "ClubUtils.h"
 #include "CombatLogPackets.h"
@@ -5051,7 +5052,7 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
     float const terrain = map->GetGridHeight(GetPhaseShift(), x, y);
     if (terrain <= INVALID_HEIGHT)
     {
-        // A battleground floor is WMO only (no terrain grid): the rez rows 771/772 sit ~24 y under it. Raise to the surface found above.
+        // a battleground floor is WMO only (no terrain grid): raise a point under it to the surface found above
         if (!map->IsBattleground())
             return false;
 
@@ -5059,14 +5060,14 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
         if (ground <= INVALID_HEIGHT || ground <= z + 1.0f)
             return false;
 
-        TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is below the floor ({:.1f}); using the floor. Fix the world_safe_locs row.",
+        TC_LOG_ERROR("misc", "Player::SnapBuriedLocToFloor: safe loc {} map {} ({:.1f}, {:.1f}) z {:.1f} is below the floor ({:.1f}), using the floor. Fix the world_safe_locs row.",
             safeLocId, map->GetId(), x, y, z, ground);
         loc.Relocate(x, y, ground + 0.5f);
         return true;
     }
 
-    // Buried = more than a yard under the terrain and no WMO / model surface within reach of the point (a graveyard inside a building or
-    // a cave under the terrain stands on that surface and is left alone).
+    // buried = more than a yard under the terrain and no WMO / model surface within reach of the point (a graveyard inside a building
+    // or a cave under the terrain stands on that surface and is left alone)
     if (z >= terrain - 1.0f)
         return false;
 
@@ -5076,7 +5077,7 @@ bool Player::SnapBuriedLocToFloor(Map* map, WorldLocation& loc, uint32 safeLocId
 
     float const floor = map->GetHeight(GetPhaseShift(), x, y, terrain + 1.0f, true, 6.0f);
     float const newZ = std::max(floor, terrain) + 0.5f;
-    TC_LOG_ERROR("misc", "[graveyard_z] safe loc {} map {} ({:.1f},{:.1f}) z {:.1f} is under the terrain ({:.1f}); using {:.1f}. Fix the world_safe_locs row.",
+    TC_LOG_ERROR("misc", "Player::SnapBuriedLocToFloor: safe loc {} map {} ({:.1f}, {:.1f}) z {:.1f} is under the terrain ({:.1f}), using {:.1f}. Fix the world_safe_locs row.",
         safeLocId, map->GetId(), x, y, z, terrain, newZ);
     loc.Relocate(x, y, newZ);
     return true;
@@ -5114,15 +5115,18 @@ void Player::RepopAtGraveyard()
     // and don't show spirit healer location
     if (closestGrave)
     {
-        // A graveyard whose Z lies under the terrain drops the ghost out of the world: the retail world_safe_locs rows keep retail Z values
-        // that the Classic terrain does not match (WSG rows 771/772 sat ~24 y under the floor, Karrz 2026-10-08; Sentinel Hill graveyard 4 on
-        // release from the Deadmines, Karrz 2026-10-10). Same map: raise it to the floor here. Another map (an instance releasing to the
-        // continent) is not loaded yet; the worldport ack does the same once the destination map exists.
+        // Classic 1.60: retail world_safe_locs rows keep retail Z values that the Classic terrain does not always match, and a graveyard
+        // under the terrain drops the ghost out of the world. Same map: raise it to the floor here. Another map (an instance releasing
+        // to the continent) is not loaded yet; the worldport ack does the same once it exists. Transport graveyards are left alone.
         WorldLocation graveLoc = closestGrave->Loc;
-        if (graveLoc.GetMapId() == GetMapId())
-            SnapBuriedLocToFloor(GetMap(), graveLoc, closestGrave->ID);
-        else
-            SetGraveyardTeleportId(closestGrave->ID);
+        if (!closestGrave->TransportSpawnId)
+        {
+            if (graveLoc.GetMapId() == GetMapId())
+                SnapBuriedLocToFloor(GetMap(), graveLoc, closestGrave->ID);
+            else
+                SetGraveyardTeleportId(closestGrave->ID);
+        }
+
         TeleportTo({ .Location = graveLoc, .TransportGuid = closestGrave->TransportSpawnId ? ObjectGuid::Create<HighGuid::Transport>(*closestGrave->TransportSpawnId) : ObjectGuid::Empty }, shouldResurrect ? TELE_REVIVE_AT_TELEPORT : TELE_TO_NONE);
         if (isDead())                                        // not send if alive, because it used in TeleportTo()
         {

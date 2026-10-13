@@ -241,8 +241,7 @@ void WorldSession::HandleCastSpellOpcode(WorldPackets::Spells::CastSpell& castRe
     {
         if (SpellInfo const* resolvedInfo = sSpellMgr->GetSpellInfo(resolved, _player->GetMap()->GetDifficultyID()))
         {
-            TC_LOG_DEBUG("spells", "WorldSession::HandleCastSpellOpcode: {} cast superseded rank {}, casting {}", _player->GetName(), spellInfo->Id, resolved);
-            castRequest.Cast.SpellID = resolved;
+            castRequest.Cast.SpellID = int32(resolved);
             spellInfo = resolvedInfo;
         }
     }

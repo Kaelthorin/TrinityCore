@@ -24,10 +24,7 @@
 //
 // Learning a rank marks the lower ranks inactive and tells the client to replace them in the spellbook and on the action bars
 // (Player::AddSpell). That only reaches bars the client holds while the rank is learned: bars saved earlier, bars written by
-// .learn all, and bars of characters that logged in with the rank already known keep the rank 1 id. The server then cast that
-// rank 1 (Karrz, level 60 warlock: Immolate 348, Curse of Agony 980, Searing Pain 5676 with the top ranks known, 2026-10-09).
-// Pure: no game types, tested in tests/game/ClassicSpellRank.cpp.
-
+// .learn all, and bars of characters that logged in with the rank already known keep the lower rank id, and the server cast it.
 namespace ClassicSpellRank
 {
     // The highest active rank above spellId when spellId is a known but superseded rank, else spellId itself. next(id) is the

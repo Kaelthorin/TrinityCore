@@ -18,18 +18,20 @@
 #ifndef TRINITY_CLASSIC_MANA_REGEN_H
 #define TRINITY_CLASSIC_MANA_REGEN_H
 
-// Classic 1.60 (vanilla): the "five second rule". Spirit mana regeneration stops for 5 seconds after a mana-costing spell is cast
+#include <cstdint>
+
+// Classic 1.60 (vanilla): the "five second rule". Spirit mana regeneration stops for 5 seconds after mana is paid for a spell
 // (only the share of SPELL_AURA_MOD_MANA_REGEN_INTERRUPT keeps running, e.g. Meditation, Mage Armor); after that it runs at the full
-// rate, in or out of combat. Combat itself does not interrupt it (the retail core did that, and it never started the window on a
-// cast, so a caster in combat got no spirit regeneration at all). Pure: tested in tests/game/ClassicManaRegen.cpp.
+// rate, in or out of combat. Combat itself does not interrupt it (the retail rule did, and never started the window on a cast, so a
+// caster in combat got no spirit regeneration at all).
 namespace ClassicManaRegen
 {
-    constexpr unsigned FiveSecondRuleMs = 5000;
+    constexpr int64_t FiveSecondRuleMs = 5000;
 
-    // True while the regeneration is interrupted: a mana spell was paid less than 5 s ago, or an aura interrupts it.
-    inline bool IsInterrupted(unsigned msSinceLastManaSpell, bool interruptAura)
+    // True while the regeneration is interrupted: mana was paid less than 5 s ago, or an aura interrupts it.
+    inline bool IsInterrupted(int64_t msSinceManaSpent, bool interruptAura)
     {
-        return interruptAura || msSinceLastManaSpell < FiveSecondRuleMs;
+        return interruptAura || msSinceManaSpent < FiveSecondRuleMs;
     }
 }
 

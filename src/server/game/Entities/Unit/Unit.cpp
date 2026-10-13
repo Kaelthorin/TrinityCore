@@ -6961,9 +6961,8 @@ void Unit::SendEnergizeSpellLog(Unit* victim, uint32 spellID, int32 damage, int3
 
 void Unit::EnergizeBySpell(Unit* victim, SpellInfo const* spellInfo, int32 damage, Powers powerType)
 {
-    // Classic 1.60 (vanilla): only paying mana starts the five second rule (Spell::TakePower). Receiving mana does not (Judgement of
-    // Wisdom, Spiritual Attunement, Life Tap...): with such a gain every few seconds the window never ran out, which is the likely
-    // reason the paladin regenerated 38% of its out-of-combat mana while standing in combat. Other powers keep the retail rule.
+    // Classic 1.60 (vanilla): only paying mana starts the five second rule (Spell::TakePower); receiving it does not (Judgement of
+    // Wisdom, Spiritual Attunement, Life Tap...), or a gain every few seconds would keep the window open. Other powers keep the retail rule.
     if (powerType != POWER_MANA)
         if (Player* player = victim->ToPlayer())
             if (PowerTypeEntry const* powerTypeEntry = sDB2Manager.GetPowerTypeEntry(powerType))
@@ -11685,28 +11684,26 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
             if (InstanceScript const* instance = creature->GetInstanceScript())
                 dungeonEncounter = instance->GetBossDungeonEncounter(creature);
 
-            // Classic: a boss drops its whole table on one corpse (group loot rules), as in vanilla. The retail
-            // personal encounter loot hands each table roll to one random player, so a party of 5 saw one epic.
-            bool const sharedEncounterLoot = dungeonEncounter && !tappers.empty()
-                && sConfigMgr->GetBoolDefault("Classic.SharedEncounterLoot", true);
-
-            if (sharedEncounterLoot)
+            if (dungeonEncounter && !tappers.empty() && sWorld->getBoolConfig(CONFIG_LOOT_SHARED_ENCOUNTER_LOOT))
             {
+                // vanilla boss loot: the whole loot table on one corpse, looted under the group's loot method
                 Group* group = nullptr;
+                Player* looter = tappers[0];
                 for (Player* tapper : tappers)
+                {
                     if (Group* tapperGroup = tapper->GetGroup())
                     {
                         group = tapperGroup;
+                        looter = tapper;
                         break;
                     }
+                }
 
-                Player* looter = tappers[0];
                 if (group)
                     if (Player* groupLooter = ObjectAccessor::GetPlayer(*creature, group->GetLooterGuid()))
                         looter = groupLooter;
 
                 Loot* loot = new Loot(creature->GetMap(), creature->GetGUID(), LOOT_CORPSE, group);
-                creature->m_loot.reset(loot);
                 loot->SetDungeonEncounterId(dungeonEncounter->ID);
 
                 if (uint32 lootid = creature->GetLootId())
@@ -11718,12 +11715,12 @@ void Unit::SetMeleeAnimKitId(uint16 animKitId)
                 if (group)
                     loot->NotifyLootList(creature->GetMap());
 
-                uint32 epics = 0;
-                for (LootItem const& lootItem : loot->items)
-                    if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(lootItem.itemid))
-                        if (proto->GetQuality() >= ITEM_QUALITY_EPIC)
-                            ++epics;
+                creature->m_personalLoot.clear();   // GetLootForPlayer only reads m_loot while there is no personal loot
+                creature->m_loot.reset(loot);
 
+                // Update round robin looter only if the creature had loot
+                if (group && !loot->isLooted())
+                    group->UpdateLooterGuid(creature);
             }
             else if (creature->GetMap()->IsDungeon())
             {

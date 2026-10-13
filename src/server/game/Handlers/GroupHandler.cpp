@@ -66,7 +66,7 @@ void WorldSession::HandlePartyInviteOpcode(WorldPackets::Party::PartyInviteClien
     // The unit menu / portrait Invite can send the target by guid (empty name) or as "Name-Realm"; typed /invite sends the plain name.
     Player* invitedPlayer = nullptr;
     if (!packet.TargetGUID.IsEmpty() && packet.TargetGUID.IsPlayer())
-        invitedPlayer = ObjectAccessor::FindConnectedPlayer(packet.TargetGUID);
+        invitedPlayer = ObjectAccessor::FindPlayer(packet.TargetGUID);
     if (!invitedPlayer && !packet.TargetName.empty())
     {
         invitedPlayer = ObjectAccessor::FindPlayerByName(packet.TargetName);
@@ -393,6 +393,7 @@ void WorldSession::HandleSetLootMethodOpcode(WorldPackets::Party::SetLootMethod&
         case MASTER_LOOT:
         case GROUP_LOOT:
         case NEED_BEFORE_GREED:
+        case PERSONAL_LOOT:
             break;
         default:
             return;

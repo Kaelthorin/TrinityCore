@@ -131,10 +131,7 @@ void StopDB();
 void WorldUpdateLoop();
 void ClearOnlineAccounts(uint32 realmId);
 void PruneCrashFiles(size_t keep);
-<<<<<<< HEAD
 void LogStartupSelfCheck(Realm const& realm);
-=======
->>>>>>> origin/forever
 void AddModuleScripts();                             // generated from src/modules, empty when no module is built
 void AddAllScripts() { AddScripts(); AddModuleScripts(); }
 struct ShutdownTCSoapThread { void operator()(std::thread* thread) const; };
@@ -342,10 +339,7 @@ int main(int argc, char** argv)
         return 1;
 
     PruneCrashFiles(5);
-<<<<<<< HEAD
     LogStartupSelfCheck(*realm);
-=======
->>>>>>> origin/forever
 
     // Set server offline (not connectable)
     LoginDatabase.DirectPExecute("UPDATE realmlist SET flag = flag | {} WHERE id = '{}'", Trinity::Legacy::REALM_FLAG_OFFLINE, realmId);

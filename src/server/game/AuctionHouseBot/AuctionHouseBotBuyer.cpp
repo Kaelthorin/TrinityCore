@@ -109,8 +109,8 @@ uint32 AuctionBotBuyer::GetItemInformation(BuyerConfiguration& config)
     {
         AuctionPosting* entry = &itr->second;
 
-        if (entry->IsCommodity() && !AuctionBotBuyerPolicy::CommoditiesEnabled())
-            continue; // commodities are only bought whole, and only when AuctionHouseBot.Buyer.Commodities = 1
+        if (entry->IsCommodity() && !AuctionBotBuyerPolicy::StacksEnabled())
+            continue; // stackable listings are only bought whole, and only with AuctionHouseBot.Buyer.Stacks = 1
 
         if (entry->Owner.IsEmpty() || sAuctionBotConfig->IsBotChar(entry->Owner))
             continue; // Skip auctions owned by AHBot
@@ -350,7 +350,7 @@ void AuctionBotBuyer::BuyAndBidItems(BuyerConfiguration& config)
             successBid = RollBidChance(ahInfo, auction, bidPrice);
         }
 
-        // never pay above the fair-price cap (AuctionHouseBot.Buyer.MaxPriceMultiplier)
+        // never pay above the price cap (AuctionHouseBot.Buyer.MaxPriceMultiplier)
         if (uint64 cap = AuctionBotBuyerPolicy::MaxUnitPrice(auction))
         {
             if (AuctionBotBuyerPolicy::PerItemPrice(auction, auction->BuyoutOrUnitPrice) > cap)
@@ -444,6 +444,7 @@ void AuctionBotBuyer::BuyEntry(AuctionPosting* auction, AuctionHouseObject* auct
 
     // Set bot as bidder and set new bid amount
     auction->Bidder = newBidder;
+    // a stackable listing's price is per item, the whole listing is bought
     auction->BidAmount = AuctionBotBuyerPolicy::TotalPrice(auction, auction->BuyoutOrUnitPrice);
 
     // Copy data before freeing AuctionPosting in auctionHouse->RemoveAuction

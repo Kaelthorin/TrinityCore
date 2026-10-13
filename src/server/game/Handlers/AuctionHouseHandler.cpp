@@ -379,15 +379,9 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
         return;
     }
 
-    // A stackable listing is a commodity. The commodity flow (quote + confirm) buys by item and quantity;
-    // a client that buys such a row by auction id (the classic-style list) used to be answered "item not found".
-    // Treat that as buying the whole listing at its total price.
-    bool const commodity = auction->IsCommodity();
-    uint64 const buyoutPrice = commodity ? auction->BuyoutOrUnitPrice * auction->GetTotalItemCount() : auction->BuyoutOrUnitPrice;
-    if (commodity)
-        TC_LOG_INFO("auctionhouse", "[ahbuy] {} buys commodity auction {} whole: {} x{} at {} each, asked {} of {}",
-            GetPlayerInfo(), placeBid.AuctionID, auction->Items[0]->GetEntry(), auction->GetTotalItemCount(),
-            auction->BuyoutOrUnitPrice, placeBid.BidAmount, buyoutPrice);
+    // A stackable listing stores its price per item. Buying it by auction id buys the whole listing at its total price.
+    bool const stack = auction->IsCommodity();
+    uint64 const buyoutPrice = stack ? auction->BuyoutOrUnitPrice * auction->GetTotalItemCount() : auction->BuyoutOrUnitPrice;
 
     Player* player = GetPlayer();
 
@@ -401,8 +395,8 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
     bool canBid = auction->MinBid != 0;
     bool canBuyout = auction->BuyoutOrUnitPrice != 0;
 
-    // buyout attempt with wrong amount (a commodity row may quote the unit price: accept that too)
-    if (!canBid && placeBid.BidAmount != buyoutPrice && !(commodity && placeBid.BidAmount == auction->BuyoutOrUnitPrice))
+    // buyout attempt with wrong amount (for a stack the price per item is accepted too)
+    if (!canBid && placeBid.BidAmount != buyoutPrice && !(stack && placeBid.BidAmount == auction->BuyoutOrUnitPrice))
     {
         TC_LOG_INFO("auctionhouse", "[ahbuy] {} buyout of auction {} refused: sent {}, buyout is {}", GetPlayerInfo(), placeBid.AuctionID, placeBid.BidAmount, buyoutPrice);
         SendAuctionCommandResult(placeBid.AuctionID, AuctionCommand::PlaceBid, AuctionResult::BidIncrement, throttle.DelayUntilNext);
@@ -418,8 +412,8 @@ void WorldSession::HandleAuctionPlaceBid(WorldPackets::AuctionHouse::AuctionPlac
 
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
-    // a commodity bought by unit price pays the total
-    uint64 const bidAmount = commodity && placeBid.BidAmount == auction->BuyoutOrUnitPrice ? buyoutPrice : uint64(placeBid.BidAmount);
+    // a stack bought by its price per item pays the total
+    uint64 const bidAmount = stack && placeBid.BidAmount == auction->BuyoutOrUnitPrice ? buyoutPrice : uint64(placeBid.BidAmount);
     uint64 priceToPay = bidAmount;
     if (!auction->Bidder.IsEmpty())
     {

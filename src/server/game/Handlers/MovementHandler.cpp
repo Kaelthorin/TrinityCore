@@ -195,6 +195,7 @@ void WorldSession::HandleMoveWorldportAck()
 
     // get the teleport destination
     TeleportLocation const& loc = player->GetTeleportDest();
+    uint32 const graveyardId = player->ConsumeGraveyardTeleportId();
 
     // possible errors in the coordinate validity check
     if (!MapManager::IsValidMapCoord(loc.Location))
@@ -241,8 +242,9 @@ void WorldSession::HandleMoveWorldportAck()
         return;
     }
 
+    // Classic 1.60: a release to a graveyard on another map is checked for a buried Z here, once the map exists (Player::RepopAtGraveyard)
     WorldLocation arrival = loc.Location;
-    if (uint32 graveyardId = player->ConsumeGraveyardTeleportId())
+    if (graveyardId)
         player->SnapBuriedLocToFloor(newMap, arrival, graveyardId);
 
     float z = arrival.GetPositionZ() + player->GetHoverOffset();
@@ -604,22 +606,19 @@ void WorldSession::HandleMovementOpcode(OpcodeClient opcode, MovementInfo& movem
 
         plrMover->UpdateFallInformationIfNeed(movementInfo, opcode);
 
-        // Below the map's minimum height only counts when no geometry holds the player up: the Forever .map files of WMO-only
-        // instances (Molten Core) carry a minimum plane above the floor, and a player standing on a valid WMO floor at the
-        // entrance was killed by KillPlayer below (Garr test 2026-10-08, killer=self dmg=0 at 1082.0,-474.6,-107.8, a GM is
-        // immune to the environmental damage so the kill came from KillPlayer).
-        float const min_height = plrMover->GetMap()->GetMinHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY());
-        bool under_map = movementInfo.pos.GetPositionZ() < min_height;
-        if (under_map)
+        // Below the map's minimum height only counts when no geometry holds the player up: the .map files of WMO-only
+        // instances (Molten Core) carry a minimum plane above the floor, and a player standing on a valid WMO floor was killed
+        float const minHeight = plrMover->GetMap()->GetMinHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY());
+        bool underMap = movementInfo.pos.GetPositionZ() < minHeight;
+        if (underMap)
         {
             float const floor = plrMover->GetMap()->GetHeight(plrMover->GetPhaseShift(), movementInfo.pos.GetPositionX(), movementInfo.pos.GetPositionY(),
                 movementInfo.pos.GetPositionZ() + 2.0f, true, 10.0f);
             if (floor > INVALID_HEIGHT && movementInfo.pos.GetPositionZ() >= floor - 2.0f)
-            {
-                under_map = false;
-            }
+                underMap = false;
         }
-        if (under_map)
+
+        if (underMap)
         {
             if (!(plrMover->GetBattleground() && plrMover->GetBattleground()->HandlePlayerUnderMap(_player)))
             {

@@ -131,15 +131,15 @@ public:
         return true;
     }
 
-    // .ahbot refresh: expire the bot's own listings that have no bid, then restock from scratch.
+    // .ahbot refresh: expire the bot's own listings that have no bid, the seller restocks on its next cycles
     static bool HandleAHBotRefreshCommand(ChatHandler* handler)
     {
         sAuctionBot->Rebuild(false);
-        handler->SendSysMessage("AuctionHouseBot: bot listings expiring now, the seller restocks on its next cycles.");
+        handler->SendSysMessage("AuctionHouseBot: bot listings without a bid expire now, the seller restocks on its next cycles.");
         return true;
     }
 
-    // .ahbot add [n]: raise every active quality target by n items per house until the next .ahbot reload.
+    // .ahbot add [n]: raise every active quality target by n items (default 500) until the next .ahbot reload
     static bool HandleAHBotAddCommand(ChatHandler* handler, Optional<uint32> amount)
     {
         uint32 const extra = amount.value_or(500);
@@ -149,11 +149,11 @@ public:
             if (current)
                 sAuctionBot->SetItemsAmountForQuality(quality, current + extra);
         }
-        handler->PSendSysMessage("AuctionHouseBot: every active quality target raised by {} (until .ahbot reload). See .ahbot status all.", extra);
+        handler->PSendSysMessage("AuctionHouseBot: every active quality target raised by {} (until .ahbot reload).", extra);
         return true;
     }
 
-    // .ahbot stats: what the buyer has spent today and its limits.
+    // .ahbot stats: what the buyer has spent today and its limits
     static bool HandleAHBotStatsCommand(ChatHandler* handler)
     {
         handler->SendSysMessage(AuctionBotBuyerPolicy::Describe().c_str());

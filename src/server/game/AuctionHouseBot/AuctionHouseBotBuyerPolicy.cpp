@@ -1,10 +1,25 @@
 /*
- * Blizzlike buying rules for the AuctionHouseBot buyer (Forever / classic data).
+ * This file is part of the TrinityCore Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include "AuctionHouseBotBuyerPolicy.h"
 #include "AuctionHouseMgr.h"
+#include "Common.h"
 #include "Config.h"
+#include "Duration.h"
 #include "GameTime.h"
 #include "Item.h"
 #include "ItemTemplate.h"
@@ -18,14 +33,14 @@ namespace AuctionBotBuyerPolicy
 {
 namespace
 {
-    bool _commodities = false;
-    float _maxPriceMultiplier = 0.0f;  // 0 = no price cap
+    bool _stacks = false;
+    float _maxPriceMultiplier = 0.0f; // 0 = no price cap
     uint32 _minDelay = 0;
     uint32 _maxDelay = 0;
-    uint64 _dailyBudget = 0;      // copper, 0 = unlimited
-    uint32 _maxBuysPerHour = 0;   // 0 = unlimited
+    uint64 _dailyBudget = 0;          // copper, 0 = unlimited
+    uint32 _maxBuysPerHour = 0;       // 0 = unlimited
     bool _fair = false;
-    float _fairMinChance = 35.0f; // percent at the price cap
+    float _fairMinChance = 35.0f;     // percent at the price cap
 
     time_t _dayStart = 0;
     uint64 _spentToday = 0;
@@ -60,7 +75,7 @@ namespace
 
 void LoadConfig()
 {
-    _commodities = sConfigMgr->GetBoolDefault("AuctionHouseBot.Buyer.Commodities", false);
+    _stacks = sConfigMgr->GetBoolDefault("AuctionHouseBot.Buyer.Stacks", false);
     _maxPriceMultiplier = sConfigMgr->GetFloatDefault("AuctionHouseBot.Buyer.MaxPriceMultiplier", 0.0f);
     _minDelay = sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MinDelay", 0);
     _maxDelay = std::max(_minDelay, uint32(sConfigMgr->GetIntDefault("AuctionHouseBot.Buyer.MaxDelay", 0)));
@@ -70,9 +85,9 @@ void LoadConfig()
     _fairMinChance = std::clamp(sConfigMgr->GetFloatDefault("AuctionHouseBot.Buyer.FairMinChance", 35.0f), 0.0f, 100.0f);
 }
 
-bool CommoditiesEnabled()
+bool StacksEnabled()
 {
-    return _commodities;
+    return _stacks;
 }
 
 bool Eligible(AuctionPosting const* auction)
@@ -114,7 +129,7 @@ bool RollFair(AuctionPosting const* auction, uint64 unitPrice, uint32 qualityCha
 
     chance *= qualityChance / 100.0f;
     bool const win = frand(0.0f, 100.0f) < chance;
-    TC_LOG_DEBUG("ahbot", "[ahbot] fair roll {}: price {} fair {} cap {} chance {:.1f}% -> {}",
+    TC_LOG_DEBUG("ahbot", "AHBot: fair roll {}: price {} fair {} cap {} chance {:.1f}% -> {}",
         auction->Items[0]->GetTemplate()->GetName(sWorld->GetDefaultDbcLocale()), unitPrice, fair, cap, chance, win ? "buy" : "pass");
     return win;
 }
@@ -146,15 +161,14 @@ void RecordBuy(AuctionPosting const* auction, uint64 totalPrice, char const* hou
     ++_boughtToday;
     ++_boughtThisHour;
 
-    Item const* item = auction->Items[0];
-    TC_LOG_INFO("ahbot", "[ahbot] buy {} x{} for {:.2f}g in {} (today: {} buys, {:.2f}g)",
-        item->GetTemplate()->GetName(sWorld->GetDefaultDbcLocale()), auction->GetTotalItemCount(),
+    TC_LOG_DEBUG("ahbot", "AHBot: buy {} x{} for {:.2f}g in {} (today: {} buys, {:.2f}g)",
+        auction->Items[0]->GetTemplate()->GetName(sWorld->GetDefaultDbcLocale()), auction->GetTotalItemCount(),
         float(totalPrice) / float(GOLD), house, _boughtToday, float(_spentToday) / float(GOLD));
 }
 
 std::string Describe()
 {
-    return Trinity::StringFormat("buyer today: {} buys, {:.2f}g spent (budget {}g, max {} per hour, price cap x{:.2f}, commodities {})",
-        _boughtToday, float(_spentToday) / float(GOLD), _dailyBudget / GOLD, _maxBuysPerHour, _maxPriceMultiplier, _commodities ? "on" : "off");
+    return Trinity::StringFormat("AuctionHouseBot buyer today: {} buys, {:.2f}g spent (budget {}g, max {} per hour, price cap x{:.2f}, stacks {})",
+        _boughtToday, float(_spentToday) / float(GOLD), _dailyBudget / GOLD, _maxBuysPerHour, _maxPriceMultiplier, _stacks ? "on" : "off");
 }
 }
