@@ -91,6 +91,11 @@ public:
     std::string const& owner_name() const { return s_->owner_name; }
     bool   has_owner_character()   const { return !s_->owner_name.empty(); }
     bool   is_companion_with_owner() const { return s_->owner_in_group; }
+    // In a group with a player who commands it: a companion, or a world bot a player invited. Neither runs world errands.
+    bool   is_led_by_player() const { return s_->owner_in_group || s_->led_by_player; }
+    bool   no_tag_stance() const { return s_->no_tag_stance; }
+    bool   holding_position() const { return s_->holding_position; }
+    ObjectGuid controller_guid() const { return s_->owner_in_group ? s_->owner_guid : s_->controller_guid; }
     bool   tactic_burn()      const { return s_->tactic_burn; }        // owner "max dps"
     bool   tactic_save_mana() const { return s_->tactic_save_mana; }   // owner "save mana"
     // A companion may sit down to eat or drink only when its owner has stopped next to it: otherwise the group follow

@@ -63,17 +63,32 @@ namespace Playerbot::Raid {
             { 18596u, -58.2509f, -189.020f,  10.2191f, -247.912f },    // south-west to north-east
             { 18617u,  10.2191f, -247.912f, -58.2509f, -189.020f },    // north-east to south-west
         };
+        // hover = true: the corridor of the waypoint she hovers at (or flies to) is a hazard for everybody from the moment she arrives, tanks and
+        // healers too. The breath damage is one instant at the end of the 5 s cast (scenario run: 16 dead in the same second, all
+        // three waves 4-5 s after the cast began), a raid that starts to leave when the cast starts has 35 y of running and the hall needs 34 from
+        // its middle. The corridor closes again 8 s after the cast began (RaidBrain kBreathOpenMs): the old 11 s after the last sighting kept it shut
+        // while Heated Ground burned and the bots could not leave the fire.
         for (BreathPath const& path : kPaths)
-            r.avoidBreath.push_back({ 10184, path.spell, 34.0f, 0.0f, Who::Anyone, false, true, path.ax, path.ay, path.bx, path.by });
+            r.avoidBreath.push_back({ 10184, path.spell, 34.0f, 0.0f, Who::Anyone, false, true, path.ax, path.ay, path.bx, path.by, true });
+
+        // Heated Ground (22191..22202): the fire the breath leaves round the two egg pits, a dynamic object of 13 y per spell, 300-550 a tick
+        // (scenario run: eleven raiders died in it, all at 5-16 percent after the breath, standing on the AzerothCore safe points,
+        // which lie in it). Everybody keeps out of every zone that exists.
+        for (uint32_t spell = 22191u; spell <= 22202u; ++spell)
+            r.avoidGroundEffect.push_back({ 10184, spell, 1.0f, Who::Anyone });
 
         // Phase 1 on the ground: Flame Breath 18435, Wing Buffet 18500 and Cleave 19983 hit the front, Tail Sweep 15847 the back
         // (classic_boss_onyxia.cpp:20-25). Only the tank stands in front, nobody stands behind her; melee and casters take the
         // flanks. The cones skip her while she flies (phase 2), where her facing changes at every waypoint. Lengths are the spells' radii
         // from the spell audit (research/pc-2026-10-11/SpellAudit.tsv): Flame Breath 45 y (3500 fire, 2 s cast), Tail Sweep 30 y (800),
-        // Wing Buffet 20 y. The cone angle (45 degrees either side) is still the engine's default for a front cone, UNVERIFIED.
+        // Wing Buffet 20 y. Angles from the client's SpellTargetRestrictions: Flame Breath and Wing Buffet a 120 degree cone in
+        // front (60 either side), Tail Sweep -120, the rear arc (60 either side of straight behind her). The 45 degrees this rule had was the
+        // engine default and wrong: the third live pull lost 27 of 38 to Flame Breath, raiders 55-77 degrees off her facing. The front and
+        // tail arcs, their margin and the wedges between them are the kOny* constants of RaidEncounters.h.
         // onyxia_full n17 2026-10-14: casters died to hits of 2000-3900 from 19-38 y away, outside the 25 y this rule had.
-        r.avoidFrontal.push_back({ 10184, 45.0f, 45.0f, Who::NonTank, 0.0f, 100.0f, 0.0f, false });
-        r.avoidFrontal.push_back({ 10184, 30.0f, 80.0f, Who::NonTank, 180.0f, 100.0f, 0.0f, false });
+        // A cast lands up to two seconds after she turns, so the cones carry a margin: nobody stands, or leaves to stand, inside the widened edge.
+        r.avoidFrontal.push_back({ 10184, 45.0f, kOnyFrontHalfDeg, Who::NonTank, 0.0f, 100.0f, 0.0f, false, kOnyConeMarginDeg });
+        r.avoidFrontal.push_back({ 10184, 30.0f, kOnyTailHalfDeg, Who::NonTank, 180.0f, 100.0f, 0.0f, false, kOnyConeMarginDeg });
 
         // Where to stand for each breath, the AzerothCore bots' safe zones (mod-playerbots Ai/Raid/Ony/OnyActions.h): two points per breath,
         // 32-53 y off its line, at the hall's ends. A member inside a corridor walks to the nearer one.
@@ -102,29 +117,37 @@ namespace Playerbot::Raid {
         r.faceAway.push_back({ 10184, 100.0f, 65.0f, 0.0f });
         r.faceAway.push_back({ 10184, 40.0f, 0.0f, 0.0f });
 
-        // Melee DPS stand on her flank, in the wedge between the front cones (45 degrees) and the tail sweep (everything behind, from 90):
-        // 55..85 degrees off her facing, 3-8 yards out. Phases 1 and 3 only; she flies in phase 2 (the rule skips a flying enemy too).
+        // Melee DPS stand on her flank, in the wedge between the widened front cone and the widened tail sweep (kOnyWedgeLoDeg..kOnyWedgeHiDeg
+        // off her facing: 75..105 with the arcs at 60 either side and a 12 degree margin), 2-9 yards out. Phases 1 and 3 only; she flies in phase 2 (the rule skips a
+        // flying enemy too). The wedge is measured from the tank's locked axis (RaidBrain 3d), not from her live facing, which swings with
+        // every step of the tank and flipped the side a bot stood on.
         // Onyxia n7 2026-10-14: six melee DPS died to one tail sweep at 19 s while alternating "leave cone" and attack.
-        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, 70.0f, 20.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, 70.0f, 20.0f, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Melee, 2.0f, 9.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 40.0f, 0.0f });
 
         // Each bot has its own slot in the wedge (RaidBrain 3d: the matching members on its side share a grid of rows and columns) and that is
-        // the only position rule for it in phases 1 and 3; healers take the inner band (20-26 y), ranged the outer one (26-34 y), melee 2-9 y.
-        // Ranged DPS and healers take the same side wedges, out of Wing Buffet (20 y) and the tail sweep, 22-30 y from her. Her facing follows
+        // the only position rule for it in phases 1 and 3; healers take the inner band (21-25 y), ranged the outer one (23-29 y), melee 2-9 y.
+        // The outer band ends inside the casters' 30 y reach: the old 26-34 y band put half of them out of range, and the range step walked them
+        // back toward her while the wedge sent them out.
+        // Ranged DPS and healers take the same side wedges, out of Wing Buffet (20 y) and the tail sweep, 21-29 y from her. Her facing follows
         // whoever she is hitting; with the ranged massed on one bearing a single Flame Breath (45 y) took ten of them at once, in the first
         // minute of n38 run 5 (all ten stood 48-68 degrees off her facing, 8-30 y out) and in a dozen breaths of run 6's phase 3, where the
         // whole raid stood round her. In the wedges only the side she turns to is exposed, and the other side is clear. Phases 1 and 3.
-        r.standFlank.push_back({ 10184, Who::Ranged, 26.0f, 34.0f, 70.0f, 20.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Ranged, 26.0f, 34.0f, 70.0f, 20.0f, 40.0f, 0.0f });
-        r.standFlank.push_back({ 10184, Who::Healer, 20.0f, 26.0f, 70.0f, 20.0f, 100.0f, 65.0f });
-        r.standFlank.push_back({ 10184, Who::Healer, 20.0f, 26.0f, 70.0f, 20.0f, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Ranged, 23.0f, 29.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Ranged, 23.0f, 29.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 40.0f, 0.0f });
+        r.standFlank.push_back({ 10184, Who::Healer, 21.0f, 25.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 100.0f, 65.0f });
+        r.standFlank.push_back({ 10184, Who::Healer, 21.0f, 25.0f, kOnyWedgeCentreDeg, kOnyWedgeHalfDeg, 40.0f, 0.0f });
 
         // The two cave alcoves (-30.1,-254.5 and -30.8,-177.1, ony/boss_onyxia.cpp whelp spawn points) are out of bounds: static whelps lie in
         // them, and raiders sent there (the off-tanks stood 6 y inside each mouth, the casters' AoE share behind them) and raiders pushed there by
         // a flank, spacing or dodge move pulled out dozens of whelps, 38 loose at 3 min (n58 live 2026-10-15). No move target may end within
-        // 22 y of either centre; the whelps the script sends out come to the raid, which fights them where it stands.
-        r.keepOut.push_back({ 10184, -30.1f, -254.5f, 22.0f });
-        r.keepOut.push_back({ 10184, -30.8f, -177.1f, 22.0f });
+        // kOnyCaveKeepOutRadius of either centre; the whelps the script sends out come to the raid, which fights them where it stands.
+        // The circle is the whelps' own pull range, not a wide berth: the core's aggro radius is 15 y less the creature's combat reach plus the
+        // level difference (Creature::GetAggroRange), about 10-13 y for a level 56-59 whelp against a level 60 raider. The 22 y it had put both
+        // flank wedges inside the circles whenever she stands at her spawn spot (x -34.6: the wedge's slots are 7-19 y from the cave centres), the
+        // brain pushed every casters' move out to the rim in front of her and 945 cone steps followed.
+        r.keepOut.push_back({ 10184, -30.1f, -254.5f, kOnyCaveKeepOutRadius });
+        r.keepOut.push_back({ 10184, -30.8f, -177.1f, kOnyCaveKeepOutRadius });
 
         // Phase 2 range. In n50 run 1 she went 56% -> 54% in 36 s with 20 DPS "hitting": the ranged stood 54-78 y from her (dps_idle_reason
         // "target out of range" with the flying Onyxia, moving=1 for whole minutes) and the casters on the whelp share ran 36-71 y after

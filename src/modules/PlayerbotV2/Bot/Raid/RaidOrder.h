@@ -79,6 +79,13 @@ struct RaidOrder
     // Pause the rotation (Nefarian's priest call). Movement and elected jobs still run.
     bool hold_rotation = false;
 
+    // A boss fight script (RaidFightScript.h) owns this DPS bot's target and start: the tank-first threat holds and the skull / kill-focus
+    // pickers stand down, the bot attacks script_focus (empty: the generic rules pick). Never set on tanks or healers.
+    bool script_owns = false;
+    ObjectGuid script_focus;
+    // The boss script names this bot's kill target: it wins over every generic picker (skull, kill focus, fallback).
+    bool script_names_target() const { return active && script_owns && !script_focus.IsEmpty(); }
+
     // Snapshot buffers are recycled: clear everything but keep the vector's capacity.
     void reset()
     {

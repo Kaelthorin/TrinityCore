@@ -606,22 +606,24 @@ public:
         };
         // One-step companions for the player at the keyboard: `.bot add warrior tank` creates the bot, binds it to the
         // caller's character, levels it to them, teaches its spells, sets role/talents/gear, brings it over and groups it.
+        // Every player: the commands for the caller's own bots (each one only ever touches bots owned by the caller's account).
+        // GM only: world, bgstress, bgsoak and itemstats, which look at other players or the whole server.
         static ChatCommandTable botTable =
         {
-            { "about",         HandleBotAbout,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
+            { "about",         HandleBotAbout,      rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::Yes },
             { "addon",         HandleBotAddonHello, rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
-            { "add",           HandleBotAdd,        rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "call",          HandleBotCall,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "add",           HandleBotAdd,        rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "call",          HandleBotCall,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             // Every player: brings the caller's own bots only (`.bot summon all|saved|<bot name>`).
             { "summon",        HandleBotSummon,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No },
-            { "dismiss",       HandleBotDismiss,    rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "regear",        HandleBotRegear,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "gear",          HandleBotGear,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "dismiss",       HandleBotDismiss,    rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "regear",        HandleBotRegear,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "gear",          HandleBotGear,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "itemstats",     HandleBotItemStats,  rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "save",          HandleBotSave,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "delete",        HandleBotDelete,     rbac::RBAC_PERM_COMMAND_GM, Console::No  },
-            { "list",          HandleBotList,       rbac::RBAC_PERM_COMMAND_GM, Console::No  },
+            { "save",          HandleBotSave,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "unsave",        HandleBotUnsave,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "delete",        HandleBotDelete,     rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
+            { "list",          HandleBotList,       rbac::RBAC_PERM_JOIN_NORMAL_BG, Console::No  },
             { "world",         HandleBotWorld,      rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgstress",      HandleBotBgStress,   rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
             { "bgsoak",        HandleBotBgSoak,     rbac::RBAC_PERM_COMMAND_GM, Console::Yes },
@@ -839,7 +841,7 @@ public:
         Player const* me = sess->GetPlayer();
         Group const* group = me ? me->GetGroup() : nullptr;
         for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-            if (Playerbot::Services::Owners().GetOwner(id).saved ||
+            if (Playerbot::Services::Owners().SavedBy(id, me ? me->GetGUID().GetCounter() : 0) ||
                 (group && group->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
                 out.push_back(id);
         return out;
@@ -870,12 +872,26 @@ public:
         std::vector<Playerbot::BotId> ids;
         if (roster && groupOnly)
         {
+            // The companions in the group (one logged out is logged in again: a raid member that is offline is a missing one) and the
+            // companions already online that are not in it yet: they are put in the group and brought, as `.bot call` does. Saved
+            // companions that are offline and not grouped stay where they are (the 2-person-party case above).
             Group const* grp = me->GetGroup();
+            uint32 grouped = 0, offlineGrouped = 0, outside = 0;
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id)) && ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
-                    ids.push_back(id);
+            {
+                ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+                bool const online = ObjectAccessor::FindConnectedPlayer(guid) != nullptr;
+                bool const inGroup = grp && grp->IsMember(guid);
+                if (!inGroup && !online)
+                    continue;
+                ids.push_back(id);
+                if (inGroup) { ++grouped; offlineGrouped += online ? 0u : 1u; }
+                else ++outside;
+            }
+            TC_LOG_INFO("playerbot.v2", "[summon] {} .bot summon all on map {}: {} companions in the group ({} logged out), {} online outside the group",
+                        me->GetName(), me->GetMapId(), grouped, offlineGrouped, outside);
             if (ids.empty())
-            { handler->SendSysMessage("None of your bots are in your group. `.bot summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
+            { handler->SendSysMessage("None of your bots are in your group or online. `.bot summon <name>` brings one, `.bot call all` brings back your saved raid."); return Refuse(handler); }
         }
         else
             ids = roster ? SavedCompanions(sess) : CompanionsMatching(sess, who);
@@ -885,14 +901,14 @@ public:
         {
             std::vector<Playerbot::BotId> savedOnly;
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (Playerbot::Services::Owners().GetOwner(id).saved)
+                if (Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()))
                     savedOnly.push_back(id);
             if (!savedOnly.empty())
             {
                 Group* grp = me->GetGroup();
                 uint32 removed = 0;
                 for (Playerbot::BotId id : ids)
-                    if (!Playerbot::Services::Owners().GetOwner(id).saved)
+                    if (!Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()))
                     {
                         ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
                         if (grp && grp->IsMember(guid))
@@ -958,7 +974,7 @@ public:
         while (!who.empty() && (who.front() == ' ' || who.front() == '\t')) who.erase(who.begin());
         bool const init = Playerbot::Services::Initialized();
         // `saved` = the saved roster (`.bot save`) plus the grouped bots, logged in if need be: the addon's "Call saved" button.
-        // `.bot call all` is the same but needs GM rights, which normal players do not have.
+        // `.bot call all` is the same.
         if (init && ToLowerAscii(who) == "saved")
         {
             CallCompanions(handler, "all", /*groupOnly*/ false);
@@ -1149,7 +1165,7 @@ public:
                     ++with_group;
             // A group with none of the owner's bots in it saves nothing and must not wipe the roster.
             for (Playerbot::BotId id : CompanionsMatching(sess, "all"))
-                if (with_group && Playerbot::Services::Owners().GetOwner(id).saved && !(grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
+                if (with_group && Playerbot::Services::Owners().SavedBy(id, me->GetGUID().GetCounter()) && !(grp && grp->IsMember(ObjectGuid::Create<HighGuid::Player>(id))))
                 {
                     Playerbot::Services::Owners().SetSaved(id, false);
                     TC_LOG_INFO("playerbot.v2", "[roster_save] {} was saved earlier and is not in the group: unsaved", CompanionName(id));
@@ -1167,7 +1183,7 @@ public:
                 if (!ObjectAccessor::FindConnectedPlayer(guid) || !group || !group->IsMember(guid))
                     continue;
             }
-            Playerbot::Services::Owners().SetSaved(id, true);
+            Playerbot::Services::Owners().SetSaved(id, true, me->GetGUID().GetCounter());
             // Its role is stored with it (a bot nobody ever gave a role would be re-read from its talents at the next call).
             if (Player* online = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id)))
             {
@@ -1215,7 +1231,7 @@ public:
             return false;
         uint32 removed = 0;
         for (Playerbot::BotId id : CompanionsMatching(sess, who))
-            if (Playerbot::Services::Owners().GetOwner(id).saved)
+            if (Playerbot::Services::Owners().SavedBy(id, sess->GetPlayer() ? sess->GetPlayer()->GetGUID().GetCounter() : 0))
             {
                 Playerbot::Services::Owners().SetSaved(id, false);
                 ++removed;
@@ -1300,7 +1316,7 @@ public:
                 continue;
             handler->PSendSysMessage("%s: level %u %s, %s%s", info->Name.c_str(), uint32(info->Level),
                                      ClassName(info->Class), ObjectAccessor::FindConnectedPlayer(guid) ? "online" : "offline",
-                                     Playerbot::Services::Owners().GetOwner(id).saved ? ", saved" : "");
+                                     Playerbot::Services::Owners().SavedBy(id, handler->GetSession() && handler->GetSession()->GetPlayer() ? handler->GetSession()->GetPlayer()->GetGUID().GetCounter() : 0) ? ", saved" : "");
         }
         return true;
     }

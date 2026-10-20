@@ -1,6 +1,7 @@
 #include "BotGearGenerator.h"
 #include "BotItemScorer.h"
 #include "OwnedGearPolicy.h"
+#include "WorldGearStart.h"
 #include "Bot/ClassTables.h"   // MaxPlayerLevel()
 #include "ObjectMgr.h"
 #include "DB2Stores.h"           // sItemSetStore: tier set pieces
@@ -700,6 +701,8 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
 {
     std::vector<GearItem> out;
     if (!g_initialized || ctx.cls < 1 || ctx.cls >= MAX_CLASSES) return out;
+    // A world bot below level 10 keeps its starting outfit (WorldGearStart.h).
+    if (!::Playerbot::Gear::GeneratesGear(ctx.world_bot(), ctx.level)) return out;
 
     uint16 const target_ilvl = TargetIlvlForLevel(ctx.level);
     auto const& pool = g_pools[ctx.cls];

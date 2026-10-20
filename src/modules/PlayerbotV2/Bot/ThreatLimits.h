@@ -47,4 +47,48 @@ constexpr float ThreatEarlyHoldRatio(float base, bool melee, float tank_threat, 
     return lowered > floor ? lowered : floor;
 }
 
+// The class threat drops (Fade, Feign Death, Feint, Cower): spell, the aura it needs, and whether it is cast on the mob. The rotations
+// cast them when a bot holds kThreatDropPct of the tank's threat on a mob; the generic hold casts them once at the hard limit.
+struct ThreatDrop { unsigned char cls; unsigned spell; unsigned needs_aura; bool on_target; };
+constexpr ThreatDrop kThreatDrops[] = {
+    { 5, 586,  0,   false },   // Priest: Fade
+    { 3, 5384, 0,   false },   // Hunter: Feign Death
+    { 4, 1966, 0,   true  },   // Rogue: Feint
+    { 11, 8998, 768, true },   // Druid: Cower (Cat Form)
+};
+constexpr int kThreatDropPct = 60;   // percent of the tank's threat from which a rotation sheds threat
+constexpr int kThreatHighPct = 80;   // percent of the tank's threat from which a rotation uses its big threat drop
+
+// How long a raid's DPS wait after the tank's first hit on a boss before they open by themselves (the owner's Attack still releases them at
+// once). The tank runs in from the room's edge and builds its lead in that time; the dungeons' parties keep their own, shorter wait. The one
+// number for the generic boss opening and for every boss fight script (Raid::Script::Fight::startWaitMs).
+constexpr unsigned kRaidBossOpenWaitMs = 8000;
+
+// The "a forgotten Attack must not wipe the raid" release (Playerbot.Raid.DpsWaitTimeoutMs): after the tanks have fought this long without the
+// owner's Attack the DPS go anyway. A raid's, limited to the same eight seconds and defaulting to it; a party keeps its six.
+constexpr unsigned kRaidDpsWaitTimeoutMaxMs = kRaidBossOpenWaitMs;
+constexpr unsigned kPartyDpsWaitTimeoutMs   = 6000;
+
+// Past the hard limit the over-threat hold waits for the tank's threat to rise. A tank that is stunned, feared, dead, in an Inferno
+// or out of reach never raises it, and every DPS and healer at the limit stood idle for as long as that lasted.
+// After kStalledTankHoldMs on a tank whose threat has not moved the hold releases: the class threat drop (Fade, Feign Death, Feint,
+// Cower) has had its chance during the hold, and plain fighting takes over. The same clock bounds the healer's near-tank hold.
+constexpr unsigned kStalledTankHoldMs = 6000;
+
+struct StalledTankClock { unsigned since_ms = 0; unsigned last_ms = 0; float tank_threat = 0.0f; };
+
+// One poll of a hold past the hard limit: true once the hold has lasted kStalledTankHoldMs with the tank's threat at a standstill.
+// The clock restarts when the tank's threat rises (the tank is building, the hold is doing its job) and after gap_ms without a
+// poll (a new hold).
+constexpr bool StalledTankHoldExpired(StalledTankClock& c, unsigned now, float tank_threat, unsigned gap_ms)
+{
+    if (!c.since_ms || now - c.last_ms > gap_ms || tank_threat > c.tank_threat)
+    {
+        c.since_ms = now;
+        c.tank_threat = tank_threat;
+    }
+    c.last_ms = now;
+    return now - c.since_ms >= kStalledTankHoldMs;
+}
+
 }  // namespace Playerbot

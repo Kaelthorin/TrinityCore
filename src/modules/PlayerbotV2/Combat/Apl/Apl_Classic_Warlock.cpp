@@ -26,7 +26,6 @@
 // Skipped: Fear, Fel Domination (Soulstone / Healthstone live in
 // the upkeep rules).
 
-#include "AplPetThrottle.h"
 #include "Bot/SpellFamily.h"
 #include "../ApRegistry.h"
 #include "../ApRotation.h"
@@ -188,17 +187,6 @@ bool ShouldSummonPet(ApPredicateContext const& ctx)
     return ctx.bot.raw().pet.pet_family != Interrupt::SummonPetFamily(want) && ctx.bot.has_reagents(want);
 }
 void DoSummonPet(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(PetSpell(ctx)); }
-
-bool ShouldPetAttack(ApPredicateContext const& ctx)
-{
-    return HasLiveTarget(ctx) && ctx.bot.in_combat() && ctx.bot.has_pet() && ctx.bot.pet_victim() != ctx.bot.victim()
-        && Playerbot::AplPet::PetAttackDue(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-}
-void DoPetAttack(ApPredicateContext const& ctx, BotIntentEmitter& e)
-{
-    Playerbot::AplPet::NotePetAttack(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-    e.pet_attack(ctx.bot.victim());
-}
 
 // A raid group: the curse comes from the raid plan and the dots are capped.
 bool InRaid(ApPredicateContext const& ctx)
@@ -373,7 +361,6 @@ ApRule const kWarlockRules[] = {
     { ShouldLifeTap,        DoLifeTap,        "classic_warlock:life_tap" },
     { ShouldArmor,          DoArmor,          "classic_warlock:armor" },
     { ShouldSummonPet,      DoSummonPet,      "classic_warlock:summon_pet" },
-    { ShouldPetAttack,      DoPetAttack,      "classic_warlock:pet_attack" },
     { ShouldRaidCurse,      DoRaidCurse,      "classic_warlock:raid_curse" },
     { ShouldShadowTrance,   DoShadowBolt,     "classic_warlock:shadow_trance" },
     { ShouldSchoolNuke,     DoSchoolNuke,     "classic_warlock:school_nuke" },

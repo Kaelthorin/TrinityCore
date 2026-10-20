@@ -13,6 +13,7 @@
 // top-of-tick dispatch in `State_Idle::DispatchIdle`.
 
 #include "Bot/IdleRule.h"
+#include "Bot/InstanceFullHold.h"
 #include "Group/GroupSnapshot.h"
 #include "Bot/BotAI.h"
 #include "Bot/BotSnapshotView.h"
@@ -806,6 +807,27 @@ bool RejoinInstanceFire(BotSnapshotView const& s, BotAI& ai,
     {
         ResetRejoin(ai);
         return false;
+    }
+
+    // The door refused the bot because the instance holds its most players: it
+    // stays where it is, safe, instead of walking the open world to an entrance it cannot use (a bot died to the Scarshield Sentries on
+    // that walk, outside the instance where Raul could not raise him), and asks again every kInstanceFullHoldMs for a free slot.
+    if (ai.instance_full_map() == anchor->map_id)
+    {
+        if (V2::InstanceFullHolds(ai.instance_full_map(), ai.instance_full_ms(), anchor->map_id, now_ms, BotAI::kInstanceFullHoldMs))
+        {
+            if (rr.log_ms == 0 || now_ms - rr.log_ms >= 60000u)
+            {
+                rr.log_ms = now_ms ? now_ms : 1u;
+                TC_LOG_INFO("playerbot.v2", "[rejoin] {} waits on map {}: {} in map {} is full, it asks again in {}s",
+                            s.name(), s.map_id(), anchor->name, anchor->map_id,
+                            (BotAI::kInstanceFullHoldMs - (now_ms - ai.instance_full_ms())) / 1000u);
+            }
+            ai.set_last_rule_fired("idle:rejoin_instance_full");
+            return true;
+        }
+        ai.clear_instance_full();
+        rr.direct_tries = 0;
     }
 
     float bx, by, bz;

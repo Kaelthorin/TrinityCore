@@ -8,6 +8,7 @@
 
 #include "IdleWatch.h"
 #include "WalkOrder.h"
+#include "Travel/ReachMemory.h"
 #include "BotTypes.h"
 #include "BotSnapshot.h"  // CurrencyEntry — cached_currencies_ member needs full type
 #include "Battleground/BgTactics.h"          // BgTactics::StallWatch (bg_stall_ member)
@@ -271,6 +272,13 @@ public:
         uint32 direct_tries = 0;
         static constexpr uint32 kDirectTries = 3;
     };
+    // The instance map a companion was last refused for being full, and when: the rejoin rule holds still for kInstanceFullHoldMs
+    // and asks again (idle:rejoin_instance_full), instead of walking to an entrance it cannot use.
+    void     note_instance_full(uint32 map_id, uint32 now_ms) { instance_full_map_ = map_id; instance_full_ms_ = now_ms ? now_ms : 1u; }
+    uint32   instance_full_map() const { return instance_full_map_; }
+    uint32   instance_full_ms()  const { return instance_full_ms_; }
+    void     clear_instance_full() { instance_full_map_ = 0; instance_full_ms_ = 0; }
+    static constexpr uint32 kInstanceFullHoldMs = 30000u;
     RejoinRun&       rejoin_run()       { return rejoin_run_; }
     RejoinRun const& rejoin_run() const { return rejoin_run_; }
     // The release order is not among these (see release_order_ms above).
@@ -571,13 +579,14 @@ public:
         None = 0, Follow, Hold, Stay, Engage, Disengage, Action
     };
 
-    OwnerCommand owner_command() const { return owner_command_; }
-    ObjectGuid   owner_target()  const { return owner_target_; }
-    uint32       manual_mode_until_ms() const { return manual_mode_until_ms_; }
+    OwnerCommand owner_command() const { std::lock_guard<std::mutex> lk(orders_.mtx); return orders_.command; }
+    ObjectGuid   owner_target()  const { std::lock_guard<std::mutex> lk(orders_.mtx); return orders_.target; }
+    uint32       manual_mode_until_ms() const { std::lock_guard<std::mutex> lk(orders_.mtx); return orders_.until_ms; }
     bool         is_manual_mode(uint32 now_ms) const
     {
-        return owner_command_ != OwnerCommand::None &&
-               now_ms < manual_mode_until_ms_;
+        std::lock_guard<std::mutex> lk(orders_.mtx);
+        return orders_.command != OwnerCommand::None &&
+               now_ms < orders_.until_ms;
     }
 
     // Enter manual mode with the given command + target. Pass `ttl_ms`
@@ -586,18 +595,56 @@ public:
     void enter_manual(OwnerCommand cmd, ObjectGuid target,
                       uint32 now_ms, uint32 ttl_ms = 30000)
     {
-        owner_command_         = cmd;
-        owner_target_          = target;
-        manual_mode_until_ms_  = now_ms + (ttl_ms == 0 ? 30000u : ttl_ms);
-        last_owner_command_ms_ = now_ms;
+        std::lock_guard<std::mutex> lk(orders_.mtx);
+        orders_.command  = cmd;
+        orders_.target   = target;
+        orders_.until_ms = now_ms + (ttl_ms == 0 ? 30000u : ttl_ms);
+        orders_.last_ms  = now_ms;
     }
 
     // Owner said stay/hold: the bot keeps its spot and must not be pulled back into a follow.
     bool holding_position(uint32 now_ms) const
     {
-        return is_manual_mode(now_ms) &&
-               (owner_command_ == OwnerCommand::Stay || owner_command_ == OwnerCommand::Hold);
+        std::lock_guard<std::mutex> lk(orders_.mtx);
+        return orders_.command != OwnerCommand::None && now_ms < orders_.until_ms &&
+               (orders_.command == OwnerCommand::Stay || orders_.command == OwnerCommand::Hold);
     }
+
+    // Follow-drop commitment (HonorFollowDrop, run at the top of every tick). The owner dropped or jumped to a floor 4+ y below and the
+    // bot is walking to a ledge, or is in the air after leaving it: nothing else may run until it lands (a
+    // warlock's buff cast stopped the walk, then a combat escape took it round the rim the long way). Set by the intent executor when
+    // API::move_to follow_drop took a ledge, cleared on landing or when the way is no longer wanted. The values are written on the
+    // world thread (executor) and read by the bot worker, hence atomics.
+    static constexpr uint32 kFollowDropHoldMs  = 2500;    // a commit lasts this long past the last ledge move
+    static constexpr uint32 kFollowDropMaxMs   = 15000;   // a walk to a ledge that takes longer is given up
+    static constexpr uint32 kFollowDropFineMs  = 3000;    // after the walking route was judged fine, no new attempt for this long
+    static constexpr uint32 kFollowDropBlockMs = 8000;
+    bool follow_drop_committed(uint32 now_ms) const { return now_ms < follow_drop_until_ms_.load(std::memory_order_relaxed); }
+    uint32 follow_drop_since_ms() const { return follow_drop_since_ms_.load(std::memory_order_relaxed); }
+    void commit_follow_drop(uint32 now_ms)
+    {
+        if (!follow_drop_committed(now_ms))
+            follow_drop_since_ms_.store(now_ms ? now_ms : 1u, std::memory_order_relaxed);
+        follow_drop_until_ms_.store(now_ms + kFollowDropHoldMs, std::memory_order_relaxed);
+    }
+    void clear_follow_drop()
+    {
+        follow_drop_until_ms_.store(0, std::memory_order_relaxed);
+        follow_drop_since_ms_.store(0, std::memory_order_relaxed);
+    }
+    // The walking route to the owner is fine: no ledge attempt for a while.
+    void note_follow_drop_fine(uint32 now_ms)
+    {
+        follow_drop_fine_until_ms_.store(now_ms + kFollowDropFineMs, std::memory_order_relaxed);
+        clear_follow_drop();
+    }
+    bool follow_drop_fine(uint32 now_ms) const { return now_ms < follow_drop_fine_until_ms_.load(std::memory_order_relaxed); }
+    void block_follow_drop(uint32 now_ms)
+    {
+        follow_drop_block_until_ms_.store(now_ms + kFollowDropBlockMs, std::memory_order_relaxed);
+        clear_follow_drop();
+    }
+    bool follow_drop_blocked(uint32 now_ms) const { return now_ms < follow_drop_block_until_ms_.load(std::memory_order_relaxed); }
 
     // Owner said flee: run to them without fighting back until the window ends (DispatchInCombat).
     static constexpr uint32 kFleeMs = 8000;
@@ -613,9 +660,10 @@ public:
     // disturb manual mode (they're settings, not movement orders).
     void refresh_manual(uint32 now_ms, uint32 ttl_ms = 30000)
     {
-        if (owner_command_ != OwnerCommand::None)
-            manual_mode_until_ms_ = now_ms + (ttl_ms == 0 ? 30000u : ttl_ms);
-        last_owner_command_ms_ = now_ms;
+        std::lock_guard<std::mutex> lk(orders_.mtx);
+        if (orders_.command != OwnerCommand::None)
+            orders_.until_ms = now_ms + (ttl_ms == 0 ? 30000u : ttl_ms);
+        orders_.last_ms = now_ms;
     }
 
     // Drop manual mode — autonomous rules resume. Also called when the
@@ -623,12 +671,13 @@ public:
     // ttl in is_manual_mode, but a /resume should clear immediately).
     void exit_manual()
     {
-        owner_command_         = OwnerCommand::None;
-        owner_target_          = ObjectGuid::Empty;
-        manual_mode_until_ms_  = 0;
+        std::lock_guard<std::mutex> lk(orders_.mtx);
+        orders_.command  = OwnerCommand::None;
+        orders_.target   = ObjectGuid::Empty;
+        orders_.until_ms = 0;
     }
 
-    uint32     last_owner_command_ms() const { return last_owner_command_ms_; }
+    uint32     last_owner_command_ms() const { std::lock_guard<std::mutex> lk(orders_.mtx); return orders_.last_ms; }
     // The owner's "attack" word reached this bot (whether or not the bot may open on the target): PveGroupCoordinator releases the raid's
     // marks and DPS wait for it. A Pull never sets it. 0 = never.
     void       note_owner_attack(uint32 now_ms) { owner_attack_ms_ = now_ms ? now_ms : 1u; }
@@ -746,9 +795,9 @@ public:
     // run (or follow stop), or engages a mob himself. Unlike the 30s manual-mode window it lasts
     // until released. Written by the chat handlers (world thread), read and released by the bot logic
     // worker. Returns true when the value changed (callers log [owner_order] on change).
-    bool owner_follow_order() const { return owner_follow_order_.load(std::memory_order_relaxed); }
+    bool owner_follow_order() const { return orders_.follow.load(std::memory_order_relaxed); }
     bool set_owner_follow_order(bool on)
-    { return owner_follow_order_.exchange(on, std::memory_order_relaxed) != on; }
+    { return orders_.follow.exchange(on, std::memory_order_relaxed) != on; }
     // A companion's small party (not a raid group) inside a raid map: never advance or pull,
     // follow the owner and defend. Recomputed each tick (update_dungeon_autopilot_hold).
     bool raid_map_party_hold() const { return raid_map_party_hold_; }
@@ -764,17 +813,17 @@ public:
     // Written by the chat handlers (world thread), read by the bot worker.
     enum class OwnerStance : uint8_t { Auto = 0, Passive = 1, Aggressive = 2 };
     static constexpr float kAggressiveRadiusYd = 10.0f;   // Aggressive: hostiles this close to the owner are attacked
-    OwnerStance owner_stance() const { return OwnerStance(owner_stance_.load(std::memory_order_relaxed)); }
-    bool set_owner_stance(OwnerStance st) { return owner_stance_.exchange(uint8_t(st), std::memory_order_relaxed) != uint8_t(st); }
+    OwnerStance owner_stance() const { return OwnerStance(orders_.stance.load(std::memory_order_relaxed)); }
+    bool set_owner_stance(OwnerStance st) { return orders_.stance.exchange(uint8_t(st), std::memory_order_relaxed) != uint8_t(st); }
     bool owner_passive() const { return owner_stance() == OwnerStance::Passive; }
     // The owner's last attack / pull / assist order is fresh (15 s): a passive bot fights during it.
     bool owner_order_window_open() const
     {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() <
-               owner_order_until_.load(std::memory_order_relaxed);
+               orders_.order_until.load(std::memory_order_relaxed);
     }
     // "passive" ends the window an Attack / Pull opened, so the stance holds at once and not after 15 s.
-    void close_owner_order_window() { owner_order_until_.store(0, std::memory_order_relaxed); }
+    void close_owner_order_window() { orders_.order_until.store(0, std::memory_order_relaxed); }
     // Starts no fight on its own right now (stance Passive, or Auto in an instance led by a human), outside an order window.
     bool passive_now(bool human_led_instance) const
     {
@@ -838,9 +887,9 @@ public:
         end_owner_use();
         int64_t const now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        owner_order_until_.store(now_ms + 15000, std::memory_order_relaxed);
+        orders_.order_until.store(now_ms + 15000, std::memory_order_relaxed);
         if (autopilot_window)
-            human_release_until_.store(now_ms + 15000, std::memory_order_relaxed);
+            orders_.release_until.store(now_ms + 15000, std::memory_order_relaxed);
         return a || b || c;
     }
 
@@ -1969,7 +2018,9 @@ public:
         if (quest_id == 0) return false;
         std::lock_guard<std::mutex> lk(quest_mem_mtx_);
         auto const it = quest_blacklist_until_ms_.find(quest_id);
-        if (it == quest_blacklist_until_ms_.end()) return false;
+        if (it == quest_blacklist_until_ms_.end())
+            // Not this bot's own drop: other bots may have given up on the walk to its goal (Travel/ReachMemory.h).
+            return ::Playerbot::V2::Travel::QuestGoalMemory::Instance().KnownUnreachable(quest_id, now_ms);
         return now_ms < it->second;
     }
     // Drop expired entries. Called periodically from State_Idle (every ~5min)
@@ -2905,6 +2956,7 @@ public:
         bag_recovery_free_seen_ = 255;
         bag_recovery_backoff_until_ms_ = 0;   // futile episode over (bags cleared)
         capital_run_futile_until_ms_ = 0;     // and any capital-run suppression
+        bag_hearth_used_ = false;             // and the one hearth this episode may take
     }
     // Capital-bag-run futility. When the in-city walk to the banker/AH/vendor
     // cluster proves UNREACHABLE (ChunkedWalkToward gives up after its strike
@@ -2913,6 +2965,9 @@ public:
     // bags) instead of looping the unreachable walk above the quest funnel forever
     // (live 2026-06-22: Durnan/Velruun pinned in Stormwind, 200+ path_fail on the
     // same 55y path ending 6.5y short). Retries after the cooldown.
+    // One hearthstone ride to the bound town per full-bag episode (idle:bag_hearth): a bot far from any vendor goes where the vendors are.
+    bool   bag_hearth_used() const { return bag_hearth_used_; }
+    void   set_bag_hearth_used() { bag_hearth_used_ = true; }
     bool   capital_run_in_futility(uint32 now_ms) const
     { return capital_run_futile_until_ms_ != 0 && now_ms < capital_run_futile_until_ms_; }
     void   capital_run_note_futile(uint32 now_ms)
@@ -3353,10 +3408,20 @@ private:
     uint8          last_train_level_ = 0;
     bool           aoe_preference_   = false;
     // Owner-squad-control state (Phase C of OWNER_SQUAD_CONTROL_PLAN.md).
-    OwnerCommand   owner_command_         = OwnerCommand::None;
-    ObjectGuid     owner_target_;
-    uint32         manual_mode_until_ms_  = 0;
-    uint32         last_owner_command_ms_ = 0;
+    // The owner's orders to this bot, all in one place. Written by the chat handlers (world thread), read by the bot worker.
+    struct OwnerOrders
+    {
+        mutable std::mutex mtx;                    // guards command / target / until_ms / last_ms
+        OwnerCommand command  = OwnerCommand::None;   // manual mode (enter_manual): 30 s, or 30 min for stay / hold
+        ObjectGuid   target;
+        uint32       until_ms = 0;
+        uint32       last_ms  = 0;                 // last time any order reached the bot
+        std::atomic<bool>     follow{false};       // owner_follow_order(): lasts until released
+        std::atomic<uint8_t>  stance{0};           // OwnerStance
+        std::atomic<int64_t>  order_until{0};      // steady-clock ms: an order is fresh until then (passive bots assist)
+        std::atomic<int64_t>  release_until{0};    // steady-clock ms: the dungeon autopilot is allowed until then
+    };
+    OwnerOrders    orders_;
     uint32         owner_attack_ms_       = 0;
     uint32         owner_pull_ms_         = 0;
     std::string    last_owner_name_;
@@ -3369,14 +3434,14 @@ private:
     std::atomic<bool>  tactic_save_mana_{false};
     std::atomic<bool>  loot_all_{false};
     DungeonRunMode dungeon_run_mode_      = DungeonRunMode::Off;
-    std::atomic<bool> owner_follow_order_{false};
-    std::atomic<uint8_t> owner_stance_{0};   // OwnerStance
+    std::atomic<uint32_t> follow_drop_until_ms_{0};
+    std::atomic<uint32_t> follow_drop_since_ms_{0};
+    std::atomic<uint32_t> follow_drop_fine_until_ms_{0};
+    std::atomic<uint32_t> follow_drop_block_until_ms_{0};
     bool           raid_map_party_hold_   = false;
     bool           owner_hold_            = false;   // an owner Stay / Hold is on: the autopilot walks nobody (update_dungeon_autopilot_hold)
     bool           human_lead_hold_       = false;   // see human_lead_hold()
     uint32         human_seen_ms_         = 0;       // last tick a leading human was in range (0 = never)
-    std::atomic<int64_t> human_release_until_{0};    // steady-clock ms: autopilot allowed until then
-    std::atomic<int64_t> owner_order_until_{0};      // steady-clock ms: an owner order is fresh until then (passive bots assist)
     BgRunMode      bg_run_mode_           = BgRunMode::Off;
     // Edge-tracker for BG entry/exit. Auto-activate fires on the
     // false→true transition of `in_battleground()`, not while the bot
@@ -4746,6 +4811,7 @@ public:
         uint32 last_progress_ms = 0;
         uint32 fallback_until_ms = 0;
         uint32 last_log_ms = 0;
+        uint32 last_stuck_log_ms = 0;
         uint8  last_action = 0;
     };
     FormationTrack& formation_track() { return formation_track_; }
@@ -4806,6 +4872,7 @@ private:
     uint32 crit_repair_backoff_until_ms_  = 0;  // suppress critical_repair until this time (too poor)
     // bag-recovery futility backoff — see bag_recovery_note_and_check_futile() above.
     uint32 bag_recovery_backoff_until_ms_ = 0;  // suppress bags_full_recover until this time
+    bool   bag_hearth_used_               = false;
     uint32 capital_run_futile_until_ms_   = 0;  // suppress capital_bag_run after an unreachable-city give-up
     RpgState rpg_;                              // RpgRules: town NPC visits + city / AH trips
     uint32 bag_recovery_first_ms_         = 0;  // first tick of the current no-progress window (0 = none)
@@ -5372,6 +5439,8 @@ private:
     std::atomic<uint32> release_order_ms_{0};
     std::atomic<uint32> died_at_ms_{0};
     RejoinRun      rejoin_run_;
+    uint32         instance_full_map_ = 0;
+    uint32         instance_full_ms_ = 0;
     uint32         death_log_ms_ = 0;
     bool           wipe_logged_ = false;
     uint32         owner_wait_since_ms_ = 0;

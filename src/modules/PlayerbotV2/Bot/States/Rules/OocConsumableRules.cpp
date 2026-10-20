@@ -253,6 +253,31 @@ bool OocEatFoodFire(BotSnapshotView const& s, BotAI& ai,
     return true;
 }
 
+// ---------- idle:rest ----------
+// A solo bot under half health with nothing to eat (or nothing the eat rule may use right now) sits and regenerates, instead of
+// standing up for 30-90 s until ambient_sit. The walking rules yield below 50 % (Classic::RecoverBeforeWalking), so this is the
+// other half of that yield. Grouped bots follow their group and never sit here.
+bool RestGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const& g, uint32)
+{
+    if (!s.is_alive() || s.in_combat() || s.is_casting()) return false;
+    if (s.in_group() || s.raw().movement.is_mounted || s.is_moving()) return false;
+    if (s.recently_in_combat(5000) || s.is_encounter_in_progress()) return false;
+    if (s.hp_pct() >= 50) return false;
+    return Classic::SafeToRecover(s, &g);
+}
+
+bool RestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    uint32 const now_ms = s.published_at_ms();
+    if (!ai.action_recently_tried(BotAI::ActionKind::AmbientSit, 0, now_ms))
+    {
+        emit.emit(SetStandStateIntent{1});
+        ai.note_action_retry(BotAI::ActionKind::AmbientSit, 0, now_ms);
+    }
+    ai.set_last_rule_fired("idle:rest");
+    return true;
+}
+
 // ---------- idle:ooc_bandage ----------
 // Self-bandage below 50% health (the owner: out-of-combat bandages when no
 // healer is near). Bandages need First Aid at the item's rank (the supplies
@@ -532,6 +557,14 @@ void RegisterOocConsumableRules(IdleRuleRegistry& r)
         rule.priority = 666;
         rule.gate     = &OocEatFoodGate;
         rule.fire     = &OocEatFoodFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:rest";
+        rule.priority = 662;
+        rule.gate     = &RestGate;
+        rule.fire     = &RestFire;
         r.register_rule(std::move(rule));
     }
     {

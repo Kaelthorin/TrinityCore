@@ -1,5 +1,6 @@
 ﻿#include "BotSnapshotBuilder.h"
 #include "BotRegistry.h"
+#include "GroupControl.h"
 #include "Bot/SpellFamily.h"
 #include "ClassicSpec.h"
 #include "BotAI.h"
@@ -1815,6 +1816,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         else if (mc_ai)
             mc_ai->clear_move_corroborate();
         snap->movement.is_moving = moving;
+        if (!moving && p->GetGroup() && p->GetMap())
+            snap->movement.ground_z = p->GetMap()->GetHeight(p->GetPhaseShift(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ() + 2.0f, true, 10.0f);
     }
     // UNIT_STATE_IN_FLIGHT — the core is flying the bot on a taxi path. The bot logic
     // must stand down entirely (DispatchIdle bails) so no idle/unstick/watchdog
@@ -1887,7 +1890,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         // has feet wet, but it's burning, not drowning.
         snap->environment.is_underwater = (liquid & LIQUID_MAP_UNDER_WATER) != 0
                             && !is_magma && !is_slime;
-        snap->environment.is_in_damaging_liquid = in_liquid && (is_magma || is_slime);
+        // The core burns on any contact, floor within a tenth of the surface included (WATER_WALK): the Majordomo dais.
+        snap->environment.is_in_damaging_liquid = (liquid & MAP_LIQUID_STATUS_IN_CONTACT) != 0 && (is_magma || is_slime);
         if (snap->environment.is_underwater && lqmap)
             snap->environment.water_surface_z = lqmap->GetWaterLevel(
                 p->GetPhaseShift(), p->GetPositionX(), p->GetPositionY());
@@ -3323,9 +3327,36 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     {
         snap->group.group_guid = g->GetGUID();
         snap->owner_in_group = !snap->owner_guid.IsEmpty() && g->IsMember(snap->owner_guid);
+        // No owner in this group: a human member still commands the bot (GroupControl.h). A world bot a player invited gets the
+        // companion's duties and obeys the group leader; a bot with only bots around it stays autonomous.
+        if (!snap->owner_in_group && Services::Initialized())
+        {
+            std::vector<GroupControl::Member<ObjectGuid>> members;
+            for (GroupReference const& itr : g->GetMembers())
+            {
+                Player const* m = itr.GetSource();
+                if (!m || m == p) continue;
+                members.push_back({ m->GetGUID(), !(m->GetSession() && m->GetSession()->IsBot()) });
+            }
+            ObjectGuid const controller = GroupControl::ResolveController(g->GetLeaderGUID(), members);
+            if (!controller.IsEmpty())
+            {
+                snap->led_by_player = true;
+                snap->controller_guid = controller;
+                if (Player const* c = ObjectAccessor::FindConnectedPlayer(controller); c && c->GetMapId() == p->GetMapId())
+                    snap->owner_dist = p->GetExactDist2d(c);
+            }
+        }
         if (snap->owner_in_group)
             if (Player const* owner = ObjectAccessor::FindConnectedPlayer(snap->owner_guid); owner && owner->GetMapId() == p->GetMapId())
                 snap->owner_dist = p->GetExactDist2d(owner);
+        if (bot_ai)
+        {
+            snap->holding_position = bot_ai->holding_position(snap->published_at_ms);
+            auto const stance = bot_ai->owner_stance();
+            snap->no_tag_stance = stance == BotAI::OwnerStance::Passive ||
+                                  (stance == BotAI::OwnerStance::Auto && (snap->owner_in_group || snap->led_by_player));
+        }
     }
 
     // ---- Spellbook (sorted, binary-searchable in BotSnapshotView::knows_spell) ----
@@ -4039,6 +4070,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_cc_pri = pri;
                     u.is_cc_locked = true;
                     u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                 }
             }
         }
@@ -4717,7 +4749,9 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         // Healers seven times and never the shield).
                         bool const shield = asi->Id == 20619 || asi->Id == 21075;
                         bool const shield_held = u.magic_buff_spell == 20619 || u.magic_buff_spell == 21075;
-                        if (shield || (!shield_held && (u.magic_buff_age_ms < 0 || age < u.magic_buff_age_ms)))
+                        // Both shields can stand at once; Magic Reflection (which sends a sheep back at the mage) is the one that must stay
+                        // visible, whichever aura the walk meets last.
+                        if ((shield && u.magic_buff_spell != 20619) || (!shield_held && (u.magic_buff_age_ms < 0 || age < u.magic_buff_age_ms)))
                         {
                             u.magic_buff_age_ms = age;
                             u.magic_buff_spell  = asi->Id;
@@ -4763,6 +4797,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_cc_pri = pri;
                     u.is_cc_locked = true;
                     u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                 }
             }
             fill_threat(u, t);
@@ -4967,6 +5002,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         best_cc_pri = pri;
                         u.is_cc_locked = true;
                         u.cc_caster = abase->GetCasterGUID();
+                    u.cc_ms_left = abase->GetDuration() > 0 ? uint32(abase->GetDuration()) : 0u;
                     }
                 }
             }
@@ -5920,12 +5956,15 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             bool has_complete = false;
             for (auto const& dq : snap->quest_log.quests)
                 if (dq.state == 1) { has_complete = true; break; }
-            // At most one dump per bot per minute (per build thread): a bot parked on a complete quest wrote it on every build, which
+            // At most one dump per bot per minute: a bot parked on a complete quest wrote it on every build, which
             // made [picker_none] 79% of the log at 85-150 bots and pushed every other diagnostic out of the rotation.
             if (has_complete)
             {
-                thread_local std::unordered_map<uint64, uint32> s_picker_none_ms;
+                // One table for all build threads (a table per thread let each thread log the same bot once a minute).
+                static std::mutex s_picker_none_mx;
+                static std::unordered_map<uint64, uint32> s_picker_none_ms;
                 uint32 const pn_now = snap->published_at_ms ? snap->published_at_ms : 1u;
+                std::lock_guard<std::mutex> pn_lock(s_picker_none_mx);
                 uint32& pn_last = s_picker_none_ms[snap->guid.GetCounter()];
                 if (pn_last && pn_now - pn_last < 60000u)
                     has_complete = false;
@@ -5941,10 +5980,25 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     best_breadcrumb_sm_set ? 1 : 0, best_breadcrumb_set ? 1 : 0,
                     bot_map);
                 for (auto const& dq : snap->quest_log.quests)
+                {
+                    // Which of the picker's skip gates (in loop order) drops this quest.
+                    char const* skip = "none";
+                    Quest const* dqt = sObjectMgr->GetQuestTemplate(dq.quest_id);
+                    if (dqt && dqt->GetRequiredSkill() && const_cast<Player*>(p)->GetSkillValue(dqt->GetRequiredSkill()) == 0)
+                        skip = "skill";
+                    else if (bot_ai && bot_ai->quest_blacklisted(dq.quest_id, now_ms))
+                        skip = "quest_blacklist";
+                    else if (dqt && !const_cast<Player*>(p)->SatisfyQuestMinLevel(dqt, false))
+                        skip = "min_level";
+                    else if (bot_ai && bot_ai->objective_blacklisted(dq.quest_id, 0u, now_ms))
+                        skip = "turnin_blacklist";
+                    else if (!QuestHasAnyEnder(dq.quest_id))
+                        skip = "no_ender";
                     TC_LOG_INFO("playerbot.v2",
-                        "[picker_none]   q{} state={} objs={} ender_resolved={} ender_map={}",
+                        "[picker_none]   q{} state={} objs={} ender_resolved={} ender_map={} skip={}",
                         dq.quest_id, uint32(dq.state), uint32(dq.objectives.size()),
-                        dq.ender_resolved ? 1 : 0, dq.ender_map_id);
+                        dq.ender_resolved ? 1 : 0, dq.ender_map_id, skip);
+                }
             }
         }
     }
@@ -7494,7 +7548,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         const bool truly_stuck =
             snap->quest_discovery.quest_offers.empty() &&
             snap->quest_log.quests.empty();
-        if (truly_stuck && p->GetLevel() < 20)
+        if (truly_stuck && p->GetLevel() < 20 && !snap->owner_in_group && !snap->led_by_player)   // a led bot has no quest autopilot to diagnose
         {
             uint32 giver_npc_count = 0;
             uint32 giver_go_count  = 0;

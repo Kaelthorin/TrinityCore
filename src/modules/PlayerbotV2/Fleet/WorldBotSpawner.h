@@ -31,6 +31,7 @@
 #include "WorldLoadFacts.h"
 #include "WorldFactionMix.h"
 #include "PoolBalance.h"
+#include "PoolBudget.h"
 
 class Player;
 
@@ -94,7 +95,8 @@ private:
         uint32 area_cap_town    = 40;      // the same in a capital
         float  area_radius      = 45.0f;
         uint32 pool_horde_pct   = 50;      // share of the roster that should be Horde, in every level bracket (PoolBalance.h)
-        uint32 skyborne_seed_pct = 5;      // share of the roster seeds that are level 1-9 Skyborne residents of Zephras Isle (Classic 1.60)
+        uint32 variable_max     = 2000;    // temporary residents allowed to exist next to the core roster (PoolBudget.h); 0 = none
+        uint32 variable_ttl_h   = 24;      // hours a temporary resident stays offline before it is deleted
     };
 
     struct Anchor
@@ -132,6 +134,7 @@ private:
     // Roster seeding: creates residents (level spread, both factions) one by one, lets the setup pipeline gear them and send them
     // to a zone hub for their level, then logs them out so they sleep there. No player needed; stops at PoolMax.
     void DriveSeed(uint32 now_ms);   // log in the pool bots that sleep around this anchor, no placement
+    void DriveRetire(uint32 now_ms);   // deletes temporary residents that nobody has needed for VariableTtlHours
     void FinishSpawn(Anchor const& a, std::vector<bool> const& slots, std::vector<uint8> const& slot_levels,
                      QueryResult res, bool global = false);
     void DriveGlobalSpawn(uint32 now_ms, std::vector<Anchor> const& anchors);
@@ -159,6 +162,14 @@ private:
     struct Ghost { Anchor a; uint32 until_ms; };   // where a player was before an instance / far jump: keeps its bots for a grace
     std::vector<Ghost> ghosts_;
     std::unordered_map<uint64, Anchor> prev_anchor_;
+    struct PlaceDest { float x = 0.0f, y = 0.0f; uint32 until_ms = 0; };
+    std::unordered_map<uint64, PlaceDest> place_dest_;   // where a bot sent by PlaceNear is walking to, for a while: the crowd count uses it, not its position on the way
+    // World bots under level 10 made before they stopped being given a generated set (migration 0031): each is stripped to its starter outfit once, on login.
+    std::unordered_set<uint64> gear_reset_pending_, gear_reset_tried_;
+    bool gear_reset_loaded_ = false, gear_reset_inflight_ = false;
+    void LoadGearResetPending();
+    void ResetStarterGearOnce(Player* bot);
+    float last_place_x_ = 0.0f, last_place_y_ = 0.0f, last_place_z_ = 0.0f;   // where the last PlaceNear sent the bot (it lands later)
     float last_place_dist_ = 0.0f;                  // ring distance chosen by the last PlaceNear (the teleport lands later)
     BotPopulationManager& owner_;
     Config cfg_;
@@ -179,7 +190,12 @@ private:
     QueryCallbackProcessor queries_;
     bool   query_inflight_ = false;
     uint32 query_started_ms_ = 0;
-    int64  pool_count_ = -1;                        // ambient characters in the DB (-1 = not loaded yet)
+    int64  pool_count_ = -1;                        // ambient characters in the DB, island residents not counted (-1 = not loaded yet)
+    int64  variable_count_ = 0;                     // temporary residents in the DB, plus the island residents created before the flag existed
+    uint32 variable_sweep_ms_ = 0;                  // when temporary residents were last retired
+    bool   variable_sweep_inflight_ = false;
+    uint32 n_created_variable_ = 0;                 // temporary residents created since start
+    uint32 n_retired_ = 0;                          // temporary residents deleted since start
     bool   pool_count_inflight_ = false;
     PoolCounts pool_counts_;                        // the roster by faction and level bracket (levels 10+)
     bool   pool_counts_inflight_ = false;
@@ -193,6 +209,11 @@ private:
     uint64 n_placed_ = 0;
     uint64 n_despawned_ = 0;
     uint64 n_abandoned_ = 0;
+    // Why PlaceNear's candidate spots were refused (index: 0 no ground, 1 water, 2 no navmesh point, 3 lava, 4 no complete path, 5 area full) and
+    // how many calls found none at all; reported in the [world] line so a placement that never succeeds names its cause.
+    uint64 n_place_reject_[6] = {};
+    uint64 n_place_none_ = 0;
+    uint64 n_place_calls_ = 0;
     struct Seeding { uint32 started_ms = 0; uint32 setup_done_ms = 0; };
     std::unordered_map<uint64, Seeding> seeding_;
     uint32 last_grad_ms_ = 0;

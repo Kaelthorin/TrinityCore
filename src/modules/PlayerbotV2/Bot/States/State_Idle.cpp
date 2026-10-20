@@ -9,6 +9,7 @@
 #include "Bot/BotRegistry.h"
 #include "Bot/IdleRule.h"
 #include "Bot/QuestDoable.h"
+#include "Travel/ReachMemory.h"
 #include "Bot/ClassTables.h"
 #include "Bot/Gear/BotGearGenerator.h"   // RaidGearActive / RaidEquipUpgrade (raid-gear upgrade test)
 #include "Bot/RecipeDifficulty.h"
@@ -89,6 +90,28 @@ namespace Playerbot::States {
 // wrap them as registered IdleRules. Truly private helpers (ScoreItem,
 // GetIdleConsumeThresholds, ClassOocRez) get `static` for internal
 // linkage instead of an anonymous namespace.
+
+// True when a recipe can be cast where the bot stands: it needs no spell focus, or a game object of that focus (cooking fire, forge,
+// anvil) is within its radius among the bot's nearby objects.
+static bool RecipeFocusNear(BotSnapshotView const& s, uint32 spell_id)
+{
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si || !si->RequiresSpellFocus)
+        return true;
+    float bx = 0.f, by = 0.f, bz = 0.f;
+    s.position(bx, by, bz);
+    for (auto const& go : s.raw().world_objects.nearby_objects)
+    {
+        GameObjectTemplate const* info = sObjectMgr->GetGameObjectTemplate(go.entry);
+        if (!info || info->type != GAMEOBJECT_TYPE_SPELL_FOCUS || info->GetSpellFocusType() != uint32(si->RequiresSpellFocus))
+            continue;
+        float const dx = go.x - bx, dy = go.y - by, dz = go.z - bz;
+        float const r = float(info->GetSpellFocusRadius());
+        if (dx * dx + dy * dy + dz * dz <= r * r)
+            return true;
+    }
+    return false;
+}
 
 // The mana wait before a pull. A party with a player in it has none (playtest 2026-10-15: the player watches the mana); a raid keeps it,
 // and so does a group of bots alone, where nobody else would hold the pull for the healer's drink (deadmines_full n57: the priest
@@ -17723,6 +17746,15 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 // to actually change maps. (Mirrors the swim_stuck same-map guard.)
                 if (h->mapId != s.map_id()) continue;
 
+                // Other bots already found this walk impossible from around here (a hub on another tier of a mountain island, across
+                // a gap): choose the next hub now instead of walking at the gap and wedging (Travel/ReachMemory.h).
+                if (::Playerbot::V2::Travel::ReachMemory::Instance().KnownUnreachable(
+                        s.map_id(), s.raw().position.x, s.raw().position.y, h->location.GetPositionX(), h->location.GetPositionY(), hub_now_ms))
+                {
+                    ai.note_hub_tried(h->hubId, hub_now_ms);
+                    continue;
+                }
+
                 // FIX 5a: skip any hub with no doable quest left for this bot —
                 // the SAME shared predicate the builder uses, so the rule and the
                 // builder agree about which hubs are exhausted (no oscillation).
@@ -19187,6 +19219,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                         if (t.goal_is_quest && s.current_quest_id() != 0)
                         {
                             ai.blacklist_quest(s.current_quest_id(), now_ms);
+                            ::Playerbot::V2::Travel::QuestGoalMemory::Instance().NoteDropped(s.current_quest_id(), now_ms);
                             tw.last_recovery_ms = now_ms;
                             tw.recovery_tier = 3;
                             ai.set_last_rule_fired("idle:unstick:drop_goal");
@@ -19772,6 +19805,9 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 const uint16 cur = s.skill_value(meta->skill_line_id);
                 const RecipeColor c = ResolveRecipeColor(spell_id, cur);
                 if (c == RecipeColor::Gray || c == RecipeColor::Unknown) continue;
+                // A recipe that needs a fire, forge or anvil is only cast beside one: away from it the cast fails with
+                // REQUIRES_SPELL_FOCUS, the bot stands still, and the idle watch counts it stuck (935 fails in one soak run).
+                if (!RecipeFocusNear(s, spell_id)) continue;
                 // Color rank: Orange=1, Yellow=2, Green=3 — lower is better.
                 // Replace if: better color, OR same color but lower skill.
                 const bool better_color = (best_spell == 0) || (uint8(c) < uint8(best_color));
@@ -20475,8 +20511,21 @@ void DispatchIdle(BotAI& ai,
             || (ai.last_rule_fired() && (std::strcmp(ai.last_rule_fired(), "idle:inn_rest") == 0            // resting at the inn is a reason to stand
                                          || std::strcmp(ai.last_rule_fired(), "idle:mailbox") == 0        // and standing at a mailbox
                                          || std::strcmp(ai.last_rule_fired(), "idle:res_sick_wait") == 0)); // so is waiting out Resurrection Sickness
+        // The watch's own forced walk overwrites the last rule; keep the one before it, which is what held the bot.
+        if (char const* lr = ai.last_rule_fired(); lr && std::strcmp(lr, "idle:watch_walk") != 0)
+            w.prev_rule = lr;
         if (V2::IdleStuck(w, px, py, now, exempt))
         {
+            // Found standing again and again while the quest approach (it only runs more than 80 y from the goal) was the last thing
+            // to move it: the goal cannot be closed from here (Derno and Phili, Burning Steppes, strikes 1..5 for 45 minutes: a forced walk
+            // to a hub ends and the quest rule walks them back to the same goal). Give that objective up so the picker takes another;
+            // the same answer an unreachable objective already gets from the fast NoPath blacklist.
+            if (w.strikes >= 3 && V2::IsObjectiveRule(w.prev_rule))
+            {
+                ai.blacklist_current_objective(now + 10u * 60u * 1000u);
+                TC_LOG_INFO("playerbot.v2", "[idle] bot={} lvl={} zone={} cannot close the quest goal (strikes={}), objective given up for 10 minutes",
+                    s.name(), uint32(s.level()), s.zone_id(), w.strikes);
+            }
             float tx = 0.f, ty = 0.f, tz = pz;
             char const* what = "wander";
             if (w.strikes >= 2)

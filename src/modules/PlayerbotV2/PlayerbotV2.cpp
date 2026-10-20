@@ -48,6 +48,7 @@
 #include "Bot/BotCommandParser.h"
 #include "Bot/BotChatReactor.h"
 #include "Bot/GroupOrderText.h"
+#include "Util.h"
 #include "Bot/AddonHint.h"
 #include "Bot/BotTextMgr.h"
 #include "Chat.h"
@@ -2806,8 +2807,11 @@ void Module::OnLevelUp(Player* p, uint8 new_level)
     uint32 const quest_spells = api.learn_class_quest_spells_free();
     uint32 const spells = api.learn_trainer_spells_free();
     uint32 const weapon_skills = api.learn_weapon_skills_free();
-    TC_LOG_INFO("playerbot.v2", "[levelup] {} reached L{} (class {} zone {}): +{} trainer spells, +{} class quest spells, +{} weapon skills",
-        p->GetName(), uint32(new_level), uint32(p->GetClass()), p->GetZoneId(), spells, quest_spells, weapon_skills);
+    // Riding (vanilla: apprentice and the race's mount at 40, journeyman and the swift mount at 60). The call does nothing below 40 and
+    // when the skill and mount are already there, so a level past 40 (or a jump over it) is safe to hand to it.
+    uint32 const riding = new_level >= 40 ? api.learn_riding_free() : 0;
+    TC_LOG_INFO("playerbot.v2", "[levelup] {} reached L{} (class {} zone {}): +{} trainer spells, +{} class quest spells, +{} weapon skills, +{} riding",
+        p->GetName(), uint32(new_level), uint32(p->GetClass()), p->GetZoneId(), spells, quest_spells, weapon_skills, riding);
 }
 
 namespace {
@@ -3171,15 +3175,13 @@ void Module::OnSpiritReleased(Player* p)
     if (!initialized_ || !p || !p->GetSession() || p->GetSession()->IsBot()) return;
     Group* group = p->GetGroup();
     if (!group) return;
-    uint32 const account = p->GetSession()->GetAccountId();
     uint32 released = 0, considered = 0;
     for (GroupReference const& itr : group->GetMembers())
     {
         Player* member = itr.GetSource();
         if (!member || member == p) continue;
         BotId const mid = member->GetGUID().GetCounter();
-        if (!Services::Registry().has(mid) ||
-            !Services::Owners().IsOwner(mid, account, p->GetGUID().GetCounter()))
+        if (!Services::Registry().has(mid) || !BotCommandParser::ControlsForGroupOrder(p, member))
             continue;
         if (member->IsAlive() || member->GetMapId() != p->GetMapId()) continue;
         ++considered;
@@ -3228,7 +3230,7 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
         if (!m || m == sender || !m->IsAlive())
             return false;
         BotId const mid = m->GetGUID().GetCounter();
-        return Services::Registry().has(mid) && Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) &&
+        return Services::Registry().has(mid) && BotCommandParser::ControlsForGroupOrder(sender, m) &&
                BotCommandParser::BotRole(m) == Role::Tank;
     };
     std::string main_tank_skipped;
@@ -3271,7 +3273,7 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
                 Player* m = itr.GetSource();
                 if (!m || m == sender || !m->IsAlive()) continue;
                 BotId const mid = m->GetGUID().GetCounter();
-                if (!Services::Registry().has(mid) || !Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
+                if (!Services::Registry().has(mid) || !BotCommandParser::ControlsForGroupOrder(sender, m) ||
                     BotCommandParser::BotRole(m) != Role::Tank)
                     continue;
                 float const d = sel ? m->GetDistance(sel) : m->GetDistance(sender);
@@ -3287,12 +3289,12 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
         Player* member = itr.GetSource();
         if (!member || member == sender) continue;
         BotId const mid = member->GetGUID().GetCounter();
-        // Quest words also reach an unowned bot in the group (a world bot the player invited): it shares and accepts
-        // quests like a companion; every other order stays with the bots the sender owns.
+        // Every order reaches the bots the sender owns and the world bots he leads (invited into his group, no owner): they
+        // obey the group leader exactly like a companion. Quest words also reach an unowned bot of any other member.
         bool const quest_word = order == "share" || order == "accept" || order == "accept all" || order == "quests" ||
                                 order == "quest list";
         if (!Services::Registry().has(mid) ||
-            !(Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
+            !(BotCommandParser::ControlsForGroupOrder(sender, member) ||
               (quest_word && Services::Owners().GetOwner(mid).account_id == 0)))
             continue;
         if (order == "pull back")
@@ -3347,7 +3349,7 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
             Player* m = itr.GetSource();
             if (!m || m == sender) continue;
             BotId const mid = m->GetGUID().GetCounter();
-            if (!Services::Registry().has(mid) || !Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter()) ||
+            if (!Services::Registry().has(mid) || !BotCommandParser::ControlsForGroupOrder(sender, m) ||
                 BotCommandParser::BotRole(m) != Role::Tank)
                 continue;
             ++owned_tanks;
@@ -3392,7 +3394,7 @@ void Module::OnGroupPingPoint(Player* sender, Group* group, Position const& poin
         Player* m = itr.GetSource();
         if (!m || m == sender || !m->IsAlive() || m->GetMapId() != sender->GetMapId()) continue;
         BotId const mid = m->GetGUID().GetCounter();
-        if (!Services::Registry().has(mid) || !Services::Owners().IsOwner(mid, account, sender->GetGUID().GetCounter())) continue;
+        if (!Services::Registry().has(mid) || !BotCommandParser::ControlsForGroupOrder(sender, m)) continue;
         if (BotAI* ai = Services::Registry().ai(mid))
         {
             ai->set_rally_point(sender->GetMapId(), point.GetPositionX(), point.GetPositionY(), point.GetPositionZ());
@@ -3461,13 +3463,35 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     if (msg.front() != ';')
     {
         // A bare group order ("follow", "stay", ...) in party or raid chat goes to every bot of the sender's in the
-        // group. Other chatter stays ignored.
+        // group. A line that starts with the name of a bot in the group, or with "all", is that bot's (every bot's)
+        // order without the ';' ("Lentha use altar", "all use altar"). Other chatter stays ignored.
         if (auto const order = ClassifyGroupOrder(msg, Services::Config().behavior_owner_commands()))
             RouteGroupOrder(sender, group, *order);
+        else if (auto const addressed = AddressedGroupOrder(msg, [group](std::string_view name) { return GroupHasBotNamed(group, name); }))
+            DispatchSquadLine(sender, group, *addressed, false);
         return;
     }
     const std::string body = msg.substr(1);
     if (body.empty()) return;
+    DispatchSquadLine(sender, group, body, true);
+}
+
+bool Module::GroupHasBotNamed(Group const* group, std::string_view name)
+{
+    if (!group || name.empty()) return false;
+    for (GroupReference const& itr : group->GetMembers())
+    {
+        Player const* member = itr.GetSource();
+        if (!member) continue;
+        if (!Services::Registry().has(member->GetGUID().GetCounter())) continue;
+        if (StringEqualI(member->GetName(), name)) return true;
+    }
+    return false;
+}
+
+void Module::DispatchSquadLine(Player* sender, Group* group, std::string const& body, bool answer_unknown)
+{
+    if (!sender || !group || body.empty()) return;
     // Walk the group for the sender's first owned bot. We need a
     // primary bot to attach the reply whisper to; if the owner has
     // none in the group, route to the first owned-on-realm fallback.
@@ -3511,7 +3535,7 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     if (!primary)
         primary = any_group_bot;
     if (!primary) return;
-    if (!BotCommandParser::Dispatch(sender, primary, body, "party;"))
+    if (!BotCommandParser::Dispatch(sender, primary, body, "party;") && answer_unknown)
     {
         // A ";" line is meant as an order: an unknown or refused one answers instead of vanishing. (A plain whisper falls
         // through to the social reactor and a bare party word is chatter, so only this explicit route replies.)

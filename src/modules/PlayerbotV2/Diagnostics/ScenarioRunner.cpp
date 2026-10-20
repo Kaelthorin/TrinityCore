@@ -23,12 +23,16 @@
 #include "GroupMgr.h"
 #include "Log.h"
 #include "InstanceLockMgr.h"
+#include "MMapManager.h"
+#include "PhasingHandler.h"
+#include "DetourNavMeshQuery.h"
 #include "Item.h"
 #include "ItemTemplate.h"
 #include "DB2Stores.h"
 #include "Map.h"
 #include "MapManager.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectMgr.h"
 #include "ObjectAccessor.h"
 #include "PathGenerator.h"
@@ -109,6 +113,7 @@ struct Run
     std::uint32_t run_ms = 0;            // time since the run began (what the failure timestamps count)
     bool goal_reached = false;
     std::uint32_t adds_killed = 0;   // ScenarioDef::goal_adds_needed
+    std::uint32_t spared_killed = 0;   // ScenarioDef::spare_entry: dead before the goal boss
     std::string stage_status;
     // Raids: the goal boss's first spawn, the spot the squad is moved to, and whether the main tank has been ordered on it.
     bool boss_spawn_known = false;
@@ -721,9 +726,12 @@ void LogLanding(Run& run)
         if (!p || !p->IsInWorld())
             continue;
         BotAI* ai = ::Playerbot::Services::Registry().ai(m.id);
-        TC_LOG_INFO("playerbot.v2", "[scenario] {} landing round {} {}: {:.0f} y from the landing spot, moving {}, hold {}, rule {}", run.def->name,
+        // What drives the walk: the movement generator, and the spline's end point when one is running.
+        auto const& dest = p->movespline->FinalDestination();
+        TC_LOG_INFO("playerbot.v2", "[scenario] {} landing round {} {}: {:.0f} y from the landing spot, moving {}, hold {}, rule {}, generator {}, spline {} to {:.0f},{:.0f}", run.def->name,
                     run.landing_rounds, p->GetName(), std::hypot(p->GetPositionX() - run.arrive_x, p->GetPositionY() - run.arrive_y),
-                    p->isMoving() ? 1 : 0, ai && ai->holding_position(now) ? 1 : 0, ai && ai->last_rule_fired() ? ai->last_rule_fired() : "-");
+                    p->isMoving() ? 1 : 0, ai && ai->holding_position(now) ? 1 : 0, ai && ai->last_rule_fired() ? ai->last_rule_fired() : "-",
+                    uint32(p->GetMotionMaster()->GetCurrentMovementGeneratorType()), p->movespline->Finalized() ? "done" : "running", dest.x, dest.y);
     }
 }
 
@@ -784,8 +792,9 @@ void LogEngagements(Run& run, Player* viewer)
 bool InMagmaContact(Map* map, PhaseShift const& ps, float x, float y, float z)
 {
     LiquidData ld;
-    ZLiquidStatus const st = map->GetLiquidStatus(ps, x, y, z, map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
-    return (st & MAP_LIQUID_STATUS_IN_CONTACT) != 0;
+    ZLiquidStatus const st = map->GetLiquidStatus(ps, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
+    return (st & MAP_LIQUID_STATUS_IN_CONTACT) != 0 &&
+        (ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) || ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime));
 }
 
 bool PickArrival(Run& run, Player* leader)
@@ -1112,6 +1121,47 @@ void SamplePull(Run& run)
 
 // What the squad stands in at the pull: health and buffs per role, so a scenario that fails can be told from a raid that is under-prepared
 // (MC Ragnaros 2026-10-13: healers died to 2000 damage with ~2000 health at the hit). One line per role.
+// Every raider's footing at the order: how many stand on the navmesh, and the ones that do not (position, nearest-poly probe). A bot with no
+// polygon under it cannot path anywhere (mc_lucifron: srcpoly=0, void ahead, 55-70 y from its target for the whole fight),
+// which reads as a rule that never acts. 2 = a polygon within 5 y vertically, 1 = one only far above or below, 0 = no tile or no mesh, -1 = probe fault.
+void LogRaiderFooting(Run const& run)
+{
+    std::uint32_t total = 0, on_mesh = 0;
+    for (Member const& m : run.members)
+    {
+        Player* p = Find(m.id);
+        if (!p || !p->IsAlive())
+            continue;
+        ++total;
+        int probe = 0;
+        if (Map* map = p->GetMap())
+        {
+            uint32 const terrain_map = PhasingHandler::GetTerrainMapId(p->GetPhaseShift(), p->GetMapId(), map->GetTerrain(), p->GetPositionX(), p->GetPositionY());
+            if (dtNavMeshQuery const* q = MMAP::MMapManager::instance()->GetNavMeshQuery(terrain_map, p->GetMapId(), p->GetInstanceId()))
+            {
+                dtQueryFilter f;
+                f.setIncludeFlags(0xFFFF);
+                float ext[3] = { 3.0f, 5.0f, 3.0f };
+                float pt[3] = { p->GetPositionY(), p->GetPositionZ(), p->GetPositionX() };   // TC -> Detour (y, z, x)
+                int r = ::Playerbot::BotMovement::SehSafeNearestPolyProbe(q, pt, ext, &f);
+                if (r != 0)
+                    probe = r > 0 ? 2 : -1;
+                else
+                {
+                    float ext2[3] = { 3.0f, 200.0f, 3.0f };
+                    probe = ::Playerbot::BotMovement::SehSafeNearestPolyProbe(q, pt, ext2, &f);
+                }
+            }
+        }
+        if (probe == 2)
+            ++on_mesh;
+        else
+            TC_LOG_INFO("playerbot.v2", "[scenario] {} footing: {} stands at {:.1f},{:.1f},{:.1f} with no navmesh polygon under it (probe {})", run.def->name,
+                        p->GetName(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), probe);
+    }
+    TC_LOG_INFO("playerbot.v2", "[scenario] {} footing: {} of {} raiders stand on the navmesh", run.def->name, on_mesh, total);
+}
+
 void LogPullState(Run const& run)
 {
     // Power Word: Fortitude / Prayer of Fortitude, Mark of the Wild / Gift of the Wild, Arcane Intellect / Brilliance, Blessings and Greater Blessings.
@@ -1175,6 +1225,7 @@ bool IssueAttack(Run& run)
         return false;
     }
     LogPullState(run);
+    LogRaiderFooting(run);
     // How many of the boss's entry stand within 400 y, and where: a leftover from an earlier run (Ragnaros summoned twice, a lair summon that
     // was never cleared) would explain tanks that read 16-20 y from "the boss" at the order and a fight that starts on the wrong one.
     {
@@ -1207,7 +1258,9 @@ bool IssueAttack(Run& run)
     TC_LOG_INFO("playerbot.v2", "[scenario] {} ordered {} onto {} ({}) at {} s, {:.0f} y away (start_attack result {})", run.def->name,
                 tank->GetName(), boss->GetName(), run.def->goal_entry, run.run_ms / 1000u, tank->GetDistance(boss), int(res));
     // A target the server refuses (immune to players, not interactible) is a fault in the setup, not a fight that happens to be quiet.
-    if (res == ::Playerbot::Result::InvalidTarget)
+    // Not when the boss is already fighting the raid: a boss script (Bot/Raid/RaidFightScript.h) owns the pull and had the DPS on it before
+    // this order, and Attack on a mob the bot already fights is refused as an invalid target.
+    if (res == ::Playerbot::Result::InvalidTarget && !boss->IsInCombat())
         run.monitor->NoteSetupFailure(run.run_ms, "", fmt::format("{} refused the attack order on {} ({}): the boss is not attackable (immune to players or not interactible)",
                                                                    tank->GetName(), boss->GetName(), run.def->goal_entry));
     return true;
@@ -1401,6 +1454,11 @@ void Finish(Run& run, bool timed_out, std::string const& note = {})
                 run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} curse(s) removed, at least {} expected: the boss's curse was never cleansed ([raid_dispel])",
                                                                        decurse, def.limits.min_decurses));
         }
+        if (def.spare_entry)
+            run.monitor->NoteInfo(fmt::format("spared adds: {} killed before {}", run.spared_killed, def.goal_name));
+        if (run.goal_reached && run.spared_killed)
+            run.monitor->NoteSupportMissing(run.run_ms, fmt::format("{} add(s) of entry {} died before {}: the raid was to leave them alive until he fell ([raid_fight])",
+                                                                   run.spared_killed, def.spare_entry, def.goal_name));
     }
 
     bool const pass = run.monitor->passed(run.goal_reached);
@@ -1904,7 +1962,14 @@ static void TickRun(Run& run, std::uint32_t diff_ms)
                 }
                 for (Member const& m : run.members)
                     if (Player* p = Find(m.id))
+                    {
+                        // A walk or follow still running from the staging is cancelled with the landing, as a taxi flight is: mc_garr and mc_geddon
+                        // had the healers walking 7 y/s from the landing spot under the Hold, rule idle:owner_holding,
+                        // and pulled the boss before the order.
+                        p->GetMotionMaster()->Clear();
+                        p->StopMoving();
                         ::Playerbot::BotMovement::SafeTeleport(p, run.def->map, run.arrive_x, run.arrive_y, run.arrive_z, run.arrive_o, 0);
+                    }
                 run.arrive_sent = true;
                 // Hold from the moment of the landing, not from "in place": the 40 raiders arrive over seconds, and until the Hold
                 // began they walked toward Garr and into his adds (MC Garr 2026-10-10: the first Firesworn engagements came with the
@@ -2159,6 +2224,8 @@ void NoteCreatureKilled(std::uint32_t map, std::uint32_t entry, bool tapped)
             }
         if (!any_alive)
             continue;
+        if (r->def->spare_entry && entry == r->def->spare_entry && !r->goal_reached)
+            ++r->spared_killed;
         if (entry == r->def->goal_entry)
             r->goal_reached = true;
         else if (r->def->goal_adds_needed && (entry == r->def->goal_adds_a || entry == r->def->goal_adds_b) && ++r->adds_killed >= r->def->goal_adds_needed)

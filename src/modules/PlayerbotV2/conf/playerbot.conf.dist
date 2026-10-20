@@ -189,7 +189,8 @@ Playerbot.World.FillerHubOnly = 1
 # around players waits too. Bots already online stay. -1 = 45% of the machine's RAM (the default), 0 = no limit.
 # Stage B/C: 12000 on a 31 GB PC that also runs a client.
 Playerbot.World.RssBudgetMb = -1
-# Bot level limits.
+# Bot level limits. MinLevel is the floor of the wide level spread in capitals and of the world-wide filler; bots around a player in
+# a zone follow the player's own level (from 1) inside the zone's level range.
 Playerbot.World.MinLevel = 10
 Playerbot.World.MaxLevel = 60
 # Percentage of bots of the player's own faction (the rest is the opposing faction).
@@ -249,11 +250,13 @@ Playerbot.World.JumpGraceSec = 20
 Playerbot.World.AreaCapOutdoors = 14
 Playerbot.World.AreaCapTown = 40
 Playerbot.World.AreaRadius = 45
-# Classic 1.60 (Skyborne): share of the seeded residents (SeedRoster = 1) that are level 1-9 Skyborne who sleep on Zephras Isle, the
-# Skyborne start, so a player who arrives there finds quests being done. Around a player on Zephras the spawner always keeps
-# Skyborne bots of level 1-9 (MinLevel does not apply there); a Skyborne bot that reaches level 10 on the island is moved to a
-# leveling town of the vanilla world, because the island has no exit. 0 = no seeded islanders.
-Playerbot.World.SkyborneSeedPct = 5
+# Temporary residents. PoolMax is the standing (core) roster; VariableMax more characters may exist next to it, created around a real
+# player where the core has nobody fitting (a new character on Zephras Isle, a new low-level player) and deleted again, with the
+# server's own character delete, once they have been offline VariableTtlHours with no owner, group or queue tag. The island's
+# Skyborne residents (level 1-9, MinLevel does not apply there) are always temporary. A Skyborne bot that reaches level 10 on the
+# island is moved to a leveling town of the vanilla world. VariableMax = 0: no temporary residents.
+Playerbot.World.VariableMax = 2000
+Playerbot.World.VariableTtlHours = 24
 
 #-----------------------------------------------------------------------------
 # Player interaction
@@ -542,19 +545,20 @@ Playerbot.Behavior.DungeonTactics = 1
 #                     question or their name: within 25 yd, 60 s per bot, 8 s global, 1-4 s delay, '[say_reply]' log.
 Playerbot.Behavior.BotWhisperable = 1
 Playerbot.Behavior.WorldBotSayReply = 1
-#   InstanceGroupCap  OFF by default (an owner may have as many companions out as they like, up to the 40-man raid
-#                     group limit; playtest 2026-10-08). Set 1 to cap: inside an instance `.bot add`, `.bot call` and the addon buttons stop once the owner has
+#   InstanceGroupCap  ON by default.
+#                     Inside an instance `.bot add`, `.bot call` and the addon buttons stop once the owner has
 #                     as many companions out as the map holds, or the group (human included) is full (5 dungeon,
 #                     10/20/40 raid, from the map data; fallback 5 / 40). The owner is warned once when a larger
-#                     group enters a smaller instance. Outside an instance the OpenWorldGroupCap below applies.
-Playerbot.Behavior.InstanceGroupCap = 0
+#                     group enters a smaller instance. Outside an instance the OpenWorldGroupCap below applies. Set 0 to turn the cap off.
+Playerbot.Behavior.InstanceGroupCap = 1
 #   OpenWorldGroupCap outside an instance (open world) an owner has at most this many of their own companions out
 #                     (`.bot add`, `.bot call`, saved roster, addon buttons, relog). Default 5. More bots only by
-#                     inviting world bots, which are not counted; the group becomes a raid when it needs to. A
+#                     inviting world bots, which are not counted; the group becomes a raid when it needs to. Default 40: no limit
+#                     beyond the raid (a raid is built in the open world); set 5 for a normal party. A
 #                     companion above the cap (called inside an instance) is dismissed 10 s after the owner stands
 #                     outside: grouped ones are kept first. Needs InstanceGroupCap = 1. Battleground and arena maps
 #                     are not capped by this. Range 1-40.
-Playerbot.Behavior.OpenWorldGroupCap = 5
+Playerbot.Behavior.OpenWorldGroupCap = 40
 #   BgHumanPriority   a human queueing for a battleground never opens a second instance while a running one can
 #                     make room: a bot leaves it for the human, and a bots-only battleground keeps playing to its
 #                     normal end after the last human leaves ([bg_queue] log lines).
@@ -614,6 +618,14 @@ Playerbot.Behavior.Ike3Commands = 1
 #                     "sell grey", "repair", "summon" (with its combat / instance refusals), "passive" / "aggressive" /
 #                     "defensive". Off: none of these new words is parsed (the older verbs keep working).
 Playerbot.Behavior.OwnerCommands = 1
+#   PassiveLeashYd    a bot in a group with a player is Passive until told otherwise: it starts nothing and fights only what the
+#                     leader pulled (his target) or what is attacking it or a member, and in the open world only within this
+#                     many yards of the leader or of the member being attacked. It never chases further and goes back to
+#                     follow when the fight is done. 0 = no distance limit.
+#   AggressiveRadiusYd  Aggressive stance: a bot attacks any hostile within this many yards of the leader (not of itself) and
+#                     nothing beyond; in a dungeon or raid only mobs not yet in combat inside this radius.
+Playerbot.Behavior.PassiveLeashYd = 25
+Playerbot.Behavior.AggressiveRadiusYd = 10
 #   Fidget            a bot standing idle out of combat (not mounted, nothing hostile near, no group fight) occasionally
 #                     fidgets like a person: a jump, a short emote, a dance or a sit, every 20-90 s (random per bot).
 #                     Off: bots stand perfectly still.
@@ -1070,9 +1082,10 @@ Playerbot.Raid.ProvideConsumables     = 1
 Playerbot.Consumables.PvE             = 1
 Playerbot.Consumables.PvP             = 0
 # Playerbot.Raid.DpsWaitTimeoutMs  with DpsWaitForAttack: after the tanks have fought this long without the owner's
-#   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). Same six seconds as a party's Pull; the
-#   value is limited to 1000-6000 (there is no "never"). Default 6000.
-Playerbot.Raid.DpsWaitTimeoutMs       = 6000
+#   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). Eight seconds for a raid, because the tank
+#   takes a while to run in (a party's Pull keeps six); the value is limited to 1000-8000 (there is no "never").
+#   Default 8000.
+Playerbot.Raid.DpsWaitTimeoutMs       = 8000
 PlayerbotV2.Threat.HoldInOpenWorld    = 0
 PlayerbotV2.Threat.MaxRatio           = 0.9
 PlayerbotV2.Threat.OpeningLeadBoss    = 900

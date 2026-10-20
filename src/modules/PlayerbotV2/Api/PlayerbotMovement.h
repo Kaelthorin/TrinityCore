@@ -83,6 +83,10 @@ bool SnapToGround(Player* p, float x, float y, float& z);
 // Playerbot.Behavior.GroundSnap = 0 restores the plain hint passthrough.
 float GroundZ(Player* p, float x, float y, float zHint, char const* where, bool* ok = nullptr);
 
+// GroundZ without the [ground] log and without touching `out` on a miss: the highest surface at or 3 y above zHint, searched 40 y down.
+// For callers that sample many points (the follow-drop ray walk); false when there is none.
+bool ProbeGround(Player* p, float x, float y, float zHint, float& out);
+
 // Snap target (tx,ty,tz) to the nearest WALKABLE navmesh polygon point as
 // seen from `p` (its map / instance / phase), searching a box of half-extents
 // `hxy` horizontal and `hz` vertical around the target. Unlike SnapToGround
@@ -198,5 +202,12 @@ constexpr bool IsLiquidImpassableForWalk(LiquidVerdict v)
 // through canals: an ungrouped bot must have a dry route or does not move, a follower takes a dry route when one exists.
 // Null = LiquidPolicy::None.
 extern LiquidPolicy (*g_LiquidPathPolicy)(Player* p);
+
+// How often the path calls from a bot's spot have failed with no route (NoPath, or a destination off the mesh), per window of three
+// minutes (Fleet/CityLayer.h). The stranded watch reads it: a bot in a pocket with void all round it fails once a second and never
+// moves far enough for the idle watch to see it stand still. World thread.
+void NoteNoPath(Player const* p);
+bool NoPathStorm(Player const* p);
+void ClearNoPath(Player const* p);
 
 } // namespace Playerbot::BotMovement

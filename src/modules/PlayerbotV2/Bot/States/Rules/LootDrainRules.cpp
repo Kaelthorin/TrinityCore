@@ -68,6 +68,13 @@ uint32 ResolveSkinningSpell(Player* p)
 
 bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
+    // A bot a player leads or owns does not loot: the player loots, so no bot runs off to a corpse. The queue is emptied so the corpses
+    // are not walked to after the group is left. Bots with no player around them keep looting.
+    if (s.is_led_by_player())
+    {
+        Services::Registry().with_loot(s.bot_id(), [](std::deque<ObjectGuid>& q) { q.clear(); });
+        return false;
+    }
     // Told to stay: the corpse can wait until it is released.
     if (ai.is_manual_mode(s.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Stay)
         return false;

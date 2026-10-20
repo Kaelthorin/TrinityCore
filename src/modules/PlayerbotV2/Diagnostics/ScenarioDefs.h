@@ -67,6 +67,8 @@ struct ScenarioDef
     // A fight with no boss death to wait for (Majordomo Executus yields when his eight adds are dead): the goal is reached when this many
     // creatures of these two entries have died on the map. 0 = the goal boss's death.
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;
+    // An add that must not die before the goal boss (Garr's Firesworn): each one that does is reported when the boss is dead. 0 = not checked.
+    std::uint32_t spare_entry = 0;
     bool order_attack = false;
     std::uint32_t order_delay_ms = 0;
     // A whole-dungeon clear to the last boss: long, so `runall` with no filter leaves it out (`runall full` or `run <name>` starts it).
@@ -204,13 +206,16 @@ struct RaidBossRow
     float lair_x = 0.f, lair_y = 0.f, lair_z = 0.f, lair_o = 0.f;   // a boss a script summons (no creature row): where; see ScenarioDef::lair_x
     float arrive_min_yards = 0.f;       // see ScenarioDef::arrive_min_yards
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;   // see ScenarioDef::goal_adds_needed
+    std::uint32_t spare_entry = 0;      // see ScenarioDef::spare_entry
 };
 
 // In the order of the raid. Each starts at the boss's room with the encounter pre-spawned (the earlier bosses alive too).
 inline constexpr RaidBossRow kMcBosses[] = {
-    { "mc_garr",      "Molten Core: 40 level 60 raiders to Garr",      12057, "Garr",      15, 12099 },   // 12099 Firesworn
+    { "mc_garr",      "Molten Core: 40 level 60 raiders to Garr",      12057, "Garr",      15, 12099, 0, 0,
+      0.f, 0.f, 0.f, 0.f, 0.f, 0, 0, 0, 12099 },   // 12099 Firesworn: kept alive at staging, and none may die before Garr
     { "mc_lucifron",  "Molten Core: 40 level 60 raiders to Lucifron",  12118, "Lucifron",  15, 12119, 0, 1 },   // Flamewaker Protector; Lucifron's Curse must be removed
     { "mc_magmadar",  "Molten Core: 40 level 60 raiders to Magmadar",  11982, "Magmadar",  15, 0, 1 },          // Frenzy must be tranquilized
+    { "mc_shazzrah",  "Molten Core: 40 level 60 raiders to Shazzrah",  12264, "Shazzrah",  15, 0, 0, 1 },       // Shazzrah's Curse must be removed; the Gate drops him on a random raider
     { "mc_gehennas",  "Molten Core: 40 level 60 raiders to Gehennas",  12259, "Gehennas",  15, 11661, 0, 1 },   // Flamewaker; Gehennas' Curse must be removed
     { "mc_sulfuron",  "Molten Core: 40 level 60 raiders to Sulfuron Harbinger", 12098, "Sulfuron Harbinger", 15, 11662 },   // Flamewaker Priests: Dark Mending is interrupted, Inspire purged, Shadow Word: Pain kept off
     { "mc_golemagg",  "Molten Core: 40 level 60 raiders to Golemagg the Incinerator", 11988, "Golemagg the Incinerator", 15, 11672 },   // Core Ragers: the off tank holds them away from Golemagg; Magma Splash stacks on the main tank
@@ -257,6 +262,7 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.arrive_near_entry = r.boss_entry;
     d.keep_entry = r.keep_entry;
     d.goal_adds_a = r.goal_adds_a; d.goal_adds_b = r.goal_adds_b; d.goal_adds_needed = r.goal_adds_needed;
+    d.spare_entry = r.spare_entry;
     d.lair_x = r.lair_x; d.lair_y = r.lair_y; d.lair_z = r.lair_z; d.lair_o = r.lair_o;
     d.arrive_min_yards = r.arrive_min_yards;
     d.order_attack = true;
@@ -298,6 +304,21 @@ inline ScenarioDef MakeOnyScenario()
     static constexpr RaidBossRow kOny = { "onyxia_full", "Onyxia's Lair: 40 level 60 raiders, the whole fight (phase 1 tanking, phase 2 Deep Breath and whelps, phase 3 fear)",
                                           10184, "Onyxia", 20, 0, 0, 0, 0.f, 0.f, 0.f, 0.f, 68.f };   // Onyxia aggroes at 58 y: land outside it, the tanks pull
     return MakeRaidScenario(kOny, kOnyEntrance, RaidSquad(kOnyRaid, sizeof(kOnyRaid) / sizeof(kOnyRaid[0])));
+}
+
+// The same fight judged on the dodge. onyxia_full passes on the kill however many die, which let a live fight lose 38 of 40 (25 to Deep Breath, 11 to
+// Heated Ground, three waves) with the boss alive and say nothing. Here the fourth death fails the run and the sixth ends it: the raid
+// stands off the line of the waypoint she hovers at before the cast, and out of the Heated Ground the pass leaves. Read the run's [raid_breath]
+// lines (the corridor opens on the cast), [raid_death] (spell, position) and [raid_hazard] (Heated Ground exits).
+inline ScenarioDef MakeOnyDodgeScenario()
+{
+    ScenarioDef d = MakeOnyScenario();
+    d.name = "onyxia_dodge";
+    d.summary = "Onyxia's Lair: the whole fight with three deaths allowed, so a Deep Breath or Heated Ground that kills the raid fails the run";
+    d.limits.kill_is_pass = false;
+    d.limits.tolerated_deaths = 3;
+    d.limits.max_deaths = 6;
+    return d;
 }
 
 // ---- Blackwing Lair, Razorgore the Untamed: the orb fight, 40 level 60 raiders ----
@@ -399,6 +420,7 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
         for (RaidBossRow const& r : kMcBosses)
             v.push_back(MakeMcScenario(r));
         v.push_back(MakeOnyScenario());
+        v.push_back(MakeOnyDodgeScenario());
         v.push_back(MakeBwlRazorgoreScenario());
         // The names are built once and kept: ScenarioDef carries char const*.
         static std::deque<std::string> s_parity_names;

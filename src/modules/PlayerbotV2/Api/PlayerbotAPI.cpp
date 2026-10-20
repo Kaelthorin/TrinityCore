@@ -6,10 +6,12 @@
 #include <unordered_map>
 #include "PlayerbotAPI.h"
 #include "ClassicBotSkills.h"
+#include "Travel/ReachMemory.h"
 #include "ClassicSpec.h"
 #include "ClassicTalentBuilds.h"
 #include "ClassicSupplies.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/Raid/ShieldRules.h"
 #include "BotItemScorer.h"
 #include "Player.h"
 #include "Corpse.h"
@@ -42,6 +44,9 @@
 #include "DetourNavMeshQuery.h"
 #include "PlayerbotV2.h"     // path-outcome telemetry, bot-leader battleground queue
 #include "PlayerbotMovement.h"  // unified bot-movement helpers
+#include "FollowDrop.h"          // follow_drop: ledge plan toward an owner who dropped or jumped down
+#include "Fleet/CityLayer.h"      // same-level moves across a drop, NoPath storm
+#include "Bot/World/ZonePicker.h" // IsVanillaCapitalZone
 #include "Fleet/InstanceEntry.h"  // PrepareInstanceEntry: a stale raid lock must not keep a companion out of its owner's instance
 #include "PartialRouteStall.h"
 #include "NoMotionGuard.h"
@@ -115,6 +120,106 @@ namespace Playerbot {
 // callers below read naturally.
 using BotMovement::SehSafeCalculatePath;
 
+// Follow-drop planning (move_to follow_drop): the walking-route verdict, then the ledge plan (Api/FollowDrop.h). World thread.
+namespace
+{
+    // Per bot: until when the follow is a ledge walk or a flight (API::follow_drop_acted), and until when a leap or drop is in the air.
+    std::unordered_map<uint64, uint32> s_followDropActive;
+    std::unordered_map<uint64, uint32> s_followDropAir;
+    std::unordered_map<uint64, uint32> s_followDropFine;
+
+    struct FollowDropPlan
+    {
+        FollowDrop::Mode mode = FollowDrop::Mode::None;
+        FollowDrop::Vec  ledge, land;
+        bool             route_fine = false;   // the walking route to the owner is fine: the ordinary pathed move is the follow
+    };
+
+    FollowDropPlan PlanFollowDropFor(Player* p, float ox, float oy, float oz)
+    {
+        FollowDropPlan out;
+        if (!p->IsAlive() || p->IsFlying() || p->IsInFlight() || p->GetVehicle() || p->GetTransport() || p->IsInWater() || p->IsFalling() ||
+            p->IsMounted())
+            return out;
+        float const bx = p->GetPositionX(), by = p->GetPositionY(), bz = p->GetPositionZ();
+        // Cheap gate: the owner is lower by a real drop, or about level (a gap). A bot already close to him just follows.
+        float const dxy = std::sqrt((ox - bx) * (ox - bx) + (oy - by) * (oy - by));
+        if (dxy > FollowDrop::kMaxOwnerDistXY || dxy < 6.0f || bz - oz < -3.0f)
+            return out;
+        // The owner's floor is the ground under him, not his height now: a snapshot taken while he is still falling (his jump) put him
+        // 8 y above the arena floor, no landing matched, and four bots took "no ledge" and walked the long way.
+        {
+            float fg = 0.f;
+            if (BotMovement::ProbeGround(p, ox, oy, oz, fg) && fg < oz)
+                oz = fg;
+        }
+
+        // The walking route is judged once a second per bot: fine (a normal path not much longer than the straight line) or not.
+        struct Verdict { uint32 at = 0; bool fine = true; };
+        static std::unordered_map<uint64, Verdict> s_verdict;
+        uint32 const now = GameTime::GetGameTimeMS();
+        Verdict& v = s_verdict[p->GetGUID().GetCounter()];
+        if (v.at == 0 || now - v.at >= 1000u)
+        {
+            v.at = now ? now : 1u;
+            PathGenerator path(p);
+            path.SetDisableRoadBonus(true);
+            bool const ok = SehSafeCalculatePath(path, ox, oy, oz);
+            PathType const pt = path.GetPathType();
+            bool fine = false;
+            if (ok && (pt & PATHFIND_NORMAL) && !(pt & PATHFIND_NOPATH) && !(pt & PATHFIND_INCOMPLETE) && !(pt & PATHFIND_SHORTCUT) && !(pt & PATHFIND_SHORT))
+            {
+                float len = 0.f;
+                auto const& pts = path.GetPath();
+                for (size_t i = 1; i < pts.size(); ++i)
+                    len += std::sqrt((pts[i].x - pts[i - 1].x) * (pts[i].x - pts[i - 1].x) + (pts[i].y - pts[i - 1].y) * (pts[i].y - pts[i - 1].y) +
+                                     (pts[i].z - pts[i - 1].z) * (pts[i].z - pts[i - 1].z));
+                float const straight = std::sqrt(dxy * dxy + (bz - oz) * (bz - oz));
+                fine = len <= 2.0f * straight + 15.0f;
+            }
+            v.fine = fine;
+        }
+        if (v.fine)
+        {
+            out.route_fine = true;
+            return out;
+        }
+
+        FollowDrop::Plan const plan = FollowDrop::PlanFollowDrop(
+            FollowDrop::Vec{ bx, by, bz }, FollowDrop::Vec{ ox, oy, oz }, false,
+            [p](float x, float y, float hint, float& z) { return BotMovement::ProbeGround(p, x, y, hint, z); },
+            [p](FollowDrop::Vec const& a, FollowDrop::Vec const& b) { return BotMovement::LineIsClear(p, a.x, a.y, a.z, b.x, b.y, b.z); });
+        if (plan.mode == FollowDrop::Mode::None)
+        {
+            static std::unordered_map<uint64, uint32> s_noLedgeLog;
+            uint32& at = s_noLedgeLog[p->GetGUID().GetCounter()];
+            if (at == 0 || now - at >= 10000u)
+            {
+                at = now ? now : 1u;
+                TC_LOG_INFO("playerbot.v2", "[follow_drop] {} found no ledge toward the owner: bot=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f}) dist={:.1f}",
+                            p->GetName(), bx, by, bz, ox, oy, oz, dxy);
+            }
+            return out;
+        }
+        if (plan.mode == FollowDrop::Mode::Walk)
+        {
+            static std::unordered_map<uint64, uint32> s_walkLog;
+            uint32& at = s_walkLog[p->GetGUID().GetCounter()];
+            if (at == 0 || now - at >= 3000u)
+            {
+                at = now ? now : 1u;
+                TC_LOG_INFO("playerbot.v2", "[follow_drop] {} walks to the ledge ({}): ledge=({:.1f},{:.1f},{:.1f}) {:.1f} y away, owner=({:.1f},{:.1f},{:.1f})",
+                            p->GetName(), plan.leap ? "leap" : "drop", plan.ledge.x, plan.ledge.y, plan.ledge.z, plan.walk, ox, oy, oz);
+            }
+        }
+        out.mode = plan.mode;
+        out.ledge = plan.ledge;
+        out.land = plan.land;
+        return out;
+    }
+}
+
+
 // Per-world-tick pathfinding budget (declared PlayerbotAPI.h). World-thread only,
 // no synchronization. g_active gates the window: outside a Begin/End pair (e.g. a
 // non-DrainIntents caller of move_to) HasBudget fails OPEN so nothing is throttled
@@ -178,6 +283,23 @@ namespace {
         auto& ring = g_path_fail[p->GetGUID().GetCounter()];
         ring.entries[ring.head] = {dest_key, now_ms, ttl_ms};
         ring.head = (ring.head + 1) % kPathFailCap;
+    }
+
+    // The shared memory of walks that cannot be done (Travel/ReachMemory.h): only for an ungrouped bot walking the open world, where a
+    // failed path is geometry; a group, a battleground or an instance has its own holding logic and its own off-mesh bridges.
+    bool ReachMemoryApplies(Player const* p)
+    {
+        return p && !p->GetGroup() && !p->InBattleground() && p->GetMap() && !p->GetMap()->IsDungeon();
+    }
+    void NoteReachFail(Player const* p, float x, float y, uint32 now_ms)
+    {
+        if (ReachMemoryApplies(p))
+            ::Playerbot::V2::Travel::ReachMemory::Instance().NoteFail(p->GetMapId(), p->GetPositionX(), p->GetPositionY(), x, y, now_ms);
+    }
+    void NoteReachOk(Player const* p, float x, float y)
+    {
+        if (ReachMemoryApplies(p))
+            ::Playerbot::V2::Travel::ReachMemory::Instance().NoteOk(p->GetMapId(), p->GetPositionX(), p->GetPositionY(), x, y);
     }
 
     inline uint64 PathDestKey(uint32 map_id, float x, float y)
@@ -497,6 +619,11 @@ static bool FaceUnitForCast(Player* p, Unit* tu)
     return p->HasInArc(static_cast<float>(M_PI), tu);
 }
 
+uint32 API::highest_known_rank(uint32 spell_id) const
+{
+    return p_ && spell_id ? HighestKnownRank(p_, spell_id) : spell_id;
+}
+
 uint32 API::cast_ready_in_ms(uint32 spell_id, bool exact_rank) const
 {
     if (!p_ || !spell_id || !p_->GetMap())
@@ -678,9 +805,14 @@ Result API::cast_spell(uint32 spell_id, ObjectGuid target, bool exact_rank)
     // Mob versions (Reflective Shield variants) trigger the same
     // SPELL_AURA_REFLECT_SPELLS aura type, so the type check below
     // catches everything without needing an ID allowlist.
+    // Only a spell the aura can send back is refused (Spell::m_canReflect): an ability such as Sunder Armor, Revenge or Taunt is never
+    // reflected, and refusing it cost the tanks their threat on Majordomo's Magic Reflection adds (ShieldRules.h).
     if (tu != p_ && p_->IsValidAttackTarget(tu, info) &&
         !info->IsPositive() &&
-        tu->HasAuraType(SPELL_AURA_REFLECT_SPELLS))
+        tu->HasAuraType(SPELL_AURA_REFLECT_SPELLS) &&
+        Playerbot::Raid::Shields::ReflectRefuses(info->DmgClass == SPELL_DAMAGE_CLASS_MAGIC, info->HasAttribute(SPELL_ATTR0_IS_ABILITY),
+            info->HasAttribute(SPELL_ATTR7_ALLOW_SPELL_REFLECTION), info->HasAttribute(SPELL_ATTR1_NO_REFLECTION),
+            info->HasAttribute(SPELL_ATTR0_NO_IMMUNITIES), info->IsPassive()))
     {
         TC_LOG_DEBUG("playerbot.api",
             "[API::cast_spell] spell {} target {} rejected: target has Spell Reflect aura",
@@ -975,7 +1107,23 @@ float API::ground_z(float x, float y, float z_hint, char const* where)
     return BotMovement::GroundZ(p_, x, y, z_hint, where);
 }
 
-Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
+bool API::follow_drop_route_fine() const
+{
+    if (!p_)
+        return false;
+    auto const it = s_followDropFine.find(p_->GetGUID().GetCounter());
+    return it != s_followDropFine.end() && GameTime::GetGameTimeMS() < it->second;
+}
+
+bool API::follow_drop_acted() const
+{
+    if (!p_)
+        return false;
+    auto const it = s_followDropActive.find(p_->GetGUID().GetCounter());
+    return it != s_followDropActive.end() && GameTime::GetGameTimeMS() < it->second;
+}
+
+Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop, bool follow_drop)
 {
     if (!p_) return Result::Other;
 
@@ -1078,6 +1226,60 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             FLIGHT_MOTION_TYPE)
         return Result::Locked;
 
+    // Follow the owner off a ledge. (x,y,z) is the owner. When his floor is only reached by a drop or a jump (he
+    // dropped 11 y into the arena and his bots, with only the walking route, went round through the Blackhand packs and died) and the walking
+    // route to him is missing or a long detour, walk to the nearest ledge and leave it; otherwise fall through to the ordinary pathed move.
+    if (follow_drop && !direct && !drop)
+    {
+        uint64 const fdg = p_->GetGUID().GetCounter();
+        uint32 const fdnow = GameTime::GetGameTimeMS();
+        // In the air after leaving a ledge: nothing may re-aim the bot until it lands.
+        if (auto it = s_followDropAir.find(fdg); it != s_followDropAir.end() && fdnow < it->second)
+        {
+            s_followDropActive[fdg] = fdnow + 500u;
+            return Result::Ok;
+        }
+        FollowDropPlan const fd = PlanFollowDropFor(p_, x, y, z);
+        s_followDropActive[fdg] = 0;
+        s_followDropFine[fdg] = fd.route_fine ? fdnow + 1000u : 0u;
+        if (fd.mode == FollowDrop::Mode::Walk)
+        {
+            s_followDropActive[fdg] = fdnow + 2500u;
+            p_->GetMotionMaster()->MovePoint(0, fd.ledge.x, fd.ledge.y, fd.ledge.z, /*generatePath*/ false);
+            return Result::Ok;
+        }
+        if (fd.mode == FollowDrop::Mode::Drop)
+        {
+            TC_LOG_INFO("playerbot.v2", "[follow_drop] {} drops to the owner's floor: ledge=({:.1f},{:.1f},{:.1f}) landing=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f})",
+                        p_->GetName(), fd.ledge.x, fd.ledge.y, fd.ledge.z, fd.land.x, fd.land.y, fd.land.z, x, y, z);
+            Result const dr = move_to(fd.land.x, fd.land.y, fd.land.z, true, false, /*drop*/ true);
+            if (dr == Result::Ok)
+            {
+                s_followDropActive[fdg] = fdnow + 2500u;
+                s_followDropAir[fdg] = fdnow + 3500u;
+            }
+            return dr;
+        }
+        if (fd.mode == FollowDrop::Mode::Leap)
+        {
+            static std::unordered_map<uint64, uint32> s_leapUntil;
+            uint64 const lg = p_->GetGUID().GetCounter();
+            uint32 const lnow = GameTime::GetGameTimeMS();
+            if (auto it = s_leapUntil.find(lg); it != s_leapUntil.end() && lnow < it->second)
+                return Result::Locked;                               // already in the air
+            s_leapUntil[lg] = lnow + 2500u;
+            s_followDropActive[lg] = lnow + 2500u;
+            s_followDropAir[lg] = lnow + 2500u;
+            Position dest = p_->GetPosition();
+            dest.Relocate(fd.land.x, fd.land.y, fd.land.z);
+            p_->SetFacingTo(std::atan2(fd.land.y - p_->GetPositionY(), fd.land.x - p_->GetPositionX()));
+            p_->GetMotionMaster()->MoveJump(/*id*/ 0, dest, /*speedXY*/ 7.0f);
+            TC_LOG_INFO("playerbot.v2", "[follow_drop] {} leaps the gap to the owner's side: ledge=({:.1f},{:.1f},{:.1f}) landing=({:.1f},{:.1f},{:.1f}) owner=({:.1f},{:.1f},{:.1f})",
+                        p_->GetName(), fd.ledge.x, fd.ledge.y, fd.ledge.z, fd.land.x, fd.land.y, fd.land.z, x, y, z);
+            return Result::Ok;
+        }
+    }
+
     // Already there. A rule holding a spot (raid/dungeon positioning, hold,
     // stand-at-NPC) keeps re-emitting the same destination after arrival; the
     // emitter dedup lets one through every ~1.5s and MovePoint then launches
@@ -1167,7 +1369,39 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
     // Ground height first, searched from above the hint: a slot built from the
     // owner's / mob's / anchor's Z next to a rock or ledge higher than the hint
     // would resolve to the terrain under the collision mesh (bot embedded).
+    float const z_ask = z;
     z = BotMovement::GroundZ(p_, x, y, z, "move_to");
+    // A world bot in a capital asking for its own level (the chunked walks and the wanderers pass the bot's z) whose destination has its
+    // ground 20+ y lower: the capital stands on layers (Stormwind: the city floor at z 94 to 100, others at z 75 and z 59 under it,
+    // joined only by steep faces). The ground probe would put the goal on the lower layer and the path would take the bot down the
+    // face, where the town's hubs cannot be reached. The ask is
+    // refused like a blocked path, so the rule picks another bearing.
+    if (!p_->GetGroup() && !p_->IsInFlight() && !p_->GetTransport() && p_->GetMap() && !p_->GetMap()->IsDungeon()
+        && !p_->GetMap()->IsBattlegroundOrArena() && ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId())
+        && ::Playerbot::V2::Fleet::AcrossDrop(p_->GetPositionZ(), z_ask, z)
+        && !([&]
+        {
+            // The ground probe sees terrain and static models, the mover walks the navmesh. Where the mesh has a walkable surface at the
+            // asked level the ask is a request for that surface (a balcony or a roof with open air under it, not a drop): keep the level.
+            Position np;
+            if (!::Playerbot::BotMovement::NearestNavPoint(p_, x, y, z_ask, 3.0f, 6.0f, np))
+                return false;
+            z = np.GetPositionZ();
+            return true;
+        }()))
+    {
+        static std::unordered_map<uint64, uint32> s_guardAt;
+        uint32 const gnow = GameTime::GetGameTimeMS();
+        uint32& gat = s_guardAt[p_->GetGUID().GetCounter()];
+        if (gat == 0 || gnow - gat >= 10000u)
+        {
+            gat = gnow ? gnow : 1u;
+            TC_LOG_INFO("playerbot.v2", "[level_guard] {} refused a same-level move across a drop: z={:.1f} dst=({:.1f},{:.1f}) ground={:.1f}",
+                        p_->GetName(), z_ask, x, y, z);
+        }
+        NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS());
+        return Result::Locked;
+    }
     BotMovement::SnapToGround(p_, x, y, z);
 
     // Battleground start room (STATUS_WAIT_JOIN): the gates are shut and the bots only mill about their start area, so a
@@ -1317,8 +1551,11 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             !Playerbot::BotMovement::NoMotionAllows(g_no_motion[p_->GetGUID().GetCounter()], move_goal_key,
                                                     p_->GetPositionX(), p_->GetPositionY(), GameTime::GetGameTimeMS()))
         {
-            TC_LOG_INFO("playerbot.v2", "[move_abandon] {} asked for ({:.0f},{:.0f},{:.0f}) for over 30 s without moving; goal dropped",
-                p_->GetName(), x, y, z);
+            TC_LOG_INFO("playerbot.v2", "[move_abandon] {} asked for ({:.0f},{:.0f},{:.0f}) for over 30 s without moving; goal dropped "
+                "(at {:.0f},{:.0f},{:.0f} motion={} casting={} sitting={} rooted={} stunned={} combat={} path_fail_recent={})",
+                p_->GetName(), x, y, z, p_->GetPositionX(), p_->GetPositionY(), p_->GetPositionZ(), int(p_->GetMotionMaster()->GetCurrentMovementGeneratorType()),
+                p_->HasUnitState(UNIT_STATE_CASTING), p_->GetStandState() != UNIT_STAND_STATE_STAND, p_->HasUnitState(UNIT_STATE_ROOT),
+                p_->HasUnitState(UNIT_STATE_STUNNED), p_->IsInCombat(), PathFailedRecently(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS()));
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
             return Result::Locked;
         }
@@ -1345,6 +1582,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                     "[move_lock] bot={} reason=path_fail_backoff dst=({:.1f},{:.1f},{:.1f})",
                     p_->GetGUID().GetCounter(), x, y, z);
             }
+            return Result::Locked;
+        }
+        // The same walk failed for other bots from this part of the map: no Detour call for it (Travel/ReachMemory.h).
+        if (ReachMemoryApplies(p_) &&
+            ::Playerbot::V2::Travel::ReachMemory::Instance().KnownUnreachable(p_->GetMapId(), p_->GetPositionX(), p_->GetPositionY(), x, y, move_now_ms))
+        {
+            NotePathFail(p_, dest_key, move_now_ms, kPathFailTtlLongMs);   // this bot's own rules stop asking for it too
             return Result::Locked;
         }
     }
@@ -1650,9 +1894,46 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 p_->GetPositionY(), x, y, z);
         Playerbot::V2::Module::instance().OnPathOutcome(1 /*NoPath*/);
         log_path_fail("NoPath");
+        BotMovement::NoteNoPath(p_);
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         return Result::Locked;
+    }
+    // Retry at the polygon found, for a destination that lies just off the mesh. A chunk step is aimed at a point on the bot's own level a
+    // stride ahead, so it often lands a few yards off a road, on a slope above or below it, or on another level of the same x,y. Detour then
+    // builds the corridor to the nearest polygon and flags the end as far from its polygon (6298 of these in; 1271
+    // ended on the asked x,y at another height, 1250 within 3 to 30 y of it at much the same height). Where that polygon is within a
+    // stride's slack of the ask, walk to it: ask again at its x,y,z. A corridor that crosses a cliff face is still refused, and so are
+    // destinations whose nearest polygon is farther off (void, a wall, the far side of a gorge).
+    if (path_ok && (pt & PATHFIND_FARFROMPOLY_END) && !(pt & PATHFIND_NOPATH) && p_->GetMap() && !p_->GetMap()->IsDungeon()
+        && !p_->GetMap()->IsBattlegroundOrArena())
+    {
+        G3D::Vector3 const ae = path.GetActualEndPosition();
+        float const off_end = std::hypot(ae.x - x, ae.y - y);
+        float const dz_end = ae.z - z;
+        // In a capital the layers lie 20 to 40 y apart (Stormwind): a polygon that far from the asked height is another level, not a
+        // slope (Hellice, on a roof at z 148.6, was snapped to a polygon 20 to 35 y below it).
+        float const max_dz = ::Playerbot::V2::World::IsVanillaCapitalZone(p_->GetZoneId()) ? ::Playerbot::V2::Fleet::kCityDropYards : 60.0f;
+        if (off_end <= 12.0f && std::fabs(dz_end) < max_dz && !::Playerbot::V2::Fleet::PathHasCliff(path.GetPath()))
+        {
+            if (SehSafeCalculatePath(path, ae.x, ae.y, ae.z) && !(path.GetPathType() & (PATHFIND_NOPATH | PATHFIND_FARFROMPOLY_END)))
+            {
+                float const ox = x, oy = y, oz = z;
+                pt = path.GetPathType();
+                x = ae.x; y = ae.y; z = ae.z;
+                static std::unordered_map<uint64, uint32> s_snapAt;
+                uint32 const snow = GameTime::GetGameTimeMS();
+                uint32& sat = s_snapAt[p_->GetGUID().GetCounter()];
+                if (sat == 0 || snow - sat >= 10000u)
+                {
+                    sat = snow ? snow : 1u;
+                    TC_LOG_INFO("playerbot.v2", "[far_end_snap] {} asked ({:.1f},{:.1f},{:.1f}), mesh at ({:.1f},{:.1f},{:.1f}), {:.1f} y off",
+                                p_->GetName(), ox, oy, oz, x, y, z, off_end);
+                }
+            }
+        }
     }
     if (pt & PATHFIND_FARFROMPOLY_END)
     {
@@ -1666,11 +1947,13 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
             return Result::Ok;
         Playerbot::V2::Module::instance().OnPathOutcome(3 /*FarFromPolyEnd*/);
         log_path_fail("FarFromPolyEnd");
+        BotMovement::NoteNoPath(p_);
         // Off-mesh destination (above terrain / inside geometry / a phantom POI
         // Z). Permanently unreachable until the data changes â suppress long so
         // the bot stops oscillating toward it and goal-selection moves on.
         NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y), GameTime::GetGameTimeMS(),
                      kPathFailTtlLongMs);
+        NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
         return Result::Locked;
     }
     if (pt & PATHFIND_FARFROMPOLY_START)
@@ -1806,10 +2089,15 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                                         x, y, z);
         float const forward_progress = cur_to_dst - end_to_dst;
 
-        log_path_fail("Incomplete");
-        TC_LOG_INFO("playerbot.v2",
-            "[path_fail] {} Incomplete forward_progress={:.1f}y (cur_to_dst={:.1f} end_to_dst={:.1f})",
-            p_->GetName(), forward_progress, cur_to_dst, end_to_dst);
+        // A partial path that gets 5 y or more closer is the normal way a long or winding route is walked (74 polygons a call): 79000 such
+        // lines an hour in a long soak run, most of them not real stalls. Only the stalls are written at INFO.
+        if (forward_progress < kMinForwardProgressYards)
+        {
+            log_path_fail("Incomplete");
+            TC_LOG_INFO("playerbot.v2",
+                "[path_fail] {} Incomplete forward_progress={:.1f}y (cur_to_dst={:.1f} end_to_dst={:.1f})",
+                p_->GetName(), forward_progress, cur_to_dst, end_to_dst);
+        }
 
         if (forward_progress < kMinForwardProgressYards)
         {
@@ -1985,6 +2273,8 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                 (cur_to_dst > 100.0f) ? kPathFailTtlMs : kPathFailTtlLongMs;
             NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
                          GameTime::GetGameTimeMS(), nonadv_ttl);
+            if (nonadv_ttl == kPathFailTtlLongMs)
+                NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
             return Result::Locked;
         }
         // Advancing partial â drive to the REACHABLE endpoint Detour found, NOT
@@ -2025,8 +2315,11 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
                     "[path_loop] {} {} partial routes toward ({:.0f},{:.0f},{:.0f}) without closing in "
                     "(cur_to_dst={:.0f}); goal suppressed", p_->GetName(),
                     Playerbot::BotMovement::kStallMaxPartials, x, y, z, cur_to_dst);
+                // The long window: a loop is geometry (Francoise, a goal in the Keep, 632 y and not one yard closer for an hour), and three
+                // seconds had the rule ask for the same goal again every ten.
                 NotePathFail(p_, PathDestKey(p_->GetMapId(), x, y),
-                             GameTime::GetGameTimeMS(), kPathFailTtlMs);
+                             GameTime::GetGameTimeMS(), kPathFailTtlLongMs);
+                NoteReachFail(p_, x, y, GameTime::GetGameTimeMS());
                 return Result::Locked;
             }
             if (pts.size() >= 2)
@@ -2110,7 +2403,10 @@ Result API::move_to(float x, float y, float z, bool run, bool direct, bool drop)
         }
     }
     else
+    {
         Playerbot::V2::Module::instance().OnPathOutcome(0 /*Ok*/);
+        NoteReachOk(p_, x, y);
+    }
 
     // Liquid safety gate. Classifies the destination POINT (not the tile/chunk
     // â a chunk is routinely half-water / half-dry) through the shared
@@ -3759,8 +4055,13 @@ Result API::enter_area_trigger(uint32 area_trigger_id)
     WorldSession* sess = p_->GetSession();
     if (!sess) return Result::Other;
     AreaTriggerTeleport const* dest = sObjectMgr->GetAreaTrigger(area_trigger_id);
-    if (dest && dest->Loc.GetMapId() != p_->GetMapId())
-        V2::Fleet::PrepareInstanceEntry(p_, dest->Loc.GetMapId());
+    last_instance_full_map_ = 0;
+    if (dest && dest->Loc.GetMapId() != p_->GetMapId() &&
+        V2::Fleet::PrepareInstanceEntry(p_, dest->Loc.GetMapId()) == TRANSFER_ABORT_MAX_PLAYERS)
+    {
+        last_instance_full_map_ = dest->Loc.GetMapId();
+        return Result::ServerRefused;
+    }
     WorldPackets::AreaTrigger::AreaTrigger packet{ WorldPacket(CMSG_AREA_TRIGGER) };
     packet.AreaTriggerID = int32(area_trigger_id);
     packet.Entered = true;
@@ -3833,8 +4134,15 @@ Result API::teleport_to(uint32 map_id, float x, float y, float z, float orientat
     if (p_->IsNonMeleeSpellCast(false, false, true)) return Result::Locked;
     // Into an instance (the owner's raid): the door checks run first so a refusal is logged with its reason, and a lock on
     // another instance is dropped for a companion that follows its owner in.
-    if (map_id != p_->GetMapId() && V2::Fleet::PrepareInstanceEntry(p_, map_id) != TRANSFER_ABORT_NONE)
-        return Result::ServerRefused;
+    last_instance_full_map_ = 0;
+    if (map_id != p_->GetMapId())
+    {
+        TransferAbortReason const denied = V2::Fleet::PrepareInstanceEntry(p_, map_id);
+        if (denied == TRANSFER_ABORT_MAX_PLAYERS)
+            last_instance_full_map_ = map_id;
+        if (denied != TRANSFER_ABORT_NONE)
+            return Result::ServerRefused;
+    }
     // SafeTeleport probes the destination map (if loaded) for ground
     // height and snaps to ground+2 when the requested Z is >50y above
     // the queried floor (typical "stale POI / hand-curated coord" bug
@@ -9078,6 +9386,15 @@ uint32 API::learn_riding_free()
     if (!p_ || p_->GetLevel() < 40) return 0;
     uint32 changed = 0;
     uint16 const target = p_->GetLevel() >= 60 ? 150 : 75;
+    // A bot a retail trainer pass raised past its level's tier (Journeyman at 40) goes back to the vanilla tier, tier spells included.
+    if (p_->GetSkillValue(SKILL_RIDING) > target)
+    {
+        p_->SetSkill(SKILL_RIDING, target / 75, target, target);
+        for (uint32 tier_spell : { 33391u, 34090u, 34091u, 90265u })   // Journeyman, Expert, Artisan, Master Riding
+            if (p_->HasSpell(tier_spell) && !(tier_spell == 33391u && target >= 150))
+                p_->RemoveSpell(tier_spell, false, false);
+        ++changed;
+    }
     if (p_->GetSkillValue(SKILL_RIDING) < target)
     {
         if (!p_->HasSkill(SKILL_RIDING))
@@ -9097,17 +9414,111 @@ uint32 API::learn_riding_free()
     uint32 normal = 0, swift = 0;
     if (!RaceMountSpells(p_->GetRace(), normal, swift))
         return changed;
-    uint32 const want = p_->GetLevel() >= 60 ? swift : normal;
-    if (known == want || (known && p_->GetLevel() < 60) || p_->HasSpell(swift))
+    bool const epic = p_->GetLevel() >= 60;
+    uint32 want = epic ? swift : normal;
+    if (known == want || (known && !epic) || p_->HasSpell(swift))
         return changed;
     if (!isMount(sSpellMgr->GetSpellInfo(want, DIFFICULTY_NONE)))
     {
-        TC_LOG_WARN("playerbot.api", "[API::riding] {}: mount spell {} for race {} is not a mount in this data",
-            p_->GetName(), want, uint32(p_->GetRace()));
-        return changed;
+        // The race's table spell is not a mount in this data: take the next mount of the race that is (the other vanilla ground mounts of the race,
+        // then its swift mount at 60).
+        std::vector<uint32> alternatives;
+        switch (p_->GetRace())
+        {
+            case RACE_HUMAN:        alternatives = epic ? std::vector<uint32>{ 23227, 23228 } : std::vector<uint32>{ 472, 6648, 458 }; break;
+            case RACE_ORC:          alternatives = epic ? std::vector<uint32>{ 23251, 23252 } : std::vector<uint32>{ 6653, 6654, 580 }; break;
+            case RACE_DWARF:        alternatives = epic ? std::vector<uint32>{ 23239, 23240 } : std::vector<uint32>{ 6777, 6898, 6899 }; break;
+            case RACE_NIGHTELF:     alternatives = epic ? std::vector<uint32>{ 23219, 23338 } : std::vector<uint32>{ 8394, 10789, 10792, 66847, 10793 }; break;
+            case RACE_UNDEAD_PLAYER: alternatives = epic ? std::vector<uint32>{ 23246, 23247 } : std::vector<uint32>{ 17463, 17464, 17462 }; break;
+            case RACE_TAUREN:       alternatives = epic ? std::vector<uint32>{ 23248, 23249 } : std::vector<uint32>{ 18989, 18991, 18990 }; break;
+            case RACE_GNOME:        alternatives = epic ? std::vector<uint32>{ 23222, 23223 } : std::vector<uint32>{ 17453, 10969, 10873 }; break;
+            case RACE_TROLL:        alternatives = epic ? std::vector<uint32>{ 23242, 23243 } : std::vector<uint32>{ 10796, 10799, 8395 }; break;
+            default: break;
+        }
+        uint32 found = 0;
+        for (uint32 candidate : alternatives)
+            if (candidate != want && isMount(sSpellMgr->GetSpellInfo(candidate, DIFFICULTY_NONE)))
+            {
+                found = candidate;
+                break;
+            }
+        TC_LOG_WARN("playerbot.api", "[API::riding] {}: mount spell {} for race {} is not a mount in this data; {}", p_->GetName(), want,
+            uint32(p_->GetRace()), found ? fmt::format("using {}", found) : std::string("no other mount of the race is either"));
+        if (!found)
+            return changed;
+        want = found;
     }
     p_->LearnSpell(want, false);
+    if (!p_->HasSpell(want))
+    {
+        TC_LOG_WARN("playerbot.api", "[API::riding] {}: learning mount spell {} did not take (race {} class {} level {})", p_->GetName(), want,
+            uint32(p_->GetRace()), uint32(p_->GetClass()), uint32(p_->GetLevel()));
+        return changed;
+    }
     return changed + 1;
+}
+
+uint32 API::reset_to_starter_gear(bool& complete)
+{
+    complete = false;
+    if (!p_) return 0;
+    PlayerInfo const* info = sObjectMgr->GetPlayerInfo(p_->GetRace(), p_->GetClass());
+    if (!info) return 0;
+    // Nothing is taken off before its replacement is known to fit: each starter item goes straight into its equipment slot (the swap check
+    // allows an occupied slot), the old piece in that slot is destroyed just before, and a piece that cannot be worn leaves the old one on.
+    // The slots the outfit does not use are cleared only when every piece went on, so a bot is never left bare.
+    uint32 removed = 0;
+    bool all = true;
+    std::array<bool, EQUIPMENT_SLOT_END> kept{};
+    for (PlayerCreateInfoItem const& initial : info->item)
+    {
+        ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(initial.item_id);
+        if (!tpl || tpl->GetClass() == ITEM_CLASS_CONTAINER || tpl->GetClass() == ITEM_CLASS_QUIVER)
+            continue;   // the bot's bags and quivers stay as they are
+        if (tpl->GetInventoryType() == INVTYPE_NON_EQUIP || tpl->GetClass() == ITEM_CLASS_PROJECTILE)
+        {
+            ItemPosCountVec dest;
+            if (!p_->HasItemCount(initial.item_id, 1) && p_->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, initial.item_id, initial.item_amount) == EQUIP_ERR_OK)
+                p_->StoreNewItem(dest, initial.item_id, true);
+            continue;   // food, drink and the like are a bonus, not part of the outfit
+        }
+        uint16 pos = 0;
+        InventoryResult const res = p_->CanEquipNewItem(NULL_SLOT, pos, initial.item_id, true);
+        uint8 const slot = uint8(pos & 0xFF);
+        if (res != EQUIP_ERR_OK || uint8(pos >> 8) != INVENTORY_SLOT_BAG_0 || slot >= EQUIPMENT_SLOT_END)
+        {
+            all = false;
+            TC_LOG_INFO("playerbot.v2", "[starter_outfit] {} cannot wear starter item {}: result {}", p_->GetName(), initial.item_id, uint32(res));
+            continue;
+        }
+        if (Item* cur = p_->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        {
+            if (cur->GetEntry() == initial.item_id)
+            {
+                kept[slot] = true;
+                continue;
+            }
+            p_->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+            ++removed;
+        }
+        if (p_->EquipNewItem(pos, initial.item_id, info->itemContext, true))
+            kept[slot] = true;
+        else
+        {
+            all = false;
+            TC_LOG_INFO("playerbot.v2", "[starter_outfit] {} could not equip starter item {} in slot {}", p_->GetName(), initial.item_id, uint32(slot));
+        }
+        p_->AutoUnequipOffhandIfNeed();
+    }
+    if (all)
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+            if (!kept[slot] && p_->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+            {
+                p_->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
+                ++removed;
+            }
+    complete = all;
+    return removed;
 }
 
 Result API::trainer_buy_spell(ObjectGuid trainer_npc, uint32 spell_id)

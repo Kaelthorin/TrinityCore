@@ -38,7 +38,10 @@ Rules worth knowing:
 
 - Only words on the group allow-list are picked up from party/raid chat. Ordinary chatter is ignored. Words that
   are not on the list (for example `inv`, `repair_all`) work by whisper only.
-- A `;` in front of a party line (`;tank: attack`) sends it through the full whisper parser, including address
+- A line that starts with the name of a bot in your group, or with `all`, is that bot's order (every bot's for `all`)
+  with no prefix needed: `Lentha use altar`, `Baxter, follow`, `all use altar`. Anything that is not an order after the
+  name is ignored, so talking about a bot in chat does nothing.
+- A `;` in front of a party line (`;tank: attack`) still sends it through the full whisper parser, including address
   prefixes.
 - **Address prefixes** (whisper or `;`): `all:`, `squad:`, `here:`, `tank:`, `healer:`, `dps:`, `<class>:` (for
   example `mage:`), `<spec>:`, `<BotName>:` before the order. ike3-style selectors also work with
@@ -50,7 +53,7 @@ Rules worth knowing:
 
 ## 2. Getting bots: add, call, save, dismiss
 
-`.bot` commands need a GM account (level 3 on the realm). The addon buttons run the same commands.
+The `.bot` commands for your own bots work for every account, no GM needed; each one only touches bots owned by your account. `.bot world`, `.bot bgstress`, `.bot bgsoak` and `.bot itemstats` need GM (level 3). The addon buttons run the same commands.
 
 | Command | What it does |
 |---|---|
@@ -74,7 +77,7 @@ Install the `ForeverBots` folder into `Interface\AddOns` (the folder name must s
 out of date AddOns"). The addon only sends ordinary chat, so it needs nothing else on the client.
 
 - `/fb` opens or closes the window (it stays open across relog). The window has:
-  - **Raid ready** (also `/fb raidready`): calls your saved bots (`.bot summon saved`), waits until the group stops growing,
+  - **Raid ready** (also `/fb raidready`): calls your saved bots (`.bot summon saved`) when you are alone (already in a group it uses that group and never changes it), waits until the group stops growing,
     makes it a raid when it holds more than five, sets formation circle and spacing close, sends `resume` and the
     crowd-control switch, sets the Main Tank flag when you target a group member, and starts a ready check about twenty
     seconds later while the bots buff themselves. Not in combat; a new click or combat cancels it.
@@ -211,7 +214,7 @@ A group chat order reaches every bot of yours; to address only some, whisper the
 
 ## 8. Instance rules
 
-- **Open world**: you have at most `Playerbot.Behavior.OpenWorldGroupCap` (default 5) of your own companions out at
+- **Open world**: you have at most `Playerbot.Behavior.OpenWorldGroupCap` (default 40: no limit beyond the raid; 5 = a normal party) of your own companions out at
   once (`.bot add`, `.bot call`, saved roster, buttons). For more, find world bots and invite them: invited world
   bots are not counted. Companions above the cap (called inside an instance) are dismissed 10 s after you walk out;
   the ones grouped with you stay. Needs `InstanceGroupCap = 1`.
@@ -298,8 +301,8 @@ Defaults are those of `conf/playerbot.conf.dist`. Behaviour switches are read wh
 
 | Key | Default |
 |---|---|
-| `Playerbot.Behavior.InstanceGroupCap` | 0 (off; 1 limits the companions to what the map holds) |
-| `Playerbot.Behavior.OpenWorldGroupCap` | 5 |
+| `Playerbot.Behavior.InstanceGroupCap` | 1 (on; 0 lifts the limit of companions to what the map holds) |
+| `Playerbot.Behavior.OpenWorldGroupCap` | 40 (no limit beyond the raid; 5 = a normal party) |
 | `Playerbot.Pve.Coordinator.Enable` | 1 |
 | `Playerbot.Raid.Enable` | 1 |
 | `Playerbot.Raid.BossWarnings` | 1 |
@@ -348,7 +351,8 @@ The module logs nothing unless `Logger.playerbot.v2=3` is set. Grep the server l
 
 ## 14. Known gaps
 
-- `trade`, and the ike3 strategy toggles `co`/`nc`/`ss` (+/- strategy lists), are **not implemented**. The
+- The ike3 strategy toggles `co`/`nc`/`ss` (+/- strategy lists) are **not implemented**. Trade is: the bot takes
+  gifts from its owner or a group mate (see Gifts by trade) and a free world bot buys what you put in. The
   nearest equivalents are `max dps` / `save mana` / `normal`, `aoe`, `hold`/`defensive`/`aggressive`.
 - `sell grey` and `repair` act at once only when the vendor is within interaction reach; from up to 60 yards the
   bot walks over and you repeat the order. There is no standing "go and sell, then come back" order; the bots'
@@ -386,7 +390,7 @@ Level-60 (level-cap) companions are geared for raiding by role (`Playerbot.Behav
 | `Playerbot.Gear.RaidIlvlCap` | 0 | Explicit item level ceiling; above 0 it overrides `MaxTier`. |
 | `Playerbot.Behavior.AcceptOwnerTrade` | 1 | A companion accepts a trade its owner opens, once the owner has accepted (gear and money gifts). The bot never offers anything, so nothing can be taken back through the window. Anyone else's trade is declined. Mail is not read by bots, so gifts go by trade. |
 
-Gifts by trade: open a trade with the bot, put the items in, accept. The bot accepts, then its auto-equip rules wear what is an upgrade for its role (within a few minutes in the open world, at once in a dungeon, or say `equip upgrades`); the rest stays in its bags.
+Gifts by trade: open a trade with the bot, put the items in, accept. Gold, gear that is an upgrade and reagents of a recipe the bot knows are gifts; anything else the bot buys at a fair price. The bot accepts, then its auto-equip rules wear what is an upgrade for its role (within a few minutes in the open world, at once in a dungeon, or say `equip upgrades`); the rest stays in its bags.
 
 | Say or whisper | What the bot does |
 |---|---|

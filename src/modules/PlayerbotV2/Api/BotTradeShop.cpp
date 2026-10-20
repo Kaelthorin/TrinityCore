@@ -9,6 +9,8 @@
 #include "Log.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "TradeData.h"
 #include "TradePackets.h"
 #include "WorldSession.h"
@@ -211,6 +213,23 @@ std::vector<std::string> Describe(std::vector<Offer> const& list)
 
 namespace {
 
+// Is `entry` a reagent of a recipe (a spell that makes an item) the bot knows? Reagents the owner hands over for a craft order are a gift.
+bool IsRecipeReagent(Player const* bot, uint32 entry)
+{
+    for (auto const& [spell_id, ps] : bot->GetSpellMap())
+    {
+        if (ps.state == PLAYERSPELL_REMOVED || !ps.active || ps.disabled)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+        if (!si || !si->HasEffect(SPELL_EFFECT_CREATE_ITEM))
+            continue;
+        for (std::size_t i = 0; i < si->Reagent.size(); ++i)
+            if (si->Reagent[i] > 0 && si->ReagentCount[i] > 0 && uint32(si->Reagent[i]) == entry)
+                return true;
+    }
+    return false;
+}
+
 BotTrade::Line LineOf(Player const* viewer_for_price, Item* it, uint64 unit)
 {
     (void)viewer_for_price;
@@ -235,7 +254,11 @@ std::vector<BotTrade::Line> Lines(Player* bot, TradeData* side, bool mark_upgrad
     for (size_t i = 0; i < items.size(); ++i)
     {
         BotTrade::Line l = LineOf(bot, items[i], unit[i]);
-        if (mark_upgrades) l.upgrade = IsUpgrade(bot, items[i]->GetTemplate());
+        if (mark_upgrades)
+        {
+            l.upgrade = IsUpgrade(bot, items[i]->GetTemplate());
+            l.reagent = IsRecipeReagent(bot, items[i]->GetEntry());
+        }
         out.push_back(l);
     }
     if (items_out) *items_out = std::move(items);

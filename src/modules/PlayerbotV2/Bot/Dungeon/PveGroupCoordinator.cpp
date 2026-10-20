@@ -11,9 +11,11 @@
 #include "../ClassTables.h"
 #include "../Raid/RaidBrain.h"
 #include "../Raid/RaidEncounters.h"
+#include "../Raid/KickRules.h"
 #include "../Raid/RaidHealSlots.h"
 #include "../Raid/RaidHealGroups.h"
 #include "../ClassicUpkeep.h"
+#include "../ThreatLimits.h"
 #include "MarkCc.h"
 #include "PrePullCc.h"
 #include "Combat/Apl/ApInterrupt.h"
@@ -241,7 +243,9 @@ void PveGroupCoordinator::Update(uint32 now_ms)
             uint32& started = fight_start_[bkey];
             if (!started)
                 started = now_ms;
-            uint32 const wait_ms = Services::Config().raid_dps_wait_timeout_ms();
+            // A raid waits as long as configured (up to eight seconds: the tank takes a while to run in); a party keeps its six.
+            uint32 const wait_ms = gs->is_raid ? Services::Config().raid_dps_wait_timeout_ms()
+                                               : std::min<uint32>(Services::Config().raid_dps_wait_timeout_ms(), kPartyDpsWaitTimeoutMs);
             if (wait_ms && now_ms - started >= wait_ms && !(mark_release_until_.count(bkey) && now_ms < mark_release_until_[bkey]))
             {
                 mark_release_until_[bkey] = now_ms + 10000u;
@@ -534,7 +538,7 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         // and the hunter tranq order. See PlanInterrupts / PlanTranq.
         // The Felhunter duty goes first: it is pet choice, not live state.
         PlanFelhunters(bkey, mem, snaps, plan);
-        PlanInterrupts(mem, snaps, plan);
+        PlanInterrupts(bkey, mem, snaps, plan);
         PlanTranq(bkey, mem, snaps, plan);
 
         // Soak duty: assigned UNCONDITIONALLY every plan (the fields cost
@@ -794,6 +798,8 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         it = buckets.count(it->first) ? std::next(it) : cc_held_.erase(it);
     for (auto it = mark_release_until_.begin(); it != mark_release_until_.end();)
         it = buckets.count(it->first) ? std::next(it) : mark_release_until_.erase(it);
+    for (auto it = kick_plan_logged_.begin(); it != kick_plan_logged_.end();)
+        it = buckets.count(it->first) ? std::next(it) : kick_plan_logged_.erase(it);
     for (auto it = fight_start_.begin(); it != fight_start_.end();)
         it = buckets.count(it->first) ? std::next(it) : fight_start_.erase(it);
     for (auto it = defend_since_.begin(); it != defend_since_.end();)
@@ -833,7 +839,7 @@ void PveGroupCoordinator::Update(uint32 now_ms)
         last_dump_ = "no coordinated dungeon/raid groups";
 }
 
-void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
+void PveGroupCoordinator::PlanInterrupts(uint64 bkey, std::vector<Member> const& mem,
                                          std::vector<std::shared_ptr<BotSnapshot const>> const& snaps,
                                          std::unordered_map<uint64, PveOrder>& plan)
 {
@@ -871,8 +877,10 @@ void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
     struct Kicker
     {
         uint64        low = 0;
+        std::string   name;
         Kick::Ability a;
         bool          ready = false;
+        bool          busy = false;   // mid own cast: cannot kick before it finishes (a pet's Spell Lock does not wait for its master)
         float         x = 0.f, y = 0.f, z = 0.f;
         ObjectGuid    victim;
         PveOrder*     o = nullptr;
@@ -891,8 +899,10 @@ void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
         o->interrupt_rank = irank < 0xFF ? irank++ : 0xFF;
         Kicker k;
         k.low = e.guid_low;
+        k.name = e.src ? e.src->name : std::to_string(e.guid_low);
         k.a = a;
         k.ready = Kick::Ready(v, a);
+        k.busy = !a.pet && it->second->cast.is_casting && it->second->cast.current_cast_remaining.count() > 0;
         k.x = it->second->position.x; k.y = it->second->position.y; k.z = it->second->position.z;
         k.victim = v.victim();
         k.o = o;
@@ -902,11 +912,11 @@ void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
         return;
 
     // Per casting mob: the union of every bot's view of interruptible casts
-    // on mobs engaged with the group, most urgent first. Each gets the
-    // nearest interrupters with their kick ready and the mob in range:
+    // on mobs engaged with the group, most urgent first (Raid::Kicks::CastBefore). Each gets the
+    // nearest free interrupters with their kick ready and the mob in range:
     // rank 0 kicks on sight, rank 1 backs it up (BotSnapshotView::
     // interrupt_window_open). One mob per interrupter.
-    struct CastingMob { ObjectGuid guid; float x, y, z; int64 rem; NearbyUnit const* u; bool first; };
+    struct CastingMob { ObjectGuid guid; float x, y, z; int64 rem; NearbyUnit const* u; size_t order; };
     std::vector<CastingMob> casts;
     for (auto const& sp : snaps)
         for (NearbyUnit const& u : sp->combat.nearby_enemies)
@@ -914,24 +924,23 @@ void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
             if (!Kick::Casting(u) || !Kick::EngagedWithGroup(u) || u.cast_remaining.count() < 350) continue;
             if (std::any_of(casts.begin(), casts.end(), [&](CastingMob const& c) { return c.guid == u.guid; }))
                 continue;
-            // A raid rule can name casts that go first (Dark Mending, Healing Circle, Greater Polymorph).
+            // A raid rule names casts that go first, in order (Dark Mending before Shadow Bolt; Healing Circle, Greater Polymorph).
             casts.push_back({ u.guid, u.x, u.y, u.z, int64(u.cast_remaining.count()), &u,
-                Raid::InterruptFirst(sp->position.map_id, u.casting_spell_id) });
+                Raid::InterruptOrder(sp->position.map_id, u.casting_spell_id) });
         }
     if (casts.empty())
         return;
     std::sort(casts.begin(), casts.end(), [](CastingMob const& a, CastingMob const& b)
     {
-        if (a.first != b.first) return a.first;
-        if (a.rem != b.rem) return a.rem < b.rem;
-        return a.guid.GetCounter() < b.guid.GetCounter();
+        return Raid::Kicks::CastBefore({ a.order, a.rem, a.guid.GetCounter() }, { b.order, b.rem, b.guid.GetCounter() });
     });
+    auto& logged = kick_plan_logged_[bkey];
     std::array<ObjectGuid, PveOrder::kMaxInterruptClaims> claimed{};
     size_t n_claimed = 0;
     for (CastingMob const& c : casts)
     {
         if (n_claimed >= claimed.size()) break;
-        std::vector<std::pair<float, Kicker*>> cand;
+        std::vector<std::pair<Raid::Kicks::Kicker, Kicker*>> cand;
         for (Kicker& k : kickers)
         {
             if (!k.ready || !k.o->interrupt_target.IsEmpty()) continue;
@@ -939,14 +948,29 @@ void PveGroupCoordinator::PlanInterrupts(std::vector<Member> const& mem,
             const float dx = c.x - k.x, dy = c.y - k.y, dz = c.z - k.z;
             const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
             const bool reach = (k.a.melee && k.victim == c.guid) || d <= k.a.range + (k.a.melee ? 2.5f : 0.f);
-            if (reach) cand.emplace_back(d, &k);
+            if (reach) cand.emplace_back(Raid::Kicks::Kicker{ k.busy, d, k.low }, &k);
+        }
+        std::sort(cand.begin(), cand.end(), [](auto const& a, auto const& b) { return Raid::Kicks::KickerBefore(a.first, b.first); });
+        // A listed cast (the Healers' Dark Mending) is logged once per cast with who takes it, or that nobody can: the kick
+        // rotation is the Majordomo fight's key, and only a log line says whether it happened.
+        if (c.order != Raid::kNotInterruptFirst)
+        {
+            const uint64 state = (uint64(c.u->casting_spell_id) << 32) | (cand.empty() ? 0xFFFFFFFFull : (cand[0].second->low & 0xFFFFFFFFull));
+            if (uint64& was = logged[c.guid.GetCounter()]; was != state)
+            {
+                was = state;
+                CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(c.u->entry);
+                if (cand.empty())
+                    TC_LOG_INFO("playerbot.v2", "[raid_interrupt] plan: {} ({}) casts {} ({}ms left), no kicker ready in reach ({} kickers)",
+                                ct ? ct->Name : std::string("?"), c.guid.GetCounter(), c.u->casting_spell_id, c.rem, kickers.size());
+                else
+                    TC_LOG_INFO("playerbot.v2", "[raid_interrupt] plan: {} ({}) casts {} ({}ms left) -> {} kicks (spell {}, {:.0f}y{}){}",
+                                ct ? ct->Name : std::string("?"), c.guid.GetCounter(), c.u->casting_spell_id, c.rem,
+                                cand[0].second->name, cand[0].second->a.spell, cand[0].first.dist, cand[0].first.busy ? ", mid-cast" : "",
+                                cand.size() > 1 ? ", " + cand[1].second->name + " backs up" : std::string(", no backup"));
+            }
         }
         if (cand.empty()) continue;
-        std::sort(cand.begin(), cand.end(), [](auto const& a, auto const& b)
-        {
-            if (a.first != b.first) return a.first < b.first;
-            return a.second->low < b.second->low;
-        });
         for (size_t r = 0; r < cand.size() && r < 2; ++r)
         {
             cand[r].second->o->interrupt_target = c.guid;
@@ -1231,6 +1255,13 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
     for (auto const& e : mem)
         if (e.alive && e.src->max_hp > 0 && Pct(e.src->hp, e.src->max_hp) < 40) { emergency = true; break; }
 
+    // An enemy the raid's data never holds (Raid::NoControl): neither an icon nor the automatic pick sends a caster to it.
+    auto never_controlled = [&](uint32 entry) -> bool
+    {
+        if (!is_raid) return false;
+        Raid::RaidRules const* rr = Raid::RulesForMap(map_id);
+        return rr && std::any_of(rr->noControl.begin(), rr->noControl.end(), [&](Raid::NoControl const& n) { return n.enemy == entry; });
+    };
     std::vector<ObjectGuid> cc_taken;
     bool moon_is_tank_mark = false;
     for (auto const& [tank_low, marker] : Services::Owners().TankMarks(group_low))
@@ -1292,7 +1323,7 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
             for (uint8 sym : order)
             {
                 NearbyUnit const* u = mob_of(sym);
-                if (!u || Classic::IsBossUnit(*u)) continue;
+                if (!u || Classic::IsBossUnit(*u) || never_controlled(u->entry)) continue;
                 if (u->guid == icon[7] || u->guid == icon[6]) continue;   // marked skull / cross: killed, never crowd-controlled
                 if (u->max_hp > 0 && u->hp * 2 < u->max_hp) continue;     // under half health: being killed, not held again
                 if (std::find(cc_taken.begin(), cc_taken.end(), u->guid) != cc_taken.end()) continue;
@@ -1346,7 +1377,7 @@ void PveGroupCoordinator::PlanMarkOrders(uint64 group_low, uint32 map_id, bool i
                     // the owner put on a caster sends that caster to hold it (the loop above).
                     for (ObjectGuid const& marked : icon)
                         if (u.guid == marked) return false;
-                    if (kill_focus_of(u.guid)) return false;
+                    if (kill_focus_of(u.guid) || never_controlled(u.entry)) return false;
                     // Nor the mob the owner (any human) or a tank is hitting: a sheep on it breaks at once and is recast, over and over.
                     for (auto const& m : mem)
                         if ((!m.is_bot || m.tank) && m.src && m.src->victim == u.guid) return false;
@@ -1752,6 +1783,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 if (!t || !t->is_bot) continue;
                 Mob const* mm = find_mob(mk_grp->GetTargetIcon(mkr));
                 if (!mm) continue;
+                if (Raid::OffTankMob(map_id, mm->u->entry)) continue;   // the second tank's, whatever tank the icon was given to
                 if (auto sit = sticky.find(tl); sit != sticky.end() && sit->second == mm->u->guid) continue;
                 for (auto it = sticky.begin(); it != sticky.end();)
                     it = it->second == mm->u->guid ? sticky.erase(it) : std::next(it);
@@ -1880,6 +1912,32 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                     return true;
             return false;
         };
+        // A boss the rules give the second tank (Majordomo): the off tank holds him whatever it held, and whoever held him takes a
+        // free mob below. The owner's plan: off tank on him, the other tanks one Elite each, the main tank the skull.
+        if (off_tank)
+            if (auto ot = by_low.find(off_tank); ot != by_low.end() && ot->second->is_bot && ot->second->alive && !user_sym.count(off_tank))
+                for (auto const& m : mobs)
+                {
+                    if (!Raid::OffTankMob(map_id, m.u->entry)) continue;
+                    if (auto sit = sticky.find(off_tank); sit != sticky.end() && sit->second == m.u->guid) break;
+                    if (auto sit = sticky.find(off_tank); sit != sticky.end())
+                    {
+                        taken.erase(std::remove(taken.begin(), taken.end(), sit->second), taken.end());
+                        sticky.erase(sit);
+                    }
+                    for (auto it = sticky.begin(); it != sticky.end();)
+                    {
+                        if (it->second == m.u->guid)
+                        {
+                            taken.erase(std::remove(taken.begin(), taken.end(), it->second), taken.end());
+                            it = sticky.erase(it);
+                        }
+                        else
+                            ++it;
+                    }
+                    assign(ot->second, m, "off_tank_mob");
+                    break;
+                }
         // The main tank chooses first: the mob it already hits (its pull), else the mob engaged with it, else the
         // nearest. Without this a spare tank that ran at the pull target before the main tank had a victim of its own
         // would be handed the main tank's mob, and the main tank the next one.
@@ -1909,7 +1967,8 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             if (!t->is_bot || sticky.count(t->guid_low)) continue;
             for (auto const& m : mobs)
                 if (auto const hold = cc_held.find(m.u->guid.GetCounter());
-                    hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry))
+                    hold != cc_held.end() && hold->second.tank_low == t->guid_low && !is_taken(m.u->guid) && !Raid::NoTank(map_id, m.u->entry) &&
+                    !cc_owned(m))   // a sheep the owner gave a mage broke: the mage recasts it, the tank does not hit it
                 {
                     assign(t, m, "cc_released");
                     break;
@@ -1918,7 +1977,7 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
         for (Member const* t : tanks)
         {
             if (!t->is_bot || sticky.count(t->guid_low)) continue;
-            if (Mob const* cur = find_mob(t->src->victim); cur && !is_taken(cur->u->guid) && !Raid::NoTank(map_id, cur->u->entry) &&
+            if (Mob const* cur = find_mob(t->src->victim); cur && !is_taken(cur->u->guid) && !Raid::NoTank(map_id, cur->u->entry) && !cc_owned(*cur) &&
                 !(Raid::TankLast(map_id, cur->u->entry) && other_free_mob(cur->u->guid)))
                 assign(t, *cur, "already_on_it");
         }
@@ -1950,6 +2009,10 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
                 for (Member const* t : tanks)
                 {
                     if (!t->is_bot || !t->alive || user_sym.count(t->guid_low)) continue;
+                    // The tank on a boss the rules give the second tank keeps him.
+                    if (auto sit = sticky.find(t->guid_low); sit != sticky.end())
+                        if (Mob const* held = find_mob(sit->second); held && Raid::OffTankMob(map_id, held->u->entry))
+                            continue;
                     // A tank already on the other kill mark keeps it.
                     if (auto sit = sticky.find(t->guid_low); sit != sticky.end() &&
                         (sit->second == mk_grp->GetTargetIcon(7) || sit->second == mk_grp->GetTargetIcon(6)))
@@ -1984,10 +2047,12 @@ void PveGroupCoordinator::PlanRaidTanks(uint64 bkey, uint64 group_low, uint32 ma
             bool const tank_last = Raid::TankLast(map_id, m.u->entry);
             bool const adds_up = tank_last &&
                 std::any_of(mobs.begin(), mobs.end(), [&](Mob const& o) { return o.u->guid != m.u->guid && !Raid::NoTank(map_id, o.u->entry) && !Raid::TankLast(map_id, o.u->entry); });
-            // No tank leaves an add for him while an add is loose: the adds are the threat. Once every add is held he goes to the tank with
-            // the fewest mobs on it, not to whichever tank is left (n44 mc_majordomo: nobody held him, he stood on a healer all fight and
-            // killed two by melee).
-            if (adds_up && std::any_of(mobs.begin(), mobs.end(), [&](Mob const& o) { return o.loose && !Raid::NoTank(map_id, o.u->entry) && !Raid::TankLast(map_id, o.u->entry); }))
+            // No free tank leaves an add for him while an add is loose: the adds are the threat. Once every bot tank holds something he goes to
+            // the tank with the fewest mobs on it, loose add or not (Majordomo: nobody held him, he stood on a healer all fight and
+            // killed two by melee; with eight adds one is always loose, so he stood on one add after the other for 30 s).
+            bool const free_tank = std::any_of(tanks.begin(), tanks.end(), [&](Member const* t)
+                { return t->is_bot && t->alive && !user_sym.count(t->guid_low) && !sticky.count(t->guid_low); });
+            if (adds_up && free_tank && std::any_of(mobs.begin(), mobs.end(), [&](Mob const& o) { return o.loose && !Raid::NoTank(map_id, o.u->entry) && !Raid::TankLast(map_id, o.u->entry); }))
                 continue;
             Member const* best = nullptr;
             size_t best_load = SIZE_MAX;

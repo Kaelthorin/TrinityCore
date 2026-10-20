@@ -19,7 +19,6 @@
 // raid10-revamp, playerbot/strategy/hunter/*Strategy.cpp, MANGOSBOT_ZERO).
 
 #include "Bot/SpellFamily.h"
-#include "AplPetThrottle.h"
 #include "../ApRegistry.h"
 #include "../ApRotation.h"
 #include "Apl_Baseline_Common.h"
@@ -139,17 +138,6 @@ bool ShouldMendPet(ApPredicateContext const& ctx)
         && ctx.bot.find_pet_aura(MEND_PET) == nullptr;
 }
 void DoMendPet(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(MEND_PET); }
-
-bool ShouldPetAttack(ApPredicateContext const& ctx)
-{
-    return ctx.bot.has_pet() && HasLiveTarget(ctx) && ctx.bot.pet_victim() != ctx.bot.victim()
-        && Playerbot::AplPet::PetAttackDue(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-}
-void DoPetAttack(ApPredicateContext const& ctx, BotIntentEmitter& e)
-{
-    Playerbot::AplPet::NotePetAttack(ctx.bot.guid().GetCounter(), ctx.bot.published_at_ms());
-    e.pet_attack(ctx.bot.victim());
-}
 
 // ======================= Defensive =======================
 
@@ -380,7 +368,6 @@ ApRule const kRules[] = {
     { ShouldAspectHawk,    DoAspectHawk,    "classic_hunter:aspect_of_the_hawk" },
     { ShouldTrueshotAura,  DoTrueshotAura,  "classic_hunter:trueshot_aura" },
     { ShouldPrePullTrap,   DoPrePullTrap,   "classic_hunter:freezing_trap" },
-    { ShouldPetAttack,     DoPetAttack,     "classic_hunter:pet_attack" },
     { ShouldBestialWrath,  DoBestialWrath,  "classic_hunter:bestial_wrath" },
     { ShouldRapidFire,     DoRapidFire,     "classic_hunter:rapid_fire" },
     { ShouldHuntersMark,   DoHuntersMark,   "classic_hunter:hunters_mark" },

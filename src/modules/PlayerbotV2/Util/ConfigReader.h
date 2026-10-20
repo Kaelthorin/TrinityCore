@@ -352,6 +352,10 @@ public:
     bool behavior_ranged_slow()         const { return bhv_ranged_slow_; }
     bool behavior_ike3_commands()       const { return bhv_ike3_commands_; }
     bool behavior_owner_commands()      const { return bhv_owner_commands_; }
+    // Yards from the group's leader: a Passive bot defends a mob only within this of the leader (or of the member it is on), and an
+    // Aggressive one attacks a hostile only within the aggressive radius of the leader. 0 switches the Passive leash off.
+    float behavior_passive_leash_yd()   const { return bhv_passive_leash_yd_; }
+    float behavior_aggressive_radius_yd() const { return bhv_aggressive_radius_yd_; }
     bool behavior_fidget()              const { return bhv_fidget_; }
     // Players who log in without the ForeverBots add-on get one line with its download link.
     bool   addon_hint_enabled()         const { return addon_hint_enabled_; }
@@ -497,7 +501,7 @@ private:
     bool   raid_provide_consumables_     = false;
     bool   consumables_pve_              = true;
     bool   consumables_pvp_              = false;
-    uint32 raid_dps_wait_timeout_ms_     = 10000;
+    uint32 raid_dps_wait_timeout_ms_     = 8000;
     bool   threat_hold_open_world_       = false;
     float  threat_max_ratio_             = 0.9f;
     float  threat_opening_lead_boss_     = 900.0f;
@@ -530,8 +534,8 @@ private:
     bool   bhv_bot_whisperable_      = true;
     bool   chatter_conversation_     = true;
     bool   bhv_world_bot_say_reply_  = true;
-    bool   bhv_instance_group_cap_   = false;
-    uint32 bhv_open_world_group_cap_ = 5;
+    bool   bhv_instance_group_cap_   = true;
+    uint32 bhv_open_world_group_cap_ = 40;
     bool   bhv_bg_human_priority_    = true;
     bool   bhv_tank_markers_         = true;
     bool   bhv_mark_cc_              = true;
@@ -546,6 +550,8 @@ private:
     bool   bhv_ranged_slow_          = true;
     bool   bhv_ike3_commands_        = true;
     bool   bhv_owner_commands_       = true;
+    float  bhv_passive_leash_yd_     = 25.0f;
+    float  bhv_aggressive_radius_yd_ = 10.0f;
     bool   bhv_fidget_               = true;
     bool        addon_hint_enabled_   = false;
     uint32      addon_hint_delay_sec_ = 30;

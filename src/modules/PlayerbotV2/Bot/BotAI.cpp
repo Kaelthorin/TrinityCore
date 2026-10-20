@@ -7,6 +7,7 @@
 #include "BotActivityTier.h"
 #include "Group/GroupSnapshot.h"
 #include "States/StateBase.h"
+#include "States/MaintainHelpers.h"
 #include "fmt/format.h"
 #include "GameTime.h"
 #include "SharedDefines.h"  // SPELL_FAILED_NO_AMMO
@@ -629,6 +630,10 @@ void BotAI::tick(BotSnapshotView snapshot,
     // state reads dungeon_active() this tick.
     update_dungeon_autopilot_hold(snapshot, group);
 
+    // Follow-drop: the owner dropped or jumped to a floor 4+ y below; the walk to the ledge and the flight are not interruptible.
+    if (States::HonorFollowDrop(snapshot, *this, group, emit))
+        return;
+
     // 2. Primary state dispatch.
     dispatch_primary(snapshot, group, emit);
 
@@ -691,7 +696,7 @@ void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g
             bool const present = human_seen_ms_ != 0 && now_ms - human_seen_ms_ < 30000u;
             int64_t const steady = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            lead_hold = present && steady >= human_release_until_.load(std::memory_order_relaxed);
+            lead_hold = present && steady >= orders_.release_until.load(std::memory_order_relaxed);
         }
         else
             human_seen_ms_ = 0;

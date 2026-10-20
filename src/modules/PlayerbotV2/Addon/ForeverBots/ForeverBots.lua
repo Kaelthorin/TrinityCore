@@ -57,20 +57,19 @@ local function ServerCommand(text)
     SendChatMessage(text, "SAY")
 end
 
--- Stance toggle of the panel: ForeverBotsDB.stance is "passive" or "aggressive" (nil = never picked: passive, the default while
--- you lead a dungeon group). The pick is kept between sessions and re-sent to the group whenever it changes (new bots).
+-- Stance toggle of the panel: ForeverBotsDB.stance is "passive" or "aggressive" (nil = never picked: passive, the server's start
+-- stance for every bot in your group). The pick is kept between sessions and re-sent to the group whenever it changes (new bots).
 local function StanceIsAggressive()
     return ForeverBotsDB ~= nil and ForeverBotsDB.stance == "aggressive"
 end
--- What the button shows: the pick; before one, "Passive" inside an instance (that is what is sent to the group there, see the group
--- change timer below) and "Auto" elsewhere (nothing sent, the bots use their own default).
+-- What the button shows: the pick; before one, "Passive" (nothing is sent until you pick, the server starts every grouped bot Passive).
 local function StanceLabel()
     local stance = ForeverBotsDB and ForeverBotsDB.stance
     if stance == "aggressive" then return "Aggressive" end
     if stance == "passive" then return "Passive" end
-    local okI, inInstance = pcall(IsInInstance)
-    if okI and inInstance then return "Passive" end
-    return "Auto"
+    -- Nothing picked yet: every bot in your group starts Passive on the server (it fights only what the group pulled or what
+    -- attacks the group, and follows you back), so the button says so.
+    return "Passive"
 end
 local stanceBtn
 local function RefreshStance()
@@ -142,7 +141,7 @@ local tankMarker = 1
 -- Follow distance (yards, 1..20): the stepper in the panel and /fb distance <n>. The value is saved in ForeverBotsDB.distance
 -- and sent to the group as the order "distance <n>". Clicks are coalesced: the final value goes out after 0.4 s without a
 -- click and never more than one order per 0.3 s. It is re-sent silently on login and when the group changes size.
-local DIST_MIN, DIST_MAX, DIST_START = 1, 20, 5
+local DIST_MIN, DIST_MAX, DIST_START = 2, 20, 5
 local InGroupQuiet
 local distText                 -- value font string, filled by BuildFrame
 local distDirtyAt              -- GetTime() of the last unsent change
@@ -621,6 +620,13 @@ local function RaidReady()
         end
     end
 
+    -- Already in a group: it is the group that gets the orders and the ready check. The saved-roster call replaces the group with the
+    -- saved raid (a 10-man in a dungeon was dismissed), so it only runs when you are alone.
+    if MemberCount() > 1 then
+        Print("raid ready: using your current group (" .. MemberCount() .. ").")
+        Finish(MemberCount())
+        return
+    end
     Print("raid ready: calling your saved bots...")
     ServerCommand(".bot summon saved")
     local lastN, stable, waited = -1, 0, 0
@@ -740,7 +746,7 @@ local function BuildFrame()
     y = y - 34
     local raidReadyBtn = MakeButton(frame, "Raid ready", 298, RaidReady, 24)
     raidReadyBtn:SetPoint("TOPLEFT", 16, y)
-    Tip(raidReadyBtn, "Raid ready", "Calls your saved bots, makes the group a raid if it needs one, sets the formation and spacing, and starts a ready check once the bots have buffed. Target your main tank first to set the Main Tank flag too. Not in combat.")
+    Tip(raidReadyBtn, "Raid ready", "Alone: calls your saved bots. Already in a group: uses that group and never changes it. Makes the group a raid if it needs one, sets the formation and spacing, and starts a ready check once the bots have buffed. Target your main tank first to set the Main Tank flag too. Not in combat.")
     y = y - 32
 
     ---------------------------------------------------------------------------------------------- order rows
@@ -797,7 +803,7 @@ local function BuildFrame()
     local stanceRow = Row({
         { "Come", 72, "Come", "Bots teleport to you.", function() GroupOrder("come") end, "come" },
         { StanceLabel(), 98, "Stance",
-          "Auto: nothing sent yet outside an instance, the bots use their own default. Inside an instance the panel sends Passive until you pick. Passive: bots start nothing and only defend. Aggressive: they attack anything hostile within about 10 yards of you. Shows what you last sent; it is sent again to every bot that joins.",
+          "Passive (the start setting): bots start nothing, fight only what you pull or what attacks the group, and come back to follow you. Aggressive: they also attack anything hostile within about 10 yards of you. Shows what you last sent; it is sent again to every bot that joins.",
           function(self)
               ForeverBotsDB.stance = StanceIsAggressive() and "passive" or "aggressive"
               GroupOrder(ForeverBotsDB.stance)
@@ -843,8 +849,8 @@ local function BuildFrame()
     distText:SetJustifyH("CENTER")
     local distPlus = MakeButton(frame, "+", 26, function() StepDistance(1) end)
     distPlus:SetPoint("TOPLEFT", 212, y)
-    Tip(distMinus, "Follow distance", "How far the bots follow you out of combat, 1 to 20 yards. Also sets the formation spacing.")
-    Tip(distPlus, "Follow distance", "How far the bots follow you out of combat, 1 to 20 yards. Also sets the formation spacing.")
+    Tip(distMinus, "Follow distance", "How far the bots follow you out of combat, 2 to 20 yards. Also sets the formation spacing.")
+    Tip(distPlus, "Follow distance", "How far the bots follow you out of combat, 2 to 20 yards. Also sets the formation spacing.")
     ShowDistance()
     y = y - 30
 
@@ -1048,7 +1054,18 @@ end
 for _, ev in ipairs({ "GROUP_ROSTER_UPDATE", "PARTY_MEMBERS_CHANGED", "RAID_ROSTER_UPDATE" }) do
     pcall(distFrame.RegisterEvent, distFrame, ev)
 end
-distFrame:SetScript("OnEvent", OnGroupChanged)
+-- A zone change or loading screen can re-create the bots on the server (their stance starts over), with the group size unchanged:
+-- the stance is sent again then, so a pick of Aggressive or Passive is never lost.
+for _, ev in ipairs({ "PLAYER_ENTERING_WORLD", "ZONE_CHANGED_NEW_AREA" }) do
+    pcall(distFrame.RegisterEvent, distFrame, ev)
+end
+distFrame:SetScript("OnEvent", function(self, event)
+    if event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED_NEW_AREA" then
+        if GroupSize() > 0 then self.stanceAt = Now() + 2.5 end
+        return
+    end
+    OnGroupChanged()
+end)
 
 local function Toggle()
     if not frame then BuildFrame() end

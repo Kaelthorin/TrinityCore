@@ -71,6 +71,7 @@ struct Line
     std::uint32_t count = 0;
     std::uint64_t value = 0;     // fair price of the whole stack
     bool upgrade = false;        // equippable and better than what the bot wears there (only meaningful on the player's side)
+    bool reagent = false;        // a reagent of a recipe the bot knows: a gift from the owner or a group mate, so "trade them to me and ask again" works
 };
 
 struct View
@@ -119,17 +120,17 @@ struct Action
     Say say = Say::None;
 };
 
-inline bool AllUpgrades(std::vector<Line> const& v)
+inline bool AllGifts(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (!l.upgrade) return false;
+        if (!l.upgrade && !l.reagent) return false;
     return true;
 }
 
-inline bool AnyUpgrade(std::vector<Line> const& v)
+inline bool AnyGift(std::vector<Line> const& v)
 {
     for (Line const& l : v)
-        if (l.upgrade) return true;
+        if (l.upgrade || l.reagent) return true;
     return false;
 }
 
@@ -170,15 +171,15 @@ inline Action Decide(View const& v)
         return {};
     }
 
-    // Gear that is an upgrade, from the owner or a group mate: a gift.
-    if (v.gift_partner && AllUpgrades(v.his) && v.mine.empty() && v.my_money == 0)
+    // Gear that is an upgrade, or reagents for a recipe the bot knows, from the owner or a group mate: a gift.
+    if (v.gift_partner && AllGifts(v.his) && v.mine.empty() && v.my_money == 0)
     {
         if (!v.his_accepted || v.my_accepted) return {};
         return v.bot_has_room ? Action{ Act::Accept } : Action{ Act::Cancel, 0, Say::NoRoom };
     }
 
     // A mix of gifts and goods, or goods and gold from the player at once, is not a deal the bot can price.
-    if (v.his_money > 0 || (v.gift_partner && AnyUpgrade(v.his)))
+    if (v.his_money > 0 || (v.gift_partner && AnyGift(v.his)))
         return { Act::Wait, 0, Say::OneWay };
 
     // Buy from the player at the fair price.

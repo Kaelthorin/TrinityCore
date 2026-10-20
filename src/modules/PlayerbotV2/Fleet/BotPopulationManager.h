@@ -18,6 +18,7 @@
 #include "AsyncCallbackProcessor.h"   // QueryCallbackProcessor member (async DB reads)
 #include "DatabaseEnvFwd.h"           // QueryCallbackProcessor / QueryResult aliases
 #include "WorldLoadFacts.h"
+#include "ObjectGuid.h"
 #include "BotQueueFiller.h"
 #include <unordered_map>
 #include <mutex>
@@ -150,6 +151,9 @@ public:
     // talents and gear, bring it to the owner and put it in the owner's group (made a raid when full). Dropped if the
     // bot does not log in within a minute or the owner is offline by then. World thread only.
     void QueueCompanionSetup(BotId bot, uint64 owner_guid_low, uint8 role);
+    // Brings an owned companion to its owner at once, in the open world or inside an instance (see the definition). Empty = on its way,
+    // else why not (also logged as [summon]). World thread.
+    std::string BringToOwner(Player* owner, Player* bot, char const* why);
 
     // Resolves and pins a companion's role: `requested` (the owner's word) if not Role::Unknown, else the role stored with
     // the companion (OwnerRegistry::DeclaredRole, migration 0024), else the one its talents say. Sets the BotAI role
@@ -185,6 +189,16 @@ public:
     };
     std::unordered_map<uint64, PendingCompanion> pending_companions_;
     void DrainCompanionSetups();
+    // A bot BringToOwner sent is only "brought" once it stands beside the owner in the owner's instance: checked 2 s after the teleport,
+    // and for up to 6 s, with both positions and instance ids in the log when it does not.
+    struct PendingBring
+    {
+        uint64 bot_low = 0;
+        ObjectGuid owner;
+        uint32 queued_ms = 0;
+    };
+    std::vector<PendingBring> pending_brings_;
+    void DrainBringChecks();
     void FinishCompanionSetup(Player* bot, Player* owner, uint8 role);
     std::unordered_map<uint64, uint32> pending_deletes_;   // bot -> queued at (getMSTime)
     void DrainCompanionDeletes();
@@ -254,6 +268,9 @@ public:
     // TotalTarget-based pool cap (the world spawner enforces its own). Returns the guid counter, 0 on failure.
     // `race` (0 = the weighted roll) fixes the race: Classic 1.60 Skyborne residents of Zephras Isle.
     uint64 SpawnAmbientBot(uint8 level, bool alliance, uint8 race = 0);
+    // Deletes one temporary world bot (the variable pool, PoolBudget.h) with the server's own character delete. The caller has
+    // checked the row; this checks the live state again (online, owned, in a group) and refuses a bot that is in use.
+    bool RetireVariableBot(uint64 guid_low, uint32 account, std::string const& name);
     // Classic 1.60: places a Skyborne bot that outgrew Zephras Isle in a vanilla leveling town (BotSetupPipeline::Graduate).
     bool GraduateSkyborne(Player* bot);
     // True when ambient (non-companion) bots are wanted at all: the shaper (TotalTarget > 0) or the world spawner
@@ -451,7 +468,8 @@ private:
     // JIT spawn one new bot at the given (level, faction). Returns the new
     // character's GUID counter, or 0 on failure. Decrements the faction's
     // per-cycle spawn budget on success.
-    uint64 SpawnNew(uint8 level, bool alliance, uint8 race_hint = 0);
+    // `own_budget`: the world spawner enforces its own pool budgets, so the shaper's 1.10x-of-TotalTarget spawn cap does not apply.
+    uint64 SpawnNew(uint8 level, bool alliance, uint8 race_hint = 0, bool own_budget = false);
 
     // Login an offline bot character. Decrements the faction's per-cycle
     // login budget on success. Returns true on success.

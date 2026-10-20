@@ -878,8 +878,8 @@ static bool BeyondHealerLeash(BotSnapshot const& s, float x, float y)
 // A loose mob nobody was assigned goes to ONE tank: the nearest idle one that this bot's friend sweep shows (a tank busy with a
 // mob of its own is no contender; ties go to the lower guid). Without it every tank without an assignment ran at the same mob and
 // they taunted it back and forth (MC 2026-10-11: [tank_loose] from several tanks on one Firewalker, "claimed by another tank 0").
-// The nearer tank counts only while it can take the mob: within the pickup reach (n24 mc_garr: an idle tank 40 y off was the "nearest", every
-// other idle tank deferred to it and a Firesworn stood 7 y from Mctankwb on a healer for a minute).
+// The nearer tank counts only while it can take the mob: within the pickup reach (an idle tank 40 y off was the "nearest", every
+// other idle tank deferred to it and a Firesworn stood 7 y from a tank on a healer for a minute).
 static constexpr float kOtherTankReachYd = 30.0f;
 
 static bool OtherTankTakesLoose(BotSnapshot const& s, NearbyUnit const& mob)
@@ -927,15 +927,22 @@ static uint32 LooseOnMemberMs(ObjectGuid mob, uint32 now)
     return now - it->second.since;
 }
 
-static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float range, bool target_reach = false, bool leash = false)
+// controller_leash: the same distance rule without the healer leash (a taunt moves nobody, but it must not drag in a mob the group is
+// nowhere near). Both measure from the controller's live position: the owner, else the player leading the group.
+static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float range, bool target_reach = false, bool leash = false,
+                                                bool controller_leash = false)
 {
     NearbyUnit const* best = nullptr;
     float best_d2 = std::numeric_limits<float>::max();
     int best_prio = -1;
     NearbyUnit const* owner_unit = nullptr;
-    if (leash && s.owner_in_group && s.instance_ctx.is_in_instance && !s.owner_guid.IsEmpty())
+    ObjectGuid const controller = s.owner_in_group ? s.owner_guid : s.controller_guid;
+    float ctl_leash = Services::Config().behavior_passive_leash_yd();
+    if (ctl_leash <= 0.f && s.instance_ctx.is_in_instance)
+        ctl_leash = kPickupLeashYd;
+    if ((leash || controller_leash) && ctl_leash > 0.f && !controller.IsEmpty())
         for (auto const& f : s.combat.nearby_friends)
-            if (f.guid == s.owner_guid) { owner_unit = &f; break; }
+            if (f.guid == controller) { owner_unit = &f; break; }
     for (auto const& e : s.combat.nearby_enemies)
     {
         if (e.hp <= 0 || e.is_player || e.untargetable || e.is_pacified) continue;
@@ -954,13 +961,13 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
         if (owner_unit)
         {
             const float ox = e.x - owner_unit->x, oy = e.y - owner_unit->y;
-            if (ox * ox + oy * oy > kPickupLeashYd * kPickupLeashYd)
+            if (ox * ox + oy * oy > ctl_leash * ctl_leash)
             {
                 static std::atomic<uint32> s_leash_log{ 0 };
                 uint32 last = s_leash_log.load(std::memory_order_relaxed);
                 if (s.published_at_ms - last >= 5000u && s_leash_log.compare_exchange_strong(last, s.published_at_ms))
                     TC_LOG_INFO("playerbot.v2", "[tank_leash] {} leaves entry {} alone: {:.0f} y from its owner (leash {:.0f} y); no pickup chase",
-                                s.identity.name, e.entry, std::sqrt(ox * ox + oy * oy), kPickupLeashYd);
+                                s.identity.name, e.entry, std::sqrt(ox * ox + oy * oy), ctl_leash);
                 continue;
             }
         }
@@ -1007,7 +1014,7 @@ NearbyUnit const* BotSnapshotView::taunt_candidate(float range) const
             // 79 [tank_loose] lines, Taunt ready, mobs 3-4 y away, no Taunt).
         }
     }
-    return UnclaimedLooseAttacker(*s_, range, /*target_reach=*/true);
+    return UnclaimedLooseAttacker(*s_, range, /*target_reach=*/true, /*leash=*/false, /*controller_leash=*/true);
 }
 
 bool BotSnapshotView::claim_blocks(NearbyUnit const& u) const
@@ -1028,7 +1035,10 @@ NearbyUnit const* BotSnapshotView::pickup_candidate() const
 {
     if (NearbyUnit const* a = assigned_tank_mob())
         return a;
-    return UnclaimedLooseAttacker(*s_, 30.f, /*target_reach=*/false, /*leash=*/true);
+    // Stay / Hold win over a chase: the tank keeps its spot (a taunt, which moves nobody, is still thrown by taunt_candidate).
+    if (s_->holding_position)
+        return nullptr;
+    return UnclaimedLooseAttacker(*s_, 30.f, /*target_reach=*/false, /*leash=*/true, /*controller_leash=*/true);
 }
 
 bool BotSnapshotView::has_item(uint32 entry) const

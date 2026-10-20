@@ -157,6 +157,10 @@ public:
         CastRejectBeyondRange,
     };
     uint32 last_cast_fail() const { return last_cast_fail_; }
+    // The instance map the last teleport_to / enter_area_trigger was refused for because it holds its most players (0: none). The
+    // rejoin rule waits for a slot instead of walking a full instance's entrance.
+    uint32 last_instance_full_map() const { return last_instance_full_map_; }
+    void   clear_instance_full_map() { last_instance_full_map_ = 0; }
     static char const* CastFailName(uint32 code);
 
     // Why a mount spell would draw nothing on the client, nullptr when its model resolves: the display the aura picks (Mount
@@ -171,6 +175,8 @@ public:
     // the spell's own cooldown and the global cooldown, read from the spell history. 0 when
     // nothing is running. Feeds the per-spell back-off after SPELL_FAILED_NOT_READY.
     uint32 cast_ready_in_ms(uint32 spell_id, bool exact_rank = false) const;
+    // The rank of `spell_id` cast_spell() would use: the highest one the player knows (spell_id itself when it knows none).
+    uint32 highest_known_rank(uint32 spell_id) const;
     // Cast a ground-target spell (Death and Decay, Blizzard, Ring of Frost,
     // Healing Rain, Ursol's Vortex). Bot's facing/position constraints still
     // apply server-side; OutOfRange / InvalidTarget will return through Result.
@@ -186,7 +192,14 @@ public:
     // split would NoPath and refuse. Distance-capped; movement-lock guards apply.
     // drop=true: a committed one-way drop off a ledge (BG ledge-to-landing legs recorded by hand): a low jump move from the ledge to the
     // landing, with the fall damage a player would take applied on arrival. Refused unless the landing is 4..40 y below within 40 y.
-    Result move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false);
+    // follow_drop=true: (x,y,z) is the owner. When he stands lower (or across a gap) and the walking route to him is missing or a long detour,
+    // the bot walks to the nearest ledge and drops or leaps to his floor ([follow_drop] logs); otherwise this is the ordinary pathed move.
+    Result move_to(float x, float y, float z, bool run = true, bool direct = false, bool drop = false, bool follow_drop = false);
+    // After a follow_drop move_to: the bot is walking to a ledge, or in the air after leaving one (the follow is committed), as against
+    // the ordinary pathed move it fell back to.
+    bool follow_drop_acted() const;
+    // After a follow_drop move_to: the walking route to the owner was judged fine (as against no ledge found).
+    bool follow_drop_route_fine() const;
     // Ground height at (x,y) searched from above `z_hint` (Playerbot.Behavior.GroundSnap); returns z_hint when none found.
     float  ground_z(float x, float y, float z_hint, char const* where = "api");
     // clear_generators=true pops all MotionMaster generators (Clear + MoveIdle)
@@ -1055,6 +1068,10 @@ public:
     // Classic riding for a bot: Riding skill 75 from level 40 and 150 at 60 (what MountCapability's ReqRidingSkill
     // checks), and its race's vanilla mount (the swift one at 60) when it knows no mount at all. Returns what changed.
     uint32 learn_riding_free();
+    // Puts a bot into the outfit its character was created with (playercreateinfo_item): each piece straight into its slot, the old piece in that
+    // slot destroyed just before; a piece that cannot be worn leaves the old one on. The slots the outfit does not use are cleared only when
+    // every piece went on (`complete`). Returns the number of equipped items removed. For a world bot under level 10 that wears a generated set.
+    uint32 reset_to_starter_gear(bool& complete);
     Result trainer_buy_all_available(ObjectGuid trainer_npc,
                                      uint32* out_learned = nullptr,
                                      uint32* out_already = nullptr,
@@ -1124,6 +1141,7 @@ private:
 
     Player* p_;
     uint32  last_cast_fail_ = 0;   // see last_cast_fail()
+    uint32  last_instance_full_map_ = 0;   // see last_instance_full_map()
 };
 
 } // namespace Playerbot

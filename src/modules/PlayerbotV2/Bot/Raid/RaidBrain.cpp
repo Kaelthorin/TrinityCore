@@ -16,6 +16,7 @@
 #include "RaidIncoming.h"
 #include "RaidManaLedger.h"
 #include "RaidRoster.h"
+#include "ShieldRules.h"
 #include "../../Fleet/BotPopulationManager.h"
 #include "../../Fleet/OwnerRegistry.h"
 #include "../BotRegistry.h"
@@ -42,6 +43,7 @@
 #include "Map.h"
 #include "MapManager.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "PathGenerator.h"
@@ -111,9 +113,7 @@ Ranks const kHammerOfJustice = { 853, 5588, 5589, 10308 };  // Paladin stun
 Ranks const kGouge         = { 1776, 1777, 8629, 11285, 11286 }; // Rogue incapacitate
 Ranks const kBash          = { 5211, 6798, 8983 };          // Druid (bear) stun
 
-// Majordomo Executus' adds: Magic Reflection / Damage Shield (mc/boss_majordomo_executus.cpp). Hitting them hurts.
-constexpr uint32_t kMagicReflection = 20619;
-constexpr uint32_t kDamageShield    = 21075;
+// Majordomo Executus' adds' shields (Magic Reflection / Damage Shield) and who stays off them: ShieldRules.h.
 
 std::vector<Ranks const*> DispelSpellsFor(DispelKind kind)
 {
@@ -513,6 +513,47 @@ void ApplyKeepOut(Plan const& plan, Member const& self, std::vector<Circle> cons
     }
 }
 
+AvoidFrontal const* FrontRule(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy);
+
+// No raid move walks through the front arc of an enemy with a cone rule (Onyxia's Flame Breath, 120 degrees): a bot back from a fear stands
+// anywhere, and the straight walk to a slot, a post or a target may run through the breath (all eight deaths of a 405 s kill
+// came 3-27 s after a roar). A move whose straight line crosses the widened arc is dropped, and the bot waits on its flank; the ways out of
+// the arc itself (leave cone, leave hazard) and a bot that already stands inside it are not touched. At most one log line a bot every 10 s.
+std::unordered_map<uint64_t, uint32_t> g_lastArcGuardLog;
+
+void ApplyFrontArcGuard(Plan const& plan, Member const& self, uint32_t now, RaidOrder& out)
+{
+    if (!out.move || !out.move_reason || plan.rules->avoidFrontal.empty())
+        return;
+    if (std::strcmp(out.move_reason, "leave hazard") == 0 || std::strcmp(out.move_reason, "leave cone") == 0 ||
+        std::strcmp(out.move_reason, "wipe retreat") == 0)
+        return;
+    float const bx = self.p->GetPositionX(), by = self.p->GetPositionY();
+    for (Unit* enemy : plan.enemies)
+    {
+        if (!enemy->IsAlive() || enemy->IsFlying())
+            continue;
+        AvoidFrontal const* front = FrontRule(*plan.rules, plan, self, enemy);
+        if (!front)
+            continue;
+        float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY(), facing = enemy->GetOrientation();
+        float const half = ConeEdgeDeg(*front) * (float(M_PI) / 180.0f);
+        if (geo::InFrontSector(ex, ey, facing, bx, by, half, front->radius))
+            continue;
+        if (!geo::PathCrossesFrontSector(ex, ey, facing, half, front->radius, bx, by, out.move_x, out.move_y))
+            continue;
+        uint32_t& at = g_lastArcGuardLog[self.p->GetGUID().GetCounter()];
+        if (now - at > 10000)
+        {
+            at = now;
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_arc] {}: move ({}) would cross {}'s front arc, dropped", self.p->GetName(), out.move_reason,
+                enemy->GetName());
+        }
+        out.move = false;
+        return;
+    }
+}
+
 bool SetMove(RaidOrder& out, float x, float y, float z, char const* reason)
 {
     out.move = true;
@@ -786,6 +827,10 @@ std::unordered_map<uint64_t, BreathLatch> g_breath;
 // The breath spell a fixed-path rule saw cast (AvoidBreath::fixedPath) and until when its corridor stays open.
 struct BreathSpellLatch { uint32_t spell = 0, until = 0; };
 std::unordered_map<uint64_t, BreathSpellLatch> g_breathSpell;
+// An airborne enemy hovers "at" a path's first point when it, or the end of its spline, is within this many yards of it. (A cast breath's
+// corridor stays open kBreathCorridorOpenMs from the first sighting of the cast; it used to be 11 s after the last sighting, 16 s from the
+// start, which kept the bots from walking out of the Heated Ground the pass leaves behind.)
+constexpr float kBreathHoverReach = 12.0f;
 
 bool IsCasting(Unit* enemy, uint32_t spell)
 {
@@ -872,6 +917,7 @@ std::unordered_map<uint64_t, uint32_t> g_auraCircleLeaveLogged;  // bot -> g_aur
 std::unordered_map<uint64_t, AuraCircleOrigin> g_auraCircleOrigin;
 
 uint32_t g_breathEnemy = 0, g_breathCast = 0;   // the fixed-path breath whose corridor HazardsFor just opened for this member (0 for none)
+size_t g_breathCircleFrom = 0;                  // where that corridor's circles start in the member's circle list; the ones before it are other hazards (Heated Ground)
 
 // Every avoid-circle that applies to this member right now.
 std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t now)
@@ -880,6 +926,7 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
     Player* bot = self.p;
     std::vector<Circle> circles;
     g_breathCast = 0;
+    g_breathCircleFrom = 0;
     for (AvoidEnemyAura const& rule : rules.avoidEnemyAura)
         if (Matches(rule.who, self, plan.mainTank))
             for (Unit* enemy : plan.enemies)
@@ -1000,6 +1047,12 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                 // casters across the room). The bot stays for a tank's taunt instead.
                 if (enemy->GetEntry() == rule.enemy && enemy->GetVictim() != bot && InPhase(enemy, rule.hpMax, rule.hpMin))
                     circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
+    for (AvoidOnStacks const& rule : rules.avoidOnStacks)
+        if (Matches(rule.who, self, plan.mainTank))
+            if (Aura const* carried = bot->GetAura(rule.aura); carried && carried->GetStackAmount() >= rule.stacks)
+                for (Unit* enemy : plan.enemies)
+                    if (enemy->GetEntry() == rule.enemy && enemy->GetVictim() != bot && circles.size() < 64)
+                        circles.push_back({ enemy->GetPositionX(), enemy->GetPositionY(), rule.radius });
     if (!rules.avoidBreath.empty())
     {
         std::vector<uint32_t> breathAdded; // one corridor per enemy, however many breath spells are listed for it
@@ -1031,20 +1084,37 @@ std::vector<Circle> HazardsFor(Plan const& plan, Member const& self, uint32_t no
                     continue;
                 BreathSpellLatch& latch = g_breathSpell[boss->GetGUID().GetCounter()];
                 if (uint32_t const cast = CastingBreath(boss, spells))
-                {
                     if (latch.spell != cast || now > latch.until)
+                    {
                         TC_LOG_INFO("playerbot.v2.raid", "[raid_breath] {} breath spell {} corridor opened", boss->GetName(), cast);
-                    latch.spell = cast;
-                    latch.until = now + 11000;
+                        latch.spell = cast;
+                        latch.until = now + kBreathCorridorOpenMs;
+                    }
+                uint32_t active = (latch.spell && now <= latch.until) ? latch.spell : 0u;
+                // Not casting yet: the corridor of the waypoint she hovers at or flies to (AvoidBreath::hover). A breath can start any time
+                // she is there, and the cast is all the warning there is.
+                if (!active && boss->IsFlying())
+                {
+                    float hx = boss->GetPositionX(), hy = boss->GetPositionY();
+                    if (!boss->movespline->Finalized())
+                    {
+                        G3D::Vector3 const& end = boss->movespline->FinalDestination();
+                        hx = end.x;
+                        hy = end.y;
+                    }
+                    if (AvoidBreath const* hover = HoverBreath(rules, rule.enemy, hx, hy, kBreathHoverReach))
+                        if (Matches(hover->who, self, plan.mainTank))
+                            active = hover->castSpell;
                 }
-                if (!latch.spell || now > latch.until)
+                if (!active)
                     continue;
                 for (AvoidBreath const& path : rules.avoidBreath)
-                    if (path.enemy == rule.enemy && path.fixedPath && path.castSpell == latch.spell && Matches(path.who, self, plan.mainTank))
+                    if (path.enemy == rule.enemy && path.fixedPath && path.castSpell == active && Matches(path.who, self, plan.mainTank))
                     {
                         breathAdded.push_back(rule.enemy);
                         g_breathEnemy = rule.enemy;
                         g_breathCast = path.castSpell;
+                        g_breathCircleFrom = circles.size();
                         float const dx = path.bx - path.ax, dy = path.by - path.ay;
                         float const len = std::sqrt(dx * dx + dy * dy);
                         float const step = std::max(path.halfWidth * 0.8f, 2.0f);
@@ -1118,7 +1188,7 @@ Brain::MoveContext BuildMoveContext(Plan const& plan, Member const& self, std::v
     {
         if (!Matches(rule.who, self, plan.mainTank))
             continue;
-        float const s = std::sin(std::min(rule.halfAngleDeg, 89.0f) * (float(M_PI) / 180.0f));
+        float const s = std::sin(std::min(ConeEdgeDeg(rule), 89.0f) * (float(M_PI) / 180.0f));
         for (Unit* enemy : plan.enemies)
         {
             // A flying enemy has no ground cone (Onyxia's phase 2: she circles the cave and turns every waypoint).
@@ -1194,6 +1264,54 @@ std::unordered_map<uint64_t, FaceAxisLock> g_faceAxis;
 constexpr float kAxisDrift = 8.0f;
 constexpr uint32_t kAxisStaleMs = 30000;
 
+// The spot a fight began at and the bearing from the raid's centre to it, locked for the fight (TankSpot): tanks stand relative to this, not to
+// mobs that move with them.
+struct TankSpotLock { float x = 0, y = 0, bearing = 0; uint32_t seenMs = 0; };
+std::unordered_map<uint64_t, TankSpotLock> g_tankSpot;
+std::unordered_map<uint64_t, uint32_t> g_lastTankSpot;
+
+bool TankSpotFor(Plan const& plan, TankSpot const& rule, Player* bot, uint32_t now, float& outX, float& outY)
+{
+    uint64_t const key = (plan.groupLow << 32) ^ rule.anchor;
+    TankSpotLock& lock = g_tankSpot[key];
+    if (!lock.seenMs || now - lock.seenMs >= kAxisStaleMs)
+    {
+        Unit* anchor = nullptr;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.anchor && enemy->IsAlive())
+                anchor = enemy;
+        if (!anchor)
+            return false;
+        float sx = 0.0f, sy = 0.0f;
+        int n = 0;
+        for (Member const& m : plan.members)
+        {
+            if (m.tank || Dist2D(m.p->GetPositionX(), m.p->GetPositionY(), anchor->GetPositionX(), anchor->GetPositionY()) > 60.0f)
+                continue;
+            sx += m.p->GetPositionX(); sy += m.p->GetPositionY();
+            ++n;
+        }
+        if (n < 4)
+            return false;
+        lock = { anchor->GetPositionX(), anchor->GetPositionY(), geo::Bearing(sx / float(n), sy / float(n), anchor->GetPositionX(), anchor->GetPositionY()), now ? now : 1u };
+    }
+    lock.seenMs = now ? now : 1u;
+    // The holders of <enemy>, in guid order: this tank's slot in the row.
+    std::vector<uint64_t> holders;
+    for (Unit* enemy : plan.enemies)
+        if (enemy->GetEntry() == rule.enemy && enemy->IsAlive() && enemy->GetVictim() && enemy->GetVictim()->GetTypeId() == TYPEID_PLAYER)
+            holders.push_back(enemy->GetVictim()->GetGUID().GetCounter());
+    std::sort(holders.begin(), holders.end());
+    holders.erase(std::unique(holders.begin(), holders.end()), holders.end());
+    auto const at = std::find(holders.begin(), holders.end(), bot->GetGUID().GetCounter());
+    if (at == holders.end())
+        return false;
+    float const lateral = (float(at - holders.begin()) - float(holders.size() - 1) * 0.5f) * rule.spacing;
+    outX = lock.x + rule.reach * std::cos(lock.bearing) + lateral * std::cos(lock.bearing + float(M_PI) * 0.5f);
+    outY = lock.y + rule.reach * std::sin(lock.bearing) + lateral * std::sin(lock.bearing + float(M_PI) * 0.5f);
+    return true;
+}
+
 bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis, float fixedBearingDeg = kNoBearing)
 {
     if (fixedBearingDeg != kNoBearing)
@@ -1228,6 +1346,34 @@ bool FaceAxisFor(Plan const& plan, Unit* enemy, uint32_t now, float& axis, float
     return true;
 }
 
+// Whether (x,y) lies inside a frontal cone of <enemy> as it faces now, widened by the rule's margin, for a bot like <self>. The same sector test
+// the cone step (2b) uses, so a stand point this rejects is one that step would walk the bot out of again.
+bool InAnyLiveCone(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy, float x, float y)
+{
+    for (AvoidFrontal const& rule : rules.avoidFrontal)
+    {
+        if (rule.enemy != enemy->GetEntry() || !Matches(rule.who, self, plan.mainTank) || !InPhase(enemy, rule.hpMax, rule.hpMin))
+            continue;
+        if (Dist2D(x, y, enemy->GetPositionX(), enemy->GetPositionY()) > rule.radius)
+            continue;
+        float const facing = enemy->GetOrientation() + rule.facingOffsetDeg * (float(M_PI) / 180.0f);
+        float const toPoint = geo::NormalizeAngle(geo::Bearing(enemy->GetPositionX(), enemy->GetPositionY(), x, y) - facing);
+        if (std::fabs(toPoint) < ConeEdgeDeg(rule) * (float(M_PI) / 180.0f))
+            return true;
+    }
+    return false;
+}
+
+// The front-cone rule of <enemy> that applies to a bot like <self> in the enemy's current phase (the cone with no facing offset), or null.
+AvoidFrontal const* FrontRule(RaidRules const& rules, Plan const& plan, Member const& self, Unit const* enemy)
+{
+    for (AvoidFrontal const& rule : rules.avoidFrontal)
+        if (rule.enemy == enemy->GetEntry() && rule.facingOffsetDeg == 0.0f && Matches(rule.who, self, plan.mainTank) &&
+            InPhase(enemy, rule.hpMax, rule.hpMin))
+            return &rule;
+    return nullptr;
+}
+
 // A bot standing in lava or slime leaves it for the nearest dry navmesh point. The Ragnaros fight (live 2026-10-12) had bots standing in
 // the lava round the platform and not moving out; the log line says whether the core even applies the liquid to them (z against the
 // surface), the move takes them out. "In" is the core's own contact test (MAP_LIQUID_STATUS_IN_CONTACT: in, under, or on the surface within
@@ -1239,8 +1385,13 @@ std::unordered_map<uint64_t, uint32_t> g_lastLavaLog;
 bool MagmaAt(Map* map, PhaseShift const& phase, float x, float y, float z, float& surfaceZ)
 {
     LiquidData ld;
-    ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
+    // All liquids, then the flags of what came back: the vmap filters on the model's raw liquid type, before the area table swaps it for
+    // its own (the Majordomo hall's dais is a water-typed model liquid the area turns into lava). A Magma|Slime filter never saw it and the
+    // core, which asks for all liquids, burned bots there for 10% a second.
+    ZLiquidStatus const st = map->GetLiquidStatus(phase, x, y, z, map_liquidHeaderTypeFlags::AllLiquids, &ld);
     if (!(st & MAP_LIQUID_STATUS_IN_CONTACT))
+        return false;
+    if (!ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
         return false;
     surfaceZ = ld.level;
     return true;
@@ -1429,6 +1580,17 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             for (BreathSafe const* s : spots)
             {
                 float pz = 0.0f;
+                // Not into other hazards (the fire the breath leaves round the pits: the listed points lie in it): the corridor's own circles
+                // start at g_breathCircleFrom, the ones before are the others.
+                bool burning = false;
+                for (size_t i = 0; i < g_breathCircleFrom && i < circles.size(); ++i)
+                    if (Dist2D(s->x, s->y, circles[i].x, circles[i].y) < circles[i].r)
+                    {
+                        burning = true;
+                        break;
+                    }
+                if (burning)
+                    continue;
                 if (!Usable(bot, s->x, s->y, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
                     continue;
                 SetMove(out, s->x, s->y, pz, "leave hazard");
@@ -1487,7 +1649,7 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             float const distance = Dist2D(bot->GetPositionX(), bot->GetPositionY(), enemy->GetPositionX(), enemy->GetPositionY());
             if (distance > rule.radius)
                 continue;
-            float const half = rule.halfAngleDeg * (float(M_PI) / 180.0f);
+            float const half = ConeEdgeDeg(rule) * (float(M_PI) / 180.0f);
             float const facing = enemy->GetOrientation() + rule.facingOffsetDeg * (float(M_PI) / 180.0f);
             float toBot = std::atan2(bot->GetPositionY() - enemy->GetPositionY(), bot->GetPositionX() - enemy->GetPositionX()) - facing;
             while (toBot > float(M_PI)) toBot -= 2.0f * float(M_PI);
@@ -1640,6 +1802,26 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 return;
             }
 
+    // 3b2. Tank spots (Majordomo): a player that holds a ruled enemy walks to its place in the row, every 3 s at most.
+    for (TankSpot const& rule : rules.tankSpot)
+    {
+        float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+        if (!TankSpotFor(plan, rule, bot, now, tx, ty) || Dist2D(bot->GetPositionX(), bot->GetPositionY(), tx, ty) < 3.0f)
+            continue;
+        uint32_t& at = g_lastTankSpot[bot->GetGUID().GetCounter()];
+        if (now - at < 3000)
+            continue;
+        at = now;
+        if (!circles.empty() && InsideAny(circles, tx, ty, 0.5f))
+            continue;
+        if (Usable(bot, tx, ty, bot->GetPositionZ(), tz, /*urgent*/ true))
+        {
+            TC_LOG_INFO("playerbot.v2.raid", "[raid_tank_spot] {} walks to its place for entry {} ({:.0f},{:.0f})", bot->GetName(), rule.enemy, tx, ty);
+            SetMove(out, tx, ty, tz, "tank spot");
+            return;
+        }
+    }
+
     // 3c. Stand behind (Magmadar): matching bots stand in the sector behind the enemy, wherever the tank has turned it.
     // At most one step per bot every 4 s, so a boss that turns a little does not make the raid hop.
     for (StandBehind const& rule : rules.standBehind)
@@ -1693,7 +1875,18 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             if (enemy->GetEntry() != rule.enemy || !enemy->IsAlive() || enemy->IsFlying() || !InPhase(enemy, rule.hpMax, rule.hpMin))
                 continue;
             float const ex = enemy->GetPositionX(), ey = enemy->GetPositionY();
-            float const eo = enemy->GetOrientation();
+            // The wedge is measured from the line the tank holds her on (the locked FaceAway axis), not from her live facing: that swings with
+            // every step the tank takes, flipped the flank a bot counted itself on and sent it across the cone to the other wedge. The cones
+            // themselves (2b) still read the live facing, which is where the breath goes.
+            float eo = enemy->GetOrientation();
+            for (FaceAway const& fa : rules.faceAway)
+                if (fa.enemy == rule.enemy && InPhase(enemy, fa.hpMax, fa.hpMin))
+                {
+                    float axis;
+                    if (FaceAxisFor(plan, enemy, now, axis, fa.bearingDeg))
+                        eo = axis;
+                    break;
+                }
             float const half = rule.halfAngleDeg * (float(M_PI) / 180.0f), centre = rule.centerDeg * (float(M_PI) / 180.0f);
             // Which flank: the side of its facing the bot is on. The rear-sector helpers measure from the line straight behind a facing, so the
             // flank is handed to them as the "rear" of a facing turned a quarter round the other way.
@@ -1719,13 +1912,36 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
             uint32_t const row = index % rows, col = index / rows;
             float const angle = centre - half + (float(col) + 0.5f) / float(cols) * 2.0f * half;
             float const dist = rule.minDist + (float(row) + 0.5f) / float(rows) * depth;
-            float const px = ex + dist * std::cos(eo + side * angle), py = ey + dist * std::sin(eo + side * angle);
+            float const slotAngle = eo + side * angle;
+            // A slot is only a slot where nothing would move the bot out again: no hazard circle, no whelp-cave circle (a move that ends in one is
+            // pushed out to its rim, which at her spawn spot put the casters in front of her) and no cone as she faces right now
+            // (the cone step would walk the bot straight out: 180 flank and 140 cone steps in 70 s). The same bearing at another distance inside
+            // the band is tried before the bot gives up and stays where it is.
+            auto const validAt = [&](float d, float& vx, float& vy)
+            {
+                vx = ex + d * std::cos(slotAngle);
+                vy = ey + d * std::sin(slotAngle);
+                return !(!circles.empty() && InsideAny(circles, vx, vy, 1.0f)) && !InsideAny(g_keepOut, vx, vy, 0.0f) &&
+                    !InAnyLiveCone(rules, plan, self, enemy, vx, vy);
+            };
+            float px = 0.0f, py = 0.0f;
+            bool found = validAt(dist, px, py);
+            for (int k = 1; !found && k <= 4; ++k)
+                for (float sign : { -1.0f, 1.0f })
+                {
+                    float const d = dist + sign * 2.0f * float(k);
+                    if (d >= rule.minDist && d <= rule.maxDist && validAt(d, px, py))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+            if (!found)
+                break;
             if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), px, py) <= 3.0f)
                 break;
             uint32_t& at = g_lastRearStep[bot->GetGUID().GetCounter()];
             if (now - at < 4000)
-                break;
-            if (!circles.empty() && InsideAny(circles, px, py, 1.0f))
                 break;
             float pz = 0.0f;
             if (!Usable(bot, px, py, enemy->GetPositionZ(), pz))
@@ -2228,7 +2444,7 @@ void ElectDispels(Election& e)
         uint32_t given = 0;
         for (Member* m : carriers)
         {
-            if (!rule.urgent && given >= kNonUrgentDispelOrdersPerPlan)
+            if (!DispelOrderAllowed(rule.urgent, rule.maxOrders, given))
                 break;
             bool const ok = e.Assign(m->p, families, false, RaidOrder::CastKind::Dispel, "dispel", !rule.urgent,
                                      rule.urgent ? 0 : kNonUrgentDispelHealerManaPct);
@@ -2279,10 +2495,23 @@ void ElectDispels(Election& e)
     }
 }
 
-void ElectPurges(Election& e)
+void ElectPurges(Election& e, ObjectGuid killFocus)
 {
     Plan& plan = e.plan;
-    for (Unit* enemy : plan.enemies)
+    // The kill focus first, then the enemies a tank holds, then the rest: Majordomo shields all eight adds at once and the purgers take a few
+    // passes, so the add the raid is burning and the ones the tanks need their abilities on lose theirs first.
+    auto const rank = [&](Unit* enemy)
+    {
+        if (!killFocus.IsEmpty() && enemy->GetGUID() == killFocus)
+            return 0;
+        Unit* held = enemy->GetVictim();
+        Player* holder = held ? held->ToPlayer() : nullptr;
+        Member* hm = holder ? FindMember(plan, holder) : nullptr;
+        return hm && hm->tank ? 1 : 2;
+    };
+    std::vector<Unit*> order(plan.enemies.begin(), plan.enemies.end());
+    std::stable_sort(order.begin(), order.end(), [&](Unit* a, Unit* b) { return rank(a) < rank(b); });
+    for (Unit* enemy : order)
         for (PurgeEnemy const& rule : plan.rules->purge)
             if (enemy->HasAura(rule.aura))
                 e.Assign(enemy, { &kPurge, &kDispelMagic }, true, RaidOrder::CastKind::Purge, "purge", true);
@@ -2394,9 +2623,11 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
     RaidRules const& rules = *plan.rules;
     std::vector<ObjectGuid> forbiddenAll;      // nobody attacks these
     std::vector<ObjectGuid> forbiddenDps;      // non-tanks do not attack these
+    std::vector<ObjectGuid> forbiddenCasters;  // Magic Reflection: the spell casters do not attack these (ShieldRules.h)
+    std::vector<ObjectGuid> forbiddenMelee;    // Damage Shield: the melee DPS do not attack these
     // Packs that die together: downed members are left alone by everybody, members trailing the healthiest one by more than
     // the rule's spread are left alone by DPS, and only the healthiest one can become the DPS fallback or the group focus.
-    std::vector<Unit*> packHolders;            // per pack rule with a member up: the healthiest member
+    std::vector<std::pair<Unit*, KillTogether const*>> packHolders;   // per pack rule with a member up: the healthiest member
     for (KillTogether const& rule : rules.killTogether)
     {
         // Molten Core's hounds only feign and rise when Instance.MoltenCoreHoundsLinked is on (default off: they die one by one).
@@ -2405,7 +2636,7 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         std::vector<Unit*> up;
         for (Unit* enemy : plan.enemies)
         {
-            if (enemy->GetEntry() != rule.enemy)
+            if (!InPack(rule, enemy->GetEntry()))
                 continue;
             if (enemy->GetHealth() <= 1 || (rule.downAura && enemy->HasAura(rule.downAura)))
                 forbiddenAll.push_back(enemy->GetGUID());
@@ -2419,15 +2650,26 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         for (Unit* enemy : up)
             if (enemy->GetHealthPct() < healthiest->GetHealthPct() - rule.spreadPct)
                 forbiddenDps.push_back(enemy->GetGUID());
-        packHolders.push_back(healthiest);
+        packHolders.emplace_back(healthiest, &rule);
         // The group kill focus too: the coordinator's generic pick (lowest health first) would chase a downed or trailing one.
         if (plan.ruleFocus.IsEmpty())
             plan.ruleFocus = healthiest->GetGUID();
     }
+    // Spare rules: an add near death is left alone by everybody while its boss lives.
+    for (Spare const& rule : rules.spare)
+    {
+        bool gateAlive = false;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.gateEnemy && enemy->IsAlive())
+                gateAlive = true;
+        for (Unit* enemy : plan.enemies)
+            if (enemy->GetEntry() == rule.enemy && SpareNow(rule, enemy->GetHealthPct(), gateAlive))
+                forbiddenAll.push_back(enemy->GetGUID());
+    }
     auto const trailsHolder = [&packHolders](Unit* enemy)
     {
-        for (Unit* holder : packHolders)
-            if (holder->GetEntry() == enemy->GetEntry() && holder != enemy)
+        for (auto const& [holder, rule] : packHolders)
+            if (holder != enemy && InPack(*rule, enemy->GetEntry()))
                 return true;
         return false;
     };
@@ -2441,14 +2683,20 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             continue;   // a downed or trailing pack member
         if (trailsHolder(enemy))
             continue;   // within the spread but not the healthiest: no focus on it
-        bool const reflecting = enemy->HasAura(kMagicReflection) || enemy->HasAura(kDamageShield);
         // The owner's skull on a sheeped mob is the call to kill it (Majordomo: he rotates the skull onto each sheeped Healer).
         bool const skulled_hold = Controlled(enemy) && !coordFocus.IsEmpty() && enemy->GetGUID() == coordFocus;
-        if ((Controlled(enemy) && !skulled_hold) || reflecting)
+        if (Controlled(enemy) && !skulled_hold)
         {
             forbiddenAll.push_back(enemy->GetGUID());
             continue;
         }
+        // Majordomo's shields, 10 s on all eight adds every 30 s: Magic Reflection takes the casters off the add, Damage Shield the melee DPS.
+        // The other half keeps attacking, the tanks keep their swings, hunters are hit by neither (either shield used to stop
+        // everybody, a third of the fight idle for the whole raid: 3200-4500 raid damage a second).
+        if (enemy->HasAura(Shields::kMagicReflection))
+            forbiddenCasters.push_back(enemy->GetGUID());
+        if (enemy->HasAura(Shields::kDamageShield))
+            forbiddenMelee.push_back(enemy->GetGUID());
         if (PriorityFor(rules, enemy->GetEntry()) < 0)
         {
             forbiddenDps.push_back(enemy->GetGUID());
@@ -2478,12 +2726,24 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         }
         return 1;
     };
+    // The shield that keeps this member off an enemy, by role (ShieldRules.h): a melee DPS off a Damage Shield, a caster off Magic Reflection.
+    auto const shieldForbids = [&](Member const& m, Unit* enemy)
+    {
+        bool const melee = Matches(Who::Melee, m, plan.mainTank);
+        bool const caster = Matches(Who::Caster, m, plan.mainTank);
+        if (!melee && !caster)
+            return false;
+        auto const in = [&](std::vector<ObjectGuid> const& v) { return std::find(v.begin(), v.end(), enemy->GetGUID()) != v.end(); };
+        return (melee && in(forbiddenMelee)) || (caster && in(forbiddenCasters));
+    };
     auto const bestFor = [&](Member const& m) -> Unit*
     {
         Unit* best = nullptr;
         int bestPriority = 0;
         for (Unit* enemy : candidates)
         {
+            if (shieldForbids(m, enemy))
+                continue;
             int const priority = priorityFor(m, enemy);
             if (priority < 0)
                 continue;
@@ -2506,6 +2766,10 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
         o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenAll.begin(), forbiddenAll.end());
         if (!m.tank)
             o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenDps.begin(), forbiddenDps.end());
+        if (Matches(Who::Melee, m, plan.mainTank))
+            o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenMelee.begin(), forbiddenMelee.end());
+        if (Matches(Who::Caster, m, plan.mainTank))
+            o.forbidden_targets.insert(o.forbidden_targets.end(), forbiddenCasters.begin(), forbiddenCasters.end());
         if (!m.tank)
             for (OnlyAttackers const& rule : rules.onlyAttackers)
                 if (!Matches(rule.who, m, plan.mainTank))
@@ -2520,7 +2784,7 @@ void PublishTargets(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders,
             Unit* pick = nullptr;
             if (!focus.IsEmpty())
                 for (Unit* enemy : candidates)
-                    if (enemy->GetGUID() == focus)
+                    if (enemy->GetGUID() == focus && !shieldForbids(m, enemy))
                         pick = enemy;
             if (!pick)
                 pick = bestFor(m);
@@ -2553,6 +2817,9 @@ struct OverHold { uint32_t first = 0, last = 0; };
 std::unordered_map<uint64_t, OverHold> g_overHold;
 std::unordered_map<uint64_t, OverHold> g_holdFight;   // bot -> when its opening wait of this fight began (one wait per fight, not per enemy)
 constexpr uint32_t kOverHoldMaxMs = 3000, kOverHoldGapMs = 4000, kFightGapMs = 8000;
+// Past the hard limit the hold waits for the tank's threat to rise; a stunned, feared, dead or out-of-reach tank never raises it, so that
+// wait is bounded by the tank standing still for kStalledTankHoldMs (Bot/ThreatLimits.h), the same clock as the generic hold.
+std::unordered_map<uint64_t, StalledTankClock> g_stalledHold;
 
 void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& orders, uint32_t now)
 {
@@ -2619,8 +2886,9 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
             fight.last = now;
             // A boss gets the tank's time to arrive and build its lead: mc_geddon 09a8ff07 had Geddon on a mage 6 s in (the tank, 40 y off at the
             // pull, still short of the 900 lead when the 6 s opening wait ran out), loose in the middle of the raid when Inferno came.
-            // Never longer than six seconds from the tank's first hit (playtest 2026-10-15), the same cap as the combat state's wait.
-            uint32_t const capMs = boss ? 6000u : (tankThreat <= 0.0f ? 1000u : 2000u);
+            // Never longer than eight seconds from the tank's first hit in a raid, the
+            // same wait as the combat state's (kRaidBossOpenWaitMs).
+            uint32_t const capMs = boss ? uint32_t(kRaidBossOpenWaitMs) : (tankThreat <= 0.0f ? 1000u : 2000u);
             hold = now - std::min(since, fight.first) < capMs;
         }
         else
@@ -2646,8 +2914,11 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
                 if (!oh.first || now - oh.last > kOverHoldGapMs)
                     oh.first = now;
                 oh.last = now;
-                if (myThreat < tankThreat * hard && now - oh.first >= kOverHoldMaxMs)
+                bool const pastHard = myThreat >= tankThreat * hard;
+                if (!pastHard && now - oh.first >= kOverHoldMaxMs)
                     hold = false;
+                else if (pastHard && StalledTankHoldExpired(g_stalledHold[key], now, tankThreat, kOverHoldGapMs))
+                    hold = false;   // the tank has not built threat for kStalledTankHoldMs: nothing to wait for
             }
         }
         if (hold)
@@ -2660,6 +2931,9 @@ void PublishThreatHolds(Plan& plan, std::unordered_map<uint64_t, RaidOrder>& ord
         if (map->size() > 1024)
             for (auto it = map->begin(); it != map->end();)
                 it = (now - it->second.last > 120000) ? map->erase(it) : std::next(it);
+    if (g_stalledHold.size() > 1024)
+        for (auto it = g_stalledHold.begin(); it != g_stalledHold.end();)
+            it = (now - it->second.last_ms > 120000) ? g_stalledHold.erase(it) : std::next(it);
 }
 
 // Which spell schools to prefer / avoid on each engaged enemy, from its live immunities, damage-taken auras and spell
@@ -2821,7 +3095,6 @@ constexpr BossNeed kBossNeeds[] = {
     { 12264, "purge (Deaden Magic)", kPurgers, 1 },
     { 12098, "interrupt (Dark Mending)", kKickers, 3 },
     { 12098, "purge (Inspire)", kPurgers, 1 },
-    { 12018, "polymorph (Flamewaker Healers)", kPolymorphers, 2 },
     { 12018, "purge (Magic Reflection / Damage Shield)", kPurgers, 2 },
     { 12018, "interrupt (Flamewaker Healers)", kKickers, 3 },
     { 11502, "banish (Sons of Flame)", kBanishers, 2 },
@@ -3657,6 +3930,7 @@ void Brain::Update(uint32_t now_ms)
                 if (!m.p->HasUnitState(UNIT_STATE_ROOT | UNIT_STATE_STUNNED | UNIT_STATE_CONFUSED | UNIT_STATE_FLEEING))
                     DecideMove(plan, m, now_ms, circles, o);
                 ApplyKeepOut(plan, m, circles, o);
+                ApplyFrontArcGuard(plan, m, now_ms, o);
                 if (o.move)
                     dump << "  " << m.p->GetName() << ": move (" << o.move_reason << ")\n";
                 for (NoAoe const& rule : plan.rules->noAoe)
@@ -3704,7 +3978,7 @@ void Brain::Update(uint32_t now_ms)
         ElectRetaunt(e);
         ElectBerserkerDance(e);
         ElectDispels(e);
-        ElectPurges(e);
+        ElectPurges(e, CoordinatorFocus(plan.groupLow, plan.mapId));
         ElectCrowdControl(e, tankTargets, CoordinatorFocus(plan.groupLow, plan.mapId));
         PublishTargets(plan, next, CoordinatorFocus(plan.groupLow, plan.mapId));
         if (std::vector<EnemySchools> hints = SchoolHints(plan, dump); !hints.empty())
@@ -3715,6 +3989,7 @@ void Brain::Update(uint32_t now_ms)
             dump << "  rule kill focus: " << plan.ruleFocus.GetCounter() << "\n";
         }
         PublishThreatHolds(plan, next, now_ms);
+        ApplyFightScript(plan, next, now_ms, dump);
         PublishMeleeSoak(plan, next);
         PublishAuraReactions(plan, next);
     }

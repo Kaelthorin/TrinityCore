@@ -21,6 +21,7 @@
 #include "Log.h"
 #include "Config.h"
 #include "GameTime.h"
+#include "Fleet/CityLayer.h"
 #include <unordered_map>
 
 #include "DetourCommon.h"
@@ -267,6 +268,31 @@ float GroundZ(Player* p, float x, float y, float zHint, char const* where, bool*
     return g;
 }
 
+bool ProbeGround(Player* p, float x, float y, float zHint, float& out)
+{
+    if (!p)
+        return false;
+    Map* m = p->GetMap();
+    if (!m)
+        return false;
+    constexpr float kProbeUp   = 3.0f;
+    constexpr float kProbeDown = 40.0f;
+    m->LoadGrid(x, y);
+    float g = INVALID_HEIGHT;
+    try
+    {
+        g = m->GetHeight(p->GetPhaseShift(), x, y, zHint + kProbeUp, /*vmap*/ true, kProbeUp + kProbeDown);
+    }
+    catch (...)
+    {
+        g = INVALID_HEIGHT;   // BIH churn race (see SnapToGround)
+    }
+    if (g <= INVALID_HEIGHT)
+        return false;
+    out = g;
+    return true;
+}
+
 // ---- NearestNavPoint --------------------------------------------------------
 
 bool NearestNavPoint(Player* p, float tx, float ty, float tz,
@@ -422,7 +448,12 @@ bool SafeNearTeleport(Player* p, float x, float y, float z, float o, bool navmes
         LiquidData ld;
         ZLiquidStatus const st = p->GetMap()->GetLiquidStatus(
             p->GetPhaseShift(), px, py, pz,
-            map_liquidHeaderTypeFlags::Magma | map_liquidHeaderTypeFlags::Slime, &ld);
+            map_liquidHeaderTypeFlags::AllLiquids, &ld);
+        // The vmap filters on the model's raw liquid type, before the area table's override (the Majordomo dais is lava only after it),
+        // so ask for all liquids and test the flags that come back.
+        if (st != LIQUID_MAP_NO_WATER && !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Magma) &&
+            !ld.type_flags.HasFlag(map_liquidHeaderTypeFlags::Slime))
+            return false;
         // A point ON the surface reads WATER_WALK (delta > -0.1) and one just above it ABOVE_WATER, and the bot falls in at
         // once: the Molten Core entrance snap lands exactly on the lava surface (z 168.5, ground 165.2), so only IN / UNDER
         // let Cornelia and Cassanny die there on arrival (2026-10-11, killer=self). Anything within a yard of the surface
@@ -699,6 +730,32 @@ LiquidVerdict ClassifyDestinationLiquid(Player* p, float x, float y, float z,
     // ABOVE_WATER / WATER_WALK / IN_WATER / OCEAN_FLOOR: the bot's head stays
     // above the surface — wading depth, allowed (PathGenerator wades through).
     return LiquidVerdict::Wadeable;
+}
+
+// ---- NoPath storm ------------------------------------------------------------
+
+namespace {
+std::unordered_map<uint64, ::Playerbot::V2::Fleet::NoPathRun> g_noPathRun;
+}
+
+void NoteNoPath(Player const* p)
+{
+    if (p)
+        ::Playerbot::V2::Fleet::NoteNoPath(g_noPathRun[p->GetGUID().GetCounter()], GameTime::GetGameTimeMS());
+}
+
+bool NoPathStorm(Player const* p)
+{
+    if (!p)
+        return false;
+    auto it = g_noPathRun.find(p->GetGUID().GetCounter());
+    return it != g_noPathRun.end() && ::Playerbot::V2::Fleet::NoPathStorm(it->second, GameTime::GetGameTimeMS());
+}
+
+void ClearNoPath(Player const* p)
+{
+    if (p)
+        g_noPathRun.erase(p->GetGUID().GetCounter());
 }
 
 } // namespace Playerbot::BotMovement

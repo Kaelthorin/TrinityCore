@@ -38,7 +38,7 @@ namespace
 bool IsWorldErrand(std::string_view name)
 {
     static constexpr std::string_view kPrefixes[] = {
-        "idle:ah_", "idle:autoact_dispatch", "idle:bags_full_recover", "idle:bank_deposit",
+        "idle:ah_", "idle:autoact_dispatch", "idle:bag_hearth", "idle:bags_full_recover", "idle:bank_deposit",
         "idle:calendar_", "idle:capital_bag_run", "idle:craft_order_", "idle:critical_repair", "idle:dual_spec_switch",
         "idle:dungeon_loop_requeue", "idle:dungeon_quest_approach", "idle:far_same_map_travel", "idle:gather",
         "idle:guild_", "idle:homebind", "idle:invite_nearby_player", "idle:legacy_vendor_dispatch",
@@ -46,6 +46,7 @@ bool IsWorldErrand(std::string_view name)
         "idle:pet_swap_from_stable", "idle:pursue_quest_", "idle:pvp_help_callout", "idle:assist_friend_pvp",
         "idle:quest_", "idle:react_to_passerby", "idle:resolve_junk_quests", "idle:swim_stuck_hearth",
         "idle:swim_stuck_walk_to_hub", "idle:tame_beast", "idle:taxi_discover", "idle:transport_ride", "idle:vendor_visit",
+        "idle:bag_hearth", "idle:fidget", "idle:inn_rest", "idle:mailbox", "idle:town_duel", "idle:wander",
         "idle:walk_",
         "idle:wq_", "idle:yell_lfg", "idle:ambient_sit", "idle:rpg_",
     };
@@ -97,7 +98,8 @@ std::string_view IdleRuleRegistry::tick(BotSnapshotView const& s, BotAI& ai,
         if (r.priority < min_priority) break;   // rules_ sorted desc — bail early
         if (!r.enabled) continue;
         if (!r.gate)    continue;
-        if (r.world_errand && s.is_companion_with_owner()) continue;
+        // A bot in a group with a player (its owner, or the player who invited it) never runs world errands.
+        if (r.world_errand && s.is_led_by_player()) continue;
         // Per-rule gate-throttle, kept per bot: a rule with min_interval_ms > 0 is looked at by a given bot no more than once per interval
         // (low-urgency rules such as mail, calendar, auction and charter do not need every tick). The first look is spread over the
         // interval by a hash of bot and rule, so a fleet does not look in the same second.

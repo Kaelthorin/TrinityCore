@@ -181,12 +181,15 @@ private:
     // raid icons on mobs nobody fights yet may start the fight (PveOrder::marks_released).
     std::unordered_map<uint64, uint32> mark_release_until_;
     std::unordered_map<uint64, uint32> fight_start_;   // first ms of the current fight (Playerbot.Raid.DpsWaitTimeoutMs)
+    // Per-(group, map): mob guid counter -> the last logged kick assignment on a listed cast (RaidRules::interruptFirst), spell and
+    // rank-0 kicker packed, so [raid_interrupt] plan lines come once per cast and not once per 500 ms plan.
+    std::unordered_map<uint64, std::unordered_map<uint64, uint64>> kick_plan_logged_;
     std::unordered_map<uint64, uint32> defend_since_;  // first ms a mob has stood on a non-tank member this fight (0 = none now)
     std::unordered_map<uint64, FightLog> fight_log_;
     // Interrupt rotation (Classic: live-ability ranks + per-casting-mob
     // assignment) and the hunter Tranquilizing Shot order. World thread,
     // inside Update(); write interrupt_* / tranq_rank into `plan`.
-    void PlanInterrupts(std::vector<Member> const& mem,
+    void PlanInterrupts(uint64 bkey, std::vector<Member> const& mem,
                         std::vector<std::shared_ptr<BotSnapshot const>> const& snaps,
                         std::unordered_map<uint64, PveOrder>& plan);
     void PlanTranq(uint64 bkey, std::vector<Member> const& mem,
