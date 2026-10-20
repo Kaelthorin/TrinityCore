@@ -33,6 +33,7 @@
 #include "ScenarioMgr.h"
 #include "ScriptMgr.h"
 #include "World.h"
+#include "WorldSession.h"
 #include "WorldStateMgr.h"
 
 #include <boost/dynamic_bitset.hpp>
@@ -189,6 +190,44 @@ GarrisonMap* MapManager::CreateGarrison(uint32 mapId, uint32 instanceId, Player*
 - create the instance if it's not created already
 - the player is not actually added to the instance (only in InstanceMap::Add)
 */
+// The group's recent instance owner decides the instance. When that owner holds no active save for the map (a companion, which never
+// saves) and the entering player holds one, the player's own save names the instance: otherwise a player saved to instance 46 is sent
+// to a fresh instance of the same map that his save does not name.
+static ObjectGuid GetInstanceOwner(Player const* player, Group const* group, MapDb2Entries const& entries)
+{
+    if (!group)
+        return player->GetGUID();
+
+    ObjectGuid owner = group->GetRecentInstanceOwner(entries.Map->ID);
+    if (owner != player->GetGUID() && !player->GetSession()->IsBot() && !sInstanceLockMgr.FindActiveInstanceLock(owner, entries)
+        && sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries))
+        return player->GetGUID();
+
+    return owner;
+}
+
+// A bot goes where its group's human is: the instance a human member of the bot's group stands in for this map. A group formed while
+// the human was already inside (a re-formed raid, bots called in after) names no instance, or one led by a bot that holds no save, and
+// the first bot in would open a second copy of the dungeon the human can only reach with a summon (`.appear` on the bots landed
+// in a separate raid). Null when the player is not a bot, has no group or no human member is in such an instance.
+static InstanceMap* FindGroupHumanInstance(Player const* player, uint32 mapId)
+{
+    Group const* group = player->GetGroup();
+    if (!group || !player->GetSession()->IsBot())
+        return nullptr;
+    for (GroupReference const& ref : group->GetMembers())
+    {
+        Player const* member = ref.GetSource();
+        if (!member || member == player || member->GetSession()->IsBot() || !member->IsInWorld())
+            continue;
+        Map* map = member->GetMap();
+        if (map && map->GetId() == mapId && map->IsDungeon())
+            if (InstanceMap* instanceMap = map->ToInstanceMap())
+                return instanceMap;
+    }
+    return nullptr;
+}
+
 Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDungeonsId /*= {}*/)
 {
     if (!player)
@@ -223,12 +262,20 @@ Map* MapManager::CreateMap(uint32 mapId, Player* player, Optional<uint32> lfgDun
             }
         }
     }
+    else if (entry->IsDungeon() && FindGroupHumanInstance(player, mapId))
+    {
+        InstanceMap* humanMap = FindGroupHumanInstance(player, mapId);
+        if (Group* group = player->GetGroup(); group && group->GetRecentInstanceId(mapId) != humanMap->GetInstanceId())
+            group->SetRecentInstance(mapId, group->GetRecentInstanceOwner(mapId), humanMap->GetInstanceId());
+        map = humanMap;
+        newInstanceId = humanMap->GetInstanceId();
+    }
     else if (entry->IsDungeon())
     {
         Group* group = player->GetGroup();
         Difficulty difficulty = group ? group->GetDifficultyID(entry) : player->GetDifficultyID(entry);
         MapDb2Entries entries{ entry, sDB2Manager.GetDownscaledMapDifficultyData(mapId, difficulty) };
-        ObjectGuid instanceOwnerGuid = group ? group->GetRecentInstanceOwner(mapId) : player->GetGUID();
+        ObjectGuid instanceOwnerGuid = GetInstanceOwner(player, group, entries);
         InstanceLock* instanceLock = sInstanceLockMgr.FindActiveInstanceLock(instanceOwnerGuid, entries);
         if (instanceLock)
         {
@@ -328,12 +375,14 @@ uint32 MapManager::FindInstanceIdForPlayer(uint32 mapId, Player const* player) c
 
     if (entry->IsBattlegroundOrArena())
         return player->GetBattlegroundId();
+    else if (entry->IsDungeon() && FindGroupHumanInstance(player, mapId))
+        return FindGroupHumanInstance(player, mapId)->GetInstanceId();
     else if (entry->IsDungeon())
     {
         Group const* group = player->GetGroup();
         Difficulty difficulty = group ? group->GetDifficultyID(entry) : player->GetDifficultyID(entry);
         MapDb2Entries entries{ entry, sDB2Manager.GetDownscaledMapDifficultyData(mapId, difficulty) };
-        ObjectGuid instanceOwnerGuid = group ? group->GetRecentInstanceOwner(mapId) : player->GetGUID();
+        ObjectGuid instanceOwnerGuid = GetInstanceOwner(player, group, entries);
         InstanceLock* instanceLock = sInstanceLockMgr.FindActiveInstanceLock(instanceOwnerGuid, entries);
         uint32 newInstanceId = 0;
         if (instanceLock)

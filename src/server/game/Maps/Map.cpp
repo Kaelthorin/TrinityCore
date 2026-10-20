@@ -2935,6 +2935,11 @@ InstanceMap::InstanceMap(uint32 id, time_t expiry, uint32 InstanceId, Difficulty
     {
         i_instanceLock->SetInUse(true);
         i_instanceExpireEvent = i_instanceLock->GetExpiryTime(); // ignore extension state for reset event (will ask players to accept extended save on expiration)
+        // an extended lock that has run out is still handed to the map (FindActiveInstanceLock keeps it): its expiry lies in
+        // the past, so the event would fire on the first update and tell everyone inside that their lock "has expired" the
+        // moment they enter. The instance lives until the next reset, as a fresh one would.
+        if (i_instanceLock->IsExpired())
+            i_instanceExpireEvent = sInstanceLockMgr.GetNextResetTime({ GetEntry(), GetMapDifficulty() });
     }
 }
 
@@ -2977,8 +2982,9 @@ TransferAbortParams InstanceMap::CannotEnter(Player* player)
         return TRANSFER_ABORT_MAX_PLAYERS;
     }
 
-    // cannot enter while an encounter is in progress (unless this is a relog, in which case it is permitted)
-    if (!player->IsLoading() && IsRaid() && GetInstanceScript() && GetInstanceScript()->IsEncounterInProgress())
+    // cannot enter while an encounter is in progress (unless this is a relog, in which case it is permitted); a companion bot is let in:
+    // its owner calls it to the fight (otherwise the whole companion group stays outside "encounter in progress" while the owner is inside)
+    if (!player->IsLoading() && !player->GetSession()->IsBot() && IsRaid() && GetInstanceScript() && GetInstanceScript()->IsEncounterInProgress())
         return TRANSFER_ABORT_ZONE_IN_COMBAT;
 
     if (i_instanceLock)
@@ -3005,13 +3011,16 @@ bool InstanceMap::AddPlayerToMap(Player* player, bool initPlayer /*= true*/)
     player->GetSession()->AddInstanceEnterTime(GetInstanceId(), GameTime::GetSystemTime());
 
     MapDb2Entries entries{ GetEntry(), GetMapDifficulty() };
-    if (entries.MapDifficulty->HasResetSchedule() && i_instanceLock && !i_instanceLock->IsNew() && i_data)
+    if (entries.MapDifficulty->HasResetSchedule() && i_instanceLock && !i_instanceLock->IsNew() && i_data && !player->GetSession()->IsBot())
     {
         if (!entries.MapDifficulty->IsUsingEncounterLocks())
         {
             InstanceLock const* playerLock = sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries);
-            if (!playerLock || (playerLock->IsExpired() && playerLock->IsExtended()) ||
-                playerLock->GetData()->CompletedEncountersMask != i_instanceLock->GetData()->CompletedEncountersMask)
+            // Instance.BindOnEntry saves the player as they enter (BindPlayerOnEntry) when they hold no active lock, or one that ran
+            // out (an expired lock that was not extended is not returned at all): no prompt then
+            bool const renewedOnEntry = (!playerLock || playerLock->IsExpired()) && IsRaid() && sWorld->getBoolConfig(CONFIG_INSTANCE_BIND_ON_ENTRY);
+            if (!renewedOnEntry && (!playerLock || (playerLock->IsExpired() && playerLock->IsExtended()) ||
+                playerLock->GetData()->CompletedEncountersMask != i_instanceLock->GetData()->CompletedEncountersMask))
             {
                 WorldPackets::Instance::PendingRaidLock pendingRaidLock;
                 pendingRaidLock.TimeUntilLock = 60000;
@@ -3093,7 +3102,13 @@ void InstanceMap::Update(uint32 t_diff)
     if (i_instanceExpireEvent && i_instanceExpireEvent < GameTime::GetSystemTime())
     {
         Reset(InstanceResetMethod::Expire);
-        i_instanceExpireEvent = sInstanceLockMgr.GetNextResetTime({ GetEntry(), GetMapDifficulty() });
+        // a difficulty without a reset schedule has no next reset in the future: fire once, not on every update
+        // (each firing tells every player inside that the lock expired and offers the extension again)
+        InstanceResetTimePoint const nextReset = sInstanceLockMgr.GetNextResetTime({ GetEntry(), GetMapDifficulty() });
+        if (nextReset > GameTime::GetSystemTime())
+            i_instanceExpireEvent = nextReset;
+        else
+            i_instanceExpireEvent.reset();
     }
 }
 
@@ -3256,6 +3271,17 @@ void InstanceMap::SetInstanceScenario(InstanceScenario* scenario)
     }
 }
 
+// A player whose active raid save names another instance of this map (a GM walks in regardless, see CannotEnter) keeps that save:
+// UpdateInstanceLockForPlayer asserts when handed a lock of a different instance.
+static bool HoldsLockOfOtherInstance(Player const* player, MapDb2Entries const& entries, uint32 instanceId)
+{
+    if (!entries.IsInstanceIdBound())
+        return false;
+
+    InstanceLock const* playerLock = sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries);
+    return playerLock && playerLock->GetInstanceId() != instanceId;
+}
+
 void InstanceMap::UpdateInstanceLock(UpdateBossStateSaveDataEvent const& updateSaveDataEvent)
 {
     if (i_instanceLock)
@@ -3273,8 +3299,13 @@ void InstanceMap::UpdateInstanceLock(UpdateBossStateSaveDataEvent const& updateS
         for (MapReference& mapReference : m_mapRefManager)
         {
             Player* player = mapReference.GetSource();
+            // bots follow their group's instance and never hold a raid save of their own (BindPlayerOnEntry skips them as well)
+            if (player->GetSession()->IsBot())
+                continue;
             // never instance bind GMs with GM mode enabled (Instance.BindOnEntry binds them: a GM owner with a bot raid is the only real player)
             if (player->IsGameMaster() && !sWorld->getBoolConfig(CONFIG_INSTANCE_BIND_ON_ENTRY))
+                continue;
+            if (HoldsLockOfOtherInstance(player, entries, GetInstanceId()))
                 continue;
 
             InstanceLock const* playerLock = sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries);
@@ -3326,8 +3357,13 @@ void InstanceMap::UpdateInstanceLock(UpdateAdditionalSaveDataEvent const& update
         for (MapReference& mapReference : m_mapRefManager)
         {
             Player* player = mapReference.GetSource();
+            // bots never hold a raid save (see above)
+            if (player->GetSession()->IsBot())
+                continue;
             // never instance bind GMs with GM mode enabled (Instance.BindOnEntry binds them, see above)
             if (player->IsGameMaster() && !sWorld->getBoolConfig(CONFIG_INSTANCE_BIND_ON_ENTRY))
+                continue;
+            if (HoldsLockOfOtherInstance(player, entries, GetInstanceId()))
                 continue;
 
             InstanceLock const* playerLock = sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries);
@@ -3359,7 +3395,14 @@ void InstanceMap::UpdateInstanceLock(UpdateAdditionalSaveDataEvent const& update
 
 void InstanceMap::CreateInstanceLockForPlayer(Player* player)
 {
+    // bots never hold a raid save: a pending bind that confirms after the entry would give each its own instance
+    if (player->GetSession()->IsBot())
+        return;
+
     MapDb2Entries entries{ GetEntry(), GetMapDifficulty() };
+    if (HoldsLockOfOtherInstance(player, entries, GetInstanceId()))
+        return;
+
     InstanceLock const* playerLock = sInstanceLockMgr.FindActiveInstanceLock(player->GetGUID(), entries);
 
     bool isNewLock = !playerLock || playerLock->IsNew() || playerLock->IsExpired();
