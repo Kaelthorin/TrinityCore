@@ -2762,6 +2762,15 @@ void Module::OnPlayerLogin(Player* p)
     // Bots taught by an earlier build can carry other classes' trainer spells (a rogue with Judgement): drop them at login.
     if (uint32 const removed = ::Playerbot::API(p).purge_foreign_class_spells())
         TC_LOG_INFO("playerbot.v2", "[levelup] {} lost {} spells of other classes at login", p->GetName(), removed);
+    // Vanilla riding (Bot/World/RidingTier.h): none below 40, 75 and a normal mount from 40, 150 and the swift mount from 60. A bot made by an earlier build can hold
+    // more (150 at 40-59, riding and mounts under 40): one correction at login. The call changes nothing for a bot that is already right, so it is one-shot by itself.
+    if (::Playerbot::IsVanillaRealm())
+    {
+        uint32 const riding_before = p->GetSkillValue(SKILL_RIDING);
+        if (uint32 const changed = ::Playerbot::API(p).learn_riding_free())
+            TC_LOG_INFO("playerbot.v2", "[riding] {} L{} corrected at login: skill {} -> {}, {} change(s)", p->GetName(), uint32(p->GetLevel()), riding_before,
+                        uint32(p->GetSkillValue(SKILL_RIDING)), changed);
+    }
     // INFO-level so the operator can see which bots actually attached bot logic
     // when bringing up a fresh worldserver / spawning via .playerbot login.
     // The DEBUG history can be inspected via /history or /inspect later.

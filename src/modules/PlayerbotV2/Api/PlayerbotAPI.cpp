@@ -71,6 +71,8 @@
 #include "GossipDef.h"
 #include "QuestDef.h"
 #include "ObjectMgr.h"
+#include "Bot/ClassTables.h"   // IsVanillaRealm()
+#include "Bot/World/RidingTier.h"
 #include "DB2Stores.h"
 #include "ReputationMgr.h"
 #include "LFGMgr.h"
@@ -9383,9 +9385,35 @@ bool API::RaceMountSpells(uint8 race, uint32& normal, uint32& swift)
 
 uint32 API::learn_riding_free()
 {
-    if (!p_ || p_->GetLevel() < 40) return 0;
+    if (!p_) return 0;
     uint32 changed = 0;
-    uint16 const target = p_->GetLevel() >= 60 ? 150 : 75;
+    ::Playerbot::V2::World::RidingFix const fix = ::Playerbot::V2::World::PlanRiding(p_->GetLevel(), p_->GetSkillValue(SKILL_RIDING));
+    // Below level 40 a bot has no riding and no mount (a bot of an earlier build, or a retail trainer pass, may have both).
+    if (fix.strip_mounts)
+    {
+        if (!::Playerbot::IsVanillaRealm())
+            return 0;
+        auto isMountSpell = [](SpellInfo const* info) { return info && info->HasAura(SPELL_AURA_MOUNTED); };
+        std::vector<uint32> doomed;
+        for (auto const& [spellId, spell] : p_->GetSpellMap())
+            if (spell.state != PLAYERSPELL_REMOVED && (isMountSpell(sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE)) ||
+                spellId == 33388u || spellId == 33391u || spellId == 34090u || spellId == 34091u || spellId == 90265u))   // Apprentice to Master Riding
+                doomed.push_back(spellId);
+        if (!doomed.empty())
+            p_->RemoveAurasByType(SPELL_AURA_MOUNTED);
+        for (uint32 spellId : doomed)
+        {
+            p_->RemoveSpell(spellId, false, false);
+            ++changed;
+        }
+        if (p_->HasSkill(SKILL_RIDING))
+        {
+            p_->SetSkill(SKILL_RIDING, 0, 0, 0);
+            ++changed;
+        }
+        return changed;
+    }
+    uint16 const target = fix.skill;
     // A bot a retail trainer pass raised past its level's tier (Journeyman at 40) goes back to the vanilla tier, tier spells included.
     if (p_->GetSkillValue(SKILL_RIDING) > target)
     {
