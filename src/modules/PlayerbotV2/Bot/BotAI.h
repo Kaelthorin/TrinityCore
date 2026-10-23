@@ -5242,7 +5242,24 @@ private:
         uint8  strikes = 0;
     };
     std::array<BadGoal, 6> bad_goals_{};
+    uint32 anchor_seen_ms_ = 0, anchor_move_ms_ = 0;
+    float  anchor_x_ = 0.f, anchor_y_ = 0.f;
 public:
+    // Whether the follow anchor (leader or owner) has moved in the last second, seen from successive ticks. A follower that waits for the
+    // full recall slack (13-15 yd for a caster) before it starts runs 2-4 s behind a leader who sets off; while he moves it starts at the
+    // follow distance instead.
+    bool anchor_moving(float x, float y, uint32 now_ms)
+    {
+        if (anchor_seen_ms_ == 0 || now_ms - anchor_seen_ms_ > 3000u)
+        {
+            anchor_x_ = x; anchor_y_ = y; anchor_seen_ms_ = now_ms; anchor_move_ms_ = 0;
+            return false;
+        }
+        const float dx = x - anchor_x_, dy = y - anchor_y_;
+        if (dx * dx + dy * dy > 1.0f) { anchor_move_ms_ = now_ms; anchor_x_ = x; anchor_y_ = y; }
+        anchor_seen_ms_ = now_ms;
+        return anchor_move_ms_ != 0 && now_ms - anchor_move_ms_ < 1000u;
+    }
     void   note_path_blocked(uint32 now_ms)
     {
         ++path_blocked_count_;

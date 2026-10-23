@@ -1,4 +1,4 @@
-﻿// State_InGroup - Cross-cutting layer that runs alongside the primary state
+// State_InGroup - Cross-cutting layer that runs alongside the primary state
 // whenever the bot is grouped. Today: keep within follow distance of the
 // leader when idle. Future: ready-checks, raid mark targeting, role hand-off.
 
@@ -1257,6 +1257,9 @@ void DispatchInGroup(BotAI& ai,
     // re-issued when the slot has moved more than 2 y from the last one (500 ms apart at most), a bot stops within
     // 1.5 y of the slot and restarts only beyond 2.5 y (no jitter), and a bot that makes no progress for 3 s falls
     // back to the plain follow behind the owner for 8 s.
+    // While the anchor is on the move a follower starts at its follow distance (+1.5 yd), not at the full recall slack; a standing
+    // anchor keeps the wide slack, so nobody shuffles about at a halt.
+    const bool anchor_on_the_move = ai.anchor_moving(anchor->x, anchor->y, snapshot.published_at_ms());
     if (formation_slot_active)
     {
         auto& ft = ai.formation_track();
@@ -1288,6 +1291,18 @@ void DispatchInGroup(BotAI& ai,
                     emit.follow(anchor->guid, plain.distance, plain.angle_radians);
                     ai.set_last_rule_fired("ingroup:formation_fallback");
                     action = 3;
+                }
+                else if (anchor_on_the_move)
+                {
+                    // The owner is walking: the follow generator keeps the bot at its slot's distance and angle and re-aims every update, which
+                    // starts the moment the owner does. Walking to the slot as it stood at the last issue (a point the owner has left by
+                    // the time the bot gets there, re-issued at most every 500 ms and only after the slot moved 2 y) left the circle trailing
+                    // far behind a walking owner. The slot walk settles the bots once the owner halts.
+                    ft.dest_valid = false;
+                    ft.last_progress_ms = formation_now_ms;
+                    emit.follow(anchor->guid, formation_offset.distance, formation_offset.angle_radians);
+                    ai.set_last_rule_fired("ingroup:formation_follow");
+                    action = 1;
                 }
                 else
                 {
@@ -1341,8 +1356,9 @@ void DispatchInGroup(BotAI& ai,
     else if (!formation_fallback && ai.formation_track().dest_valid)
         ai.formation_track().dest_valid = false;
 
+    const float recall_now = anchor_on_the_move ? std::min(kRecallSlack, std::max(kFollowDistance + 1.5f, 5.0f)) : kRecallSlack;
     if (!formation_slot_active && !movement_owned_elsewhere &&
-        (dist > kRecallSlack || (refollow && dist > 1.5f)))
+        (dist > recall_now || (refollow && dist > 1.5f)))
     {
         // Follow uses MotionMaster MoveFollow, which silently re-emits forever
         // when the leader is unreachable (across a gap / closed door) — and
