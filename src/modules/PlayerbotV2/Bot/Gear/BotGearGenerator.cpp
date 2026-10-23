@@ -678,9 +678,11 @@ uint32 PickThrownWeapon(Player const* wearer)
     if (!g_initialized || !wearer || wearer->GetClass() >= MAX_CLASSES) return 0;
     uint8 const level = wearer->GetLevel();
     ItemTemplate const* best = nullptr;
+    // A thrown weapon whose display is the generic 1.60 one is drawn by the client as a white box with blue dots:
+    // a weapon with its own display goes first, whatever its level.
     auto key = [&](ItemTemplate const* t)
     {
-        return std::tuple<uint32, uint32, int32, uint32>(t->GetBaseRequiredLevel(), uint32(t->GetQuality()),
+        return std::tuple<bool, uint32, uint32, int32, uint32>(Player::HasDrawableAmmoDisplay(t), t->GetBaseRequiredLevel(), uint32(t->GetQuality()),
             ::Playerbot::Gear::EffectiveItemLevelForLevel(t, level), ~t->GetId());
     };
     for (ItemTemplate const* tpl : g_pools[wearer->GetClass()].slots[EQUIPMENT_SLOT_RANGED])
