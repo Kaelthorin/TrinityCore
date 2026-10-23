@@ -3162,7 +3162,19 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         p_->GetMotionMaster()->MoveChase(tu, ChaseRange(0.0f, max_chase));
     }
     else
+    {
+        if (tu->IsCreature() && !tu->IsInCombat() && !tu->GetVictim() && p_->GetGroup() && p_->GetMap()->Instanceable() &&
+            !::Playerbot::IsTankSpec(p_->GetClass(), uint16(::Playerbot::Classic::EffectiveSpecId(p_))))
+        {
+            // A melee bot does not run at an idle mob while a tank of its group is on the map: the pull is the tank's, and the bot takes the mob
+            // once someone has it (the chase below starts then). Without this a rogue chased an idle Veteran 38 y up a ramp alone.
+            for (GroupReference const& itr : p_->GetGroup()->GetMembers())
+                if (Player const* m = itr.GetSource(); m && m != p_ && m->IsAlive() && m->GetMapId() == p_->GetMapId() &&
+                    ::Playerbot::IsTankSpec(m->GetClass(), uint16(::Playerbot::Classic::EffectiveSpecId(m))))
+                    return Result::Ok;
+        }
         p_->GetMotionMaster()->MoveChase(tu);
+    }
     return Result::Ok;
 }
 
