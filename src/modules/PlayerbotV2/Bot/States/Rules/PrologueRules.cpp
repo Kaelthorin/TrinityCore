@@ -1257,6 +1257,11 @@ bool OwnerUseFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     }
     emit.use_game_object(o.go);
     ai.end_owner_use();
+    // The Stay the command set keeps the follow from walking the bot off the object while the ritual runs; it does not outlive it. The 30 min
+    // hold pinned a rogue on the altar floor while the group fought Pyroguard Emberseer ("combat:melee_hold_hazard" with no
+    // hazard in the log: the Stay, with the boss on a tank, blocks the melee chase). It ends when the bot's fight starts (DispatchInCombat); two minutes is only the backstop.
+    ai.enter_manual(BotAI::OwnerCommand::Stay, ObjectGuid::Empty, now_ms, 120000u);
+    ai.set_use_stay();
     TC_LOG_INFO("playerbot.v2", "[owner_use] {} uses object {} at {:.1f}y", s.name(), o.go.GetCounter(), d);
     ai.set_last_rule_fired("idle:owner_use");
     return true;

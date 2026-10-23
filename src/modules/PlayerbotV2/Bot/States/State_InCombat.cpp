@@ -1,4 +1,4 @@
-﻿// State_InCombat - Combat dispatch. Looks up the (class, spec) APL from the
+// State_InCombat - Combat dispatch. Looks up the (class, spec) APL from the
 // rotation registry and runs it. If no rotation is registered, the bot just
 // engages auto-attack on its current target — never freezes.
 
@@ -1689,6 +1689,14 @@ void DispatchInCombat(BotAI& ai,
     // Reports a damage bot that ends this tick with nothing to do ([dps_idle_reason]).
     CombatIdleProbe const idle_probe{ ai, snapshot, emit, emit.combat_action_count(), ai.rule_fire_seq() };
     ReFaceVictim(snapshot, emit);
+    // The Stay left by a "use <object>" ends with the fight: the bot is in the group's combat now and must fight (a rogue
+    // pinned by the altar's Stay stood idle through the Emberseer fight).
+    if (ai.use_stay())
+    {
+        ai.clear_use_stay();
+        if (ai.holding_position(snapshot.published_at_ms()))
+            ai.exit_manual();
+    }
     ApPredicateContext ctx{ snapshot, group, ai.aoe_preference(), {} };
     // PvP context — populated for BG/arena ticks. Default-constructed is
     // PvE-mode (all false / empty); PvP-aware predicates gate on
@@ -3514,7 +3522,7 @@ void DispatchInCombat(BotAI& ai,
             // we close distance. Past the cap → drop the chase to free the
             // bot from terrain-induced infinite gap-close loops.
             if (chase_blocked)
-                ai.set_last_rule_fired("combat:melee_hold_hazard");
+                ai.set_last_rule_fired(HeldByOwner(ai, snapshot) ? "combat:melee_hold_stay" : "combat:melee_hold_hazard");
             else if (d2 > kMeleeRange * kMeleeRange && vu->is_fleeing && snapshot.is_in_dungeon() && d2 > kFleeLeashYd * kFleeLeashYd)
             {
                 // A mob running for help is not chased (Deadmines 2026-10-13: the tank followed a fleeing Miner into the next

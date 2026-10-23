@@ -600,7 +600,13 @@ public:
         orders_.target   = target;
         orders_.until_ms = now_ms + (ttl_ms == 0 ? 30000u : ttl_ms);
         orders_.last_ms  = now_ms;
+        use_stay_.store(false, std::memory_order_relaxed);   // any new order replaces the use's Stay
     }
+    // The Stay a "use <object>" leaves after the use: ends when the bot's fight starts (DispatchInCombat), a two-minute backstop otherwise.
+    // Set by the use rule after its enter_manual, cleared by every enter_manual.
+    void set_use_stay() { use_stay_.store(true, std::memory_order_relaxed); }
+    bool use_stay() const { return use_stay_.load(std::memory_order_relaxed); }
+    void clear_use_stay() { use_stay_.store(false, std::memory_order_relaxed); }
 
     // Owner said stay/hold: the bot keeps its spot and must not be pulled back into a follow.
     bool holding_position(uint32 now_ms) const
@@ -3294,6 +3300,7 @@ private:
     PullBackPlan       pull_back_plan_;
     std::atomic<bool>  pull_back_active_{false};
     OwnerUseOrder      owner_use_;
+    std::atomic<bool>  use_stay_{false};
     std::atomic<bool>  owner_use_active_{false};
     mutable std::mutex manual_travel_mtx_;   // guards manual_travel_ (parser writes / builder reads+clears, cross-thread)
     bool   travel_force_graph_ = false;
