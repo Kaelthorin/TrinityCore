@@ -22,6 +22,7 @@
 #include "../Bot/BotIntent.h"
 #include "../Bot/BotAI.h"        // BotAI::ActionKind for per-bot rebalance lockout
 #include "../Bot/BotRegistry.h"  // walking online bot AIs
+#include "../Bot/BotTextMgr.h"   // BotChatter::SayGoodbye (a released companion)
 #include "../Bot/ClassTables.h"  // IsTankSpec / TankSpecForClass etc.
 #include "../Bot/Formation.h"   // companion slots
 #include "../Bot/World/HunterPetsByRace.h"   // companion hunter pet
@@ -513,6 +514,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     const uint32 slow_pipelines_ms = getMSTimeDiff(t_pipelines_start, getMSTime());
     { SLOW_CALL("DrainCompanionSetups"); DrainCompanionSetups(); }
     DrainBringChecks();
+    DrainCompanionReleases();
     WarnOversizedInstanceGroups(now_ms);
     // `.bot delete` companions waiting to leave the world.
     DrainCompanionDeletes();
@@ -1169,6 +1171,28 @@ void BotPopulationManager::GrantCompanionStarterPet(BotId id, Player* p)
 void BotPopulationManager::QueueCompanionSetup(BotId bot, uint64 owner_guid_low, uint8 role)
 {
     pending_companions_[bot] = PendingCompanion{ owner_guid_low, role, getMSTime() };
+}
+
+void BotPopulationManager::DrainCompanionReleases()
+{
+    if (pending_releases_.empty())
+        return;
+    std::vector<uint64> const ids = std::move(pending_releases_);
+    pending_releases_.clear();
+    for (uint64 const id : ids)
+    {
+        ObjectGuid const guid = ObjectGuid::Create<HighGuid::Player>(id);
+        Player* bot = ObjectAccessor::FindConnectedPlayer(guid);
+        if (!bot || !bot->IsInWorld())
+            continue;
+        // Back in a group already (the owner invited it again in the same moment): it stays.
+        if (Group const* g = bot->GetGroup())
+            if (!g->isBGGroup() && !g->isBFGroup())
+                continue;
+        if (Player* owner = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(Services::Owners().GetOwner(id).player_guid)))
+            BotChatter::SayGoodbye(bot, owner);
+        Services::SessionMgr().LogoutBot(guid);
+    }
 }
 
 void BotPopulationManager::QueueCompanionDelete(BotId bot)

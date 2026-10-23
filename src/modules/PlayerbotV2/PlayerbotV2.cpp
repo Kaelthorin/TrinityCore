@@ -1,4 +1,4 @@
-﻿// Playerbot V2 - Module entry implementation
+// Playerbot V2 - Module entry implementation
 // All TrinityCore hook surfaces from PlayerbotV2.h are wired here. Some carry
 // dispatch (login/logout register the bot; OnDeath taps loot; DamageTaken /
 // HealReceived push event-bus entries; Whisper routes through the command
@@ -82,6 +82,8 @@
 #include "World/WorldMetadata.h"
 #include "Fleet/BotIdentityRegistry.h"
 #include "Fleet/OwnerRegistry.h"
+#include "Bot/GroupControl.h"
+#include "CharacterCache.h"
 #include "Bot/BotAI.h"
 #include "Bot/DeathHotspots.h"
 #include "Bot/BotSnapshotView.h"
@@ -3147,6 +3149,32 @@ void Module::OnItemLooted(Player* p, uint32 item_id)
 {
     if (!initialized_ || !p || !p->GetSession() || !p->GetSession()->IsBot()) return;
     BotChatter::OnItemLooted(p, item_id);
+}
+
+void Module::OnGroupMemberRemoved(Group* group, ObjectGuid member, uint8 method, ObjectGuid kicker)
+{
+    // An owned companion the owner removes from the group (or that leaves it) keeps following its owner for as long as the owner binding
+    // stands (it kept following its owner after the uninvite). It is let go like a dismissal: a goodbye and a logout; the owner and the
+    // saved mark stay, so `.bot call` brings it back. Plain conversions, an owner going offline and map changes never reach this hook.
+    if (!initialized_ || !group || !member.IsPlayer() || !Services::Registry().has(member.GetCounter()))
+        return;
+    auto const owner = Services::Owners().GetOwner(member.GetCounter());
+    if (owner.account_id == 0)
+        return;
+    Player const* bot = ObjectAccessor::FindConnectedPlayer(member);
+    bool const logging_out = !bot || !bot->IsInWorld() || !bot->GetSession() || bot->GetSession()->PlayerLogout();
+    Player const* remover = kicker.IsEmpty() ? nullptr : ObjectAccessor::FindConnectedPlayer(kicker);
+    bool const by_owner = remover && remover->GetSession() && !remover->GetSession()->IsBot() &&
+                          remover->GetSession()->GetAccountId() == owner.account_id;
+    if (!GroupControl::ReleaseCompanionOnRemoval(method, group->isBGGroup() || group->isBFGroup(), by_owner, logging_out))
+        return;
+    std::string owner_name;
+    if (by_owner)
+        owner_name = remover->GetName();
+    else if (owner.player_guid)
+        sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(owner.player_guid), owner_name);
+    TC_LOG_INFO("playerbot.v2", "[companion] {} released: removed from {}'s group", bot->GetName(), owner_name.empty() ? std::string("its owner") : owner_name);
+    Services::Population().QueueCompanionRelease(member.GetCounter());
 }
 
 void Module::OnRaidSubgroupChanged(Group* group, ObjectGuid member, uint8 subgroup)

@@ -48,4 +48,16 @@ inline bool AggressiveMayAttack(float mob_to_controller, float radius)
     return mob_to_controller <= radius;
 }
 
+// A companion leaves its owner for good when the owner removes it from the group (a kick) or it leaves on its own, and it is let go like a
+// dismissal. Not a battleground group (its bots come and go with the match), not a bot that is logging out, not an internal removal
+// (method 0, e.g. a regroup) and not a kick by anyone but the owner. `method` is the core's RemoveMethod: 0 default, 1 kick, 2 leave, 3 LFG kick.
+inline bool ReleaseCompanionOnRemoval(unsigned method, bool bg_group, bool kicked_by_owner, bool logging_out)
+{
+    if (bg_group || logging_out)
+        return false;
+    if (method == 1)
+        return kicked_by_owner;
+    return method == 2;
+}
+
 }  // namespace Playerbot::GroupControl

@@ -315,6 +315,12 @@ public:
     {
         Module::instance().OnRaidSubgroupChanged(group, guid, subgroup);
     }
+
+    // Before the member is taken out: an owner who removes a companion (or a companion that leaves) lets it go.
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod method, ObjectGuid kicker, char const* /*reason*/) override
+    {
+        Module::instance().OnGroupMemberRemoved(group, guid, uint8(method), kicker);
+    }
 };
 
 class playerbot_v2_guild : public GuildScript

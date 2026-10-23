@@ -171,6 +171,8 @@ public:
     // `.bot delete`: the companion's character is deleted for good once it has left the world (the caller logs it
     // out first). Given up, with a log line, if it is still in the world a minute later. World thread only.
     void QueueCompanionDelete(BotId bot);
+    // The owner removed this companion from the group (or it left): let go like `.bot dismiss` (goodbye, logout) on the next tick.
+    void QueueCompanionRelease(BotId bot) { pending_releases_.push_back(bot); }
 
     // One bot's step of RunGearBackfill (also RegearNow). Increments regear_count when the bot is processed.
     void BackfillOne(BotId id, Player* p, uint32 now_ms, uint32& regear_count, bool ignore_cooldown);
@@ -201,6 +203,9 @@ public:
     void DrainBringChecks();
     void FinishCompanionSetup(Player* bot, Player* owner, uint8 role);
     std::unordered_map<uint64, uint32> pending_deletes_;   // bot -> queued at (getMSTime)
+    // Companions their owner removed from the group: let go like a dismissal on the next tick (said goodbye to, logged out).
+    std::vector<uint64> pending_releases_;
+    void DrainCompanionReleases();
     void DrainCompanionDeletes();
 
     // Bots found wearing unrenderable gear while in combat, awaiting an
