@@ -102,3 +102,12 @@ The `.bot` commands for your own bots (add, call, dismiss, save, list, regear an
 Key bindings (0.2.2): Esc > Options > Key Bindings > AddOns > "WoW Forever Bots". Unbound by default; one entry each for Attack, Pull, Pull back, Follow, Stay, Resume, Stop attacking, Flee, Come, Fall back, Toggle stance and Show / hide the bot window. The order keys send the same line as the window buttons and work in combat.
 
 Attack (mouseover) key: hover a mob and press it; the mob becomes your target and the bots attack it. Group pings (the ping wheel, if your client has one): an Attack ping on an enemy sends the bots in, an On my way ping on the ground sends them there. Needs a server with the ping hooks.
+
+## 0.5.1 window
+
+Built on the client's own portrait window (the one its Raid and Looking For Group windows use): centred title, group icon in the portrait slot, dark inner panel, the client's own red buttons, fonts, and square icon tabs down the right edge (Orders, Bots, Form, Marks; hover for the name). Bots tab: class icons, then round role icons (shield, plus, sword) for the roles that class can do; click one to add that bot. A footer shows the group and stance with Call saved and Dismiss all. If the client has no such template the window falls back to a plain dialog frame with the same contents. The only own art is the minimap emblem (`Textures/mono_fb64.tga`); buttons are the Raid Info button template, role icons use the client's LFG art with its check box, switches are client check boxes, mark slots are the client's action-slot frame.
+
+- `/fb scale <0.7-1.5>` sets the window size (default 1.2, saved).
+- `/fb minimap on|off|reset` shows, hides or re-centres the minimap button.
+- `/fb quick` adds a tank, a healer and three damage dealers; `/fb resume` and `/fb flee` send those two orders.
+- When the client blocks an add-on call, one chat line names the add-on and the call.
