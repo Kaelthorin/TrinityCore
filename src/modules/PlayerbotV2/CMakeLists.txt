@@ -219,8 +219,9 @@ set(PLAYERBOT_V2_SUBLIBS
   playerbot-v2-api
   playerbot-v2-core
 )
-if(MSVC)
-  target_link_libraries(playerbot-v2 INTERFACE ${PLAYERBOT_V2_SUBLIBS})
+if(MSVC OR APPLE)
+  # Apple's ld64 also searches every archive until all symbols resolve, and CMake has no RESCAN link group for it
+  target_link_libraries(playerbot-v2 INTERFACE ${PLAYERBOT_V2_SUBLIBS} game)
 else()
   # game calls the module through PlayerbotHooks and the module calls back into game (PlayerbotAPI.cpp, ClassicSpec.cpp,
   # BotItemScorer.cpp), so game belongs in the same group; otherwise an executor that lists game before this
