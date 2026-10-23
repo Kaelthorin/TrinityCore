@@ -47,6 +47,7 @@
 #include "Combat/Apl/ApClassicHeal.h"   // MaintainOocHeal: Classic heal target + downranking
 #include "Combat/Apl/ApInterrupt.h"     // MaintainPet: Classic warlock pet choice
 #include "ClassicSpec.h"                // Classic::IsSingleSpecClass
+#include "Bot/DrinkSayRule.h"
 #include "Bot/ClassicUpkeep.h"          // MaintainOocFood: Classic::SafeToRecover / PickRecovery
 #include "Bot/ThreatDiscipline.h"       // RaidLogDue: [raid_pull] decision log pacing
 #include "Bot/Raid/RaidEncounters.h"    // RulesForMap: the raid layer owns cone avoidance on its maps
@@ -12020,6 +12021,8 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (dpick.item && !s.is_moving())
                 {
                     emit.emit(UseItemByEntryIntent{dpick.item, ObjectGuid::Empty});
+                    if (dpick.drink)
+                        Classic::SayDrinkingIfDue(s, ai, emit, now_ms);
                     ai.set_last_rule_fired("idle:dungeon_healer_drink");
                     if (ai.tank_diag_due(now_ms))
                         TC_LOG_INFO("playerbot.v2", "[healer_drink] {} drinks item {} at mana {}%", s.name(), dpick.item, s.power_pct(POWER_MANA));

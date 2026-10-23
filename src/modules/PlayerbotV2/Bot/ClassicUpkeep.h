@@ -326,6 +326,7 @@ struct RecoveryPick
 {
     uint32 item = 0;     // food / drink to use now
     bool   hold = false; // already eating / drinking: stay seated
+    bool   drink = false; // `item` is a drink (it may be announced in party chat, Bot/DrinkSay.h)
 };
 RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_mana);
 
@@ -399,8 +400,9 @@ uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g =
 constexpr int32 kCombatHealthItemPct = 30;
 // Mana % at or below which a group healer in a boss fight uses a mana item.
 constexpr int32 kBossHealerManaItemPct = 35;
-// ... and the mana % above which it does not even look: from here down an item is used as soon as its restore fits in the missing mana.
-constexpr int32 kHealerManaItemCeilingPct = 85;
+// ... and the mana % above which it does not even look. The items are on a 2-minute cooldown: spent at 71-81 % they were on cooldown
+// when the bar ran dry 80 s later, so a healer uses one only when mana is low.
+constexpr int32 kHealerManaItemCeilingPct = 30;
 
 // ======================= Boss fights (major cooldowns) =======================
 // A boss by its creature data: the dungeon-boss flag or the world-boss rank

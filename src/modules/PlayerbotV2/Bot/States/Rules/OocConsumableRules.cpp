@@ -20,6 +20,7 @@
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotIntent.h"
 #include "Bot/ClassicUpkeep.h"
+#include "Bot/DrinkSayRule.h"
 #include "Bot/States/MaintainHelpers.h"   // States::DungeonLootRoll
 #include "SharedDefines.h"
 #include "RaceMask.h"        // RACE_UNDEAD_PLAYER
@@ -245,6 +246,8 @@ bool OocEatFoodFire(BotSnapshotView const& s, BotAI& ai,
     if (pick.item)
     {
         emit.emit(UseItemByEntryIntent{pick.item, s.raw().guid});
+        if (pick.drink)
+            Classic::SayDrinkingIfDue(s, ai, emit, now_ms);
         ai.set_last_rule_fired("idle:ooc_eat_food");
         return true;
     }

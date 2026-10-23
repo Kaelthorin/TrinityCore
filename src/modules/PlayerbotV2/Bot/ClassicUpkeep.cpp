@@ -1211,7 +1211,7 @@ RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_
             return { food, false };
     if (!drinking && mana_user && mana < start_mana)
         if (uint32 const drink = BestConsumable(s, ConsumableKind::Drink))
-            return { drink, false };
+            return { drink, false, true };
     // A grouped instance DPS (start_mana == kPullReadyDpsManaPct) sits only to 85%: the rest is minutes of waiting for the raid.
     int32 const top_mana = start_mana == kPullReadyDpsManaPct ? 85 : kTopOffPct;
     if ((eating && hp < kTopOffPct) || (drinking && mana < top_mana))
