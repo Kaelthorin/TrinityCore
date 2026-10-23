@@ -2292,7 +2292,7 @@ static NearbyUnit const* UnpulledPackReaching(BotSnapshotView const& s, DungeonA
 // an unpulled mob's aggro reach + kPackAggroMargin than the bot itself stands
 // (any idle mob this bot sees, line of sight or not). A bot already on a
 // pack's edge may still step along or away from it; it never steps further in.
-bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z)
+bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float z, bool exempt_victim_pack)
 {
     // Raid and 5-man alike (playtest, Deadmines 2026-10-10: a mage / warlock that was hit ran, and the run took it into the next
     // pack, which pulled too).
@@ -2300,7 +2300,7 @@ bool RaidPointInUnpulledReach(BotSnapshotView const& s, float x, float y, float 
     const uint32 now_ms = s.published_at_ms();
     float pd = 0.f, pr = 0.f;
     NearbyUnit const* engaged = nullptr;
-    if (!s.victim().IsEmpty())
+    if (exempt_victim_pack && !s.victim().IsEmpty())
         for (auto const& e : s.raw().combat.nearby_enemies)
             if (e.guid == s.victim() && e.hp > 0) { engaged = &e; break; }
     NearbyUnit const* pack = UnpulledPackReaching(s, nullptr, x, y, z, 0.0f, /*need_los=*/false, nullptr, now_ms, &pd, &pr, engaged);

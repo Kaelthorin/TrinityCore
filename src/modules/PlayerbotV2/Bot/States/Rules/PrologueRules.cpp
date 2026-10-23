@@ -394,12 +394,23 @@ bool OpenerFire(BotSnapshotView const& s, BotAI& ai,
         {
             const float dist = std::sqrt(dsq);
             const float step = std::min(10.0f, dist);
-            emit.move_to(bx + dx / dist * step,
-                         by + dy / dist * step,
-                         bz, /*run*/ true);
-            ai.reset_cast_oor();
-            ai.set_last_rule_fired("combat:opener_approach");
-            return true;
+            // A caster or healer is not walked into an idle pack's reach for a line of sight or a range it can find from here: the
+            // owner's Attack on a mob up a ramp took two casters up it, and the Dragonspawn beside the target came with them (line-of-sight
+            // failures on the first casts, then 10 y approach steps toward the unpulled pack). The pack of the target itself counts. The rotation keeps trying from where it stands.
+            if (ai.effective_role(s) != Role::Tank && (IsRangedSpec(s.cls(), uint16(s.spec())) || IsHealerSpec(s.cls(), uint16(s.spec()))) &&
+                States::RaidPointInUnpulledReach(s, bx + dx / dist * step, by + dy / dist * step, bz, /*exempt_victim_pack*/ false))
+            {
+                ai.reset_cast_oor();   // no step: the rotation below retries from here, the stall timer bounds the wait
+            }
+            else
+            {
+                emit.move_to(bx + dx / dist * step,
+                             by + dy / dist * step,
+                             bz, /*run*/ true);
+                ai.reset_cast_oor();
+                ai.set_last_rule_fired("combat:opener_approach");
+                return true;
+            }
         }
         // Already adjacent yet OutOfRange — usually elevation/LoS; let
         // the APL retry and the stall timer above bound the loop.

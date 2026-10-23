@@ -3139,6 +3139,13 @@ Result API::start_attack(ObjectGuid target, uint8 avoid_school_mask)
         default:
             break;
     }
+    if (is_pure_caster && tu->IsCreature() && !tu->IsInCombat() && !tu->GetVictim() && p_->GetGroup() && p_->GetMap()->Instanceable())
+    {
+        // An idle mob in an instance: the core chase only ends with a line of sight, so a caster ordered at a mob up a ramp walked to the
+        // top, into the pack beside it. The opener's range / sight step (OpenerFire, which refuses a point in an idle pack's reach)
+        // takes the caster nearer instead.
+        return Result::Ok;
+    }
     if (is_pure_caster)
     {
         // MinRange=0 â never back-pedal. ChaseRange(min=5, max=28) had the
