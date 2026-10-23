@@ -1,4 +1,4 @@
-﻿#include "BotSnapshotView.h"
+#include "BotSnapshotView.h"
 #include "SpellMgr.h"
 #include "Log.h"
 #include "SpellInfo.h"
@@ -881,6 +881,7 @@ static bool BeyondHealerLeash(BotSnapshot const& s, float x, float y)
 // The nearer tank counts only while it can take the mob: within the pickup reach (an idle tank 40 y off was the "nearest", every
 // other idle tank deferred to it and a Firesworn stood 7 y from a tank on a healer for a minute).
 static constexpr float kOtherTankReachYd = 30.0f;
+static constexpr int   kDyingVictimPct   = 35;   // a loose mob on a member below this share of health is taken first
 
 static bool OtherTankTakesLoose(BotSnapshot const& s, NearbyUnit const& mob)
 {
@@ -979,11 +980,14 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
         if (d2 > er * er) continue;
         int prio = 0;
         // The victim's role from the bot's own friend sweep (the snapshot carries no group list; a victim outside the 12 closest friends
-        // reads as no preference). Cloth casters would need a class on NearbyUnit; only healers are preferred here.
+        // reads as no preference). Cloth casters would need a class on NearbyUnit; only healers are preferred here. A victim already
+        // below kDyingVictimPct comes before everyone: with more loose mobs than tanks the mob on the member about to die is the one
+        // to take (two mobs on a rogue at 5% health while both tanks took mobs on members at full health).
         for (NearbyUnit const& f : s.combat.nearby_friends)
             if (f.guid == e.victim)
             {
-                if (f.role == Role::Healer) prio = 1;
+                if (f.max_hp > 0 && f.hp * 100 < f.max_hp * kDyingVictimPct) prio = 2;
+                else if (f.role == Role::Healer) prio = 1;
                 break;
             }
         if (prio < best_prio || (prio == best_prio && d2 >= best_d2)) continue;
