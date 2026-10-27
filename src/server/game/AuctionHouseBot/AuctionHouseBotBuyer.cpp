@@ -85,6 +85,8 @@ bool AuctionBotBuyer::Update(AuctionHouseType houseType)
 
     BuyerConfiguration& config = _houseConfig[houseType];
     uint32 eligibleItems = GetItemInformation(config);
+    AuctionBotBuyerPolicy::NoteCycle(eligibleItems);
+    AuctionBotBuyerPolicy::LogCounters();
     if (eligibleItems)
     {
         // Prepare list of items to bid or buy - remove old items
@@ -351,12 +353,19 @@ void AuctionBotBuyer::BuyAndBidItems(BuyerConfiguration& config)
         }
 
         // never pay above the price cap (AuctionHouseBot.Buyer.MaxPriceMultiplier)
+        bool capped = false;
         if (uint64 cap = AuctionBotBuyerPolicy::MaxUnitPrice(auction))
         {
             if (AuctionBotBuyerPolicy::PerItemPrice(auction, auction->BuyoutOrUnitPrice) > cap)
+            {
+                capped = capped || successBuy;
                 successBuy = false;
+            }
             if (AuctionBotBuyerPolicy::PerItemPrice(auction, bidPrice) > cap)
+            {
+                capped = capped || successBid;
                 successBid = false;
+            }
         }
 
         // If roll bidding succesfully and bid price is above buyout -> buyout
@@ -370,9 +379,15 @@ void AuctionBotBuyer::BuyAndBidItems(BuyerConfiguration& config)
             AuctionBotBuyerPolicy::RecordBuy(auction, AuctionBotBuyerPolicy::TotalPrice(auction, auction->BuyoutOrUnitPrice),
                 AuctionBotConfig::GetHouseTypeName(config.GetHouseType()));
             BuyEntry(auction, auctionHouse); // buyout
+            AuctionBotBuyerPolicy::Note(AuctionBotBuyerPolicy::Outcome::Bought);
         }
         else if (successBid)
+        {
             PlaceBidToEntry(auction, auctionHouse, bidPrice); // bid
+            AuctionBotBuyerPolicy::Note(AuctionBotBuyerPolicy::Outcome::Bid);
+        }
+        else
+            AuctionBotBuyerPolicy::Note(capped ? AuctionBotBuyerPolicy::Outcome::OverCap : AuctionBotBuyerPolicy::Outcome::LostRoll);
 
         itr->second.LastChecked = now;
         --cycles;

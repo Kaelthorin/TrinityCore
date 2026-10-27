@@ -16,6 +16,7 @@
  */
 
 #include "AuctionHouseBotBuyerPolicy.h"
+#include "AuctionHouseBotVanilla.h"
 #include "AuctionHouseMgr.h"
 #include "Common.h"
 #include "Config.h"
@@ -48,6 +49,13 @@ namespace
     time_t _hourStart = 0;
     uint32 _boughtThisHour = 0;
 
+    struct Counters
+    {
+        uint32 fresh = 0, hourLimit = 0, dayLimit = 0, bought = 0, bid = 0, lostRoll = 0, overCap = 0;
+        uint32 cycles = 0, emptyCycles = 0;
+    } _counters;
+    time_t _countersLogged = 0;
+
     void RollWindows(time_t now)
     {
         if (!_dayStart || now - _dayStart >= DAY)
@@ -69,7 +77,8 @@ namespace
     {
         uint64 buy = proto->GetBuyPrice() / std::max<uint32>(1, proto->GetBuyCount());
         uint64 sell = uint64(proto->GetSellPrice()) * 4;
-        return std::max<uint64>({ buy, sell, SILVER });
+        // the seller's market value when AuctionHouseBot.Vanilla.ValueCurve is on, so the buyer pays what the bot asks
+        return std::max<uint64>({ buy, sell, AuctionBotVanilla::UnitValue(proto), SILVER });
     }
 }
 
@@ -96,14 +105,60 @@ bool Eligible(AuctionPosting const* auction)
     RollWindows(now);
 
     if (_maxBuysPerHour && _boughtThisHour >= _maxBuysPerHour)
+    {
+        Note(Outcome::SkippedHourLimit);
         return false;
+    }
     if (_dailyBudget && _spentToday >= _dailyBudget)
+    {
+        Note(Outcome::SkippedDayLimit);
         return false;
+    }
 
     // Leave new listings alone for a while; the delay differs per listing but never changes for one.
     uint32 const span = _maxDelay - _minDelay;
     uint32 const delay = _minDelay + (span ? (auction->Id * 2654435761u) % (span + 1) : 0);
-    return now - time_t(std::chrono::duration_cast<Seconds>(auction->StartTime.time_since_epoch()).count()) >= time_t(delay);
+    if (now - time_t(std::chrono::duration_cast<Seconds>(auction->StartTime.time_since_epoch()).count()) >= time_t(delay))
+        return true;
+    Note(Outcome::SkippedFresh);
+    return false;
+}
+
+void Note(Outcome outcome)
+{
+    switch (outcome)
+    {
+        case Outcome::SkippedFresh:     ++_counters.fresh; break;
+        case Outcome::SkippedHourLimit: ++_counters.hourLimit; break;
+        case Outcome::SkippedDayLimit:  ++_counters.dayLimit; break;
+        case Outcome::Bought:           ++_counters.bought; break;
+        case Outcome::Bid:              ++_counters.bid; break;
+        case Outcome::LostRoll:         ++_counters.lostRoll; break;
+        case Outcome::OverCap:          ++_counters.overCap; break;
+    }
+}
+
+void NoteCycle(uint32 eligible)
+{
+    ++_counters.cycles;
+    if (!eligible)
+        ++_counters.emptyCycles;
+}
+
+void LogCounters()
+{
+    time_t const now = GameTime::GetGameTime();
+    if (!_countersLogged)
+        _countersLogged = now;
+    if (now - _countersLogged < 10 * MINUTE)
+        return;
+    _countersLogged = now;
+
+    Counters const c = _counters;
+    _counters = Counters();
+    uint32 const fail = c.lostRoll + c.overCap;
+    TC_LOG_INFO("ahbot", "[ahbot] buyouts attempts={} ok={} fail={} (lost_roll={} over_cap={}) bids={} skipped(fresh={} hour_limit={} day_limit={}) cycles={} empty_cycles={}",
+        c.bought + c.bid + fail, c.bought, fail, c.lostRoll, c.overCap, c.bid, c.fresh, c.hourLimit, c.dayLimit, c.cycles, c.emptyCycles);
 }
 
 bool FairPricingEnabled()
@@ -161,7 +216,7 @@ void RecordBuy(AuctionPosting const* auction, uint64 totalPrice, char const* hou
     ++_boughtToday;
     ++_boughtThisHour;
 
-    TC_LOG_DEBUG("ahbot", "AHBot: buy {} x{} for {:.2f}g in {} (today: {} buys, {:.2f}g)",
+    TC_LOG_INFO("ahbot", "AHBot: buy {} x{} for {:.2f}g in {} (today: {} buys, {:.2f}g)",
         auction->Items[0]->GetTemplate()->GetName(sWorld->GetDefaultDbcLocale()), auction->GetTotalItemCount(),
         float(totalPrice) / float(GOLD), house, _boughtToday, float(_spentToday) / float(GOLD));
 }

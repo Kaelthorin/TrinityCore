@@ -3821,6 +3821,14 @@ AuctionHouseBot.Vanilla.Only = 0
 AuctionHouseBot.Vanilla.MaxReqLevel = 60
 AuctionHouseBot.Vanilla.MaxItemLevel = 100
 
+#    AuctionHouseBot.Vanilla.ValueCurve
+#       Description: Price bot listings (and the buyer's fair price) by item level squared x quality x class,
+#                    never below the vendor price. For client data whose loot-only goods carry a token vendor price.
+#       Default:     0 - (Disabled, vendor price)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Vanilla.ValueCurve = 0
+
 #
 #    AuctionHouseBot.Alliance.Items.Amount.Ratio
 #       Description: Enable/Disable (disabled if 0) the part of AHBot that puts items up for auction on Alliance AH
@@ -3900,6 +3908,14 @@ AuctionHouseBot.Items.Loot = 1
 #                    1 - (Enabled)
 
 AuctionHouseBot.Items.Misc = 0
+
+#    AuctionHouseBot.Items.Crafted
+#       Description: Include items made by a profession recipe even when no loot or vendor list has them
+#                    (only matters with AuctionHouseBot.Items.Misc = 0)
+#       Default:     0 - (Disabled)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Items.Crafted = 0
 
 #
 #    AuctionHouseBot.Bind.*
@@ -4089,6 +4105,14 @@ AuctionHouseBot.Class.Quest = 1
 AuctionHouseBot.Class.Key = 1
 AuctionHouseBot.Class.Misc = 5
 AuctionHouseBot.Class.Glyph = 3
+
+#    AuctionHouseBot.Class.WeightByPoolSize
+#       Description: Also weight each class's share of a quality by how many different items it has, so a
+#                    class with a handful of items (green bags, arrows) is not listed dozens of times each.
+#       Default:     0 - (Disabled, share by AuctionHouseBot.Class.* only)
+#                    1 - (Enabled)
+
+AuctionHouseBot.Class.WeightByPoolSize = 0
 
 #
 ###################################################################################################
