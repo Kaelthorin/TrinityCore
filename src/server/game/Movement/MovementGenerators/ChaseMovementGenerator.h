@@ -54,6 +54,7 @@ class ChaseMovementGenerator : public MovementGenerator, public AbstractFollower
         TimeTracker _rangeCheckTimer;
         bool _movingTowards = true;
         bool _mutualChase = true;
+        bool _throttleRepath = false;   // owner is a playerbot, or a pet / guardian of a player: see Update
 };
 
 #endif
