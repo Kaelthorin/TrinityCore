@@ -692,7 +692,10 @@ void Pet::Update(uint32 diff)
             // Classic 1.60: hunter pets slowly lose happiness, 1.5 times as fast in combat (VMaNGOS Pet::LooseHappiness)
             if (HasHappiness())
             {
-                if (m_happinessTimer > diff)
+                // A bot hunter has no client to feed its pet: the pet of a bot stays content.
+                if (Player const* owner = GetOwner(); owner && owner->GetSession() && owner->GetSession()->IsBot())
+                    SetPower(POWER_HAPPINESS, HAPPINESS_MAX);
+                else if (m_happinessTimer > diff)
                     m_happinessTimer -= diff;
                 else
                 {
