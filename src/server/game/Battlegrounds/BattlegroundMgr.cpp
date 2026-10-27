@@ -35,6 +35,7 @@
 #include "SharedDefines.h"
 #include "World.h"
 #include "WorldSession.h"
+#include <algorithm>
 
 bool BattlegroundTemplate::IsArena() const
 {
@@ -47,7 +48,8 @@ uint16 BattlegroundTemplate::GetMinPlayersPerTeam() const
     // topping the match up to 40 a side while it runs. Playerbot.Bg.Av.MinPlayersPerTeam (bot module config), 0 or unset = the table's value.
     if (BattlemasterEntry->ID == BATTLEGROUND_AV)
     {
-        uint32 const configured = uint32(sConfigMgr->GetIntDefault("Playerbot.Bg.Av.MinPlayersPerTeam", 0));
+        // Read once: this runs on every queue check. Changing it needs a restart.
+        static uint32 const configured = uint32(std::max(0, sConfigMgr->GetIntDefault("Playerbot.Bg.Av.MinPlayersPerTeam", 0)));
         if (configured > 0 && configured < BattlemasterEntry->MinPlayers)
             return uint16(configured);
     }

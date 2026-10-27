@@ -740,6 +740,7 @@ class TC_GAME_API Spell
         static bool CanIncreaseRangeByMovement(Unit const* unit);
 
         SpellRange GetMinMaxRange(bool strict) const;
+        static SpellRange CalcMinMaxRange(WorldObject const* caster, Unit const* target, bool corpseTarget, SpellInfo const* spellInfo, bool strict, Spell* spell = nullptr);
 
     protected:
         bool HasGlobalCooldown() const;

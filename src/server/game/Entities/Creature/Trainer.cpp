@@ -25,6 +25,7 @@
 #include "Player.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "StringFormat.h"
 #include "WorldSession.h"
 
 namespace Trainer
@@ -182,8 +183,17 @@ namespace Trainer
                 ++tally->spells;
             if (trainerSpell.ReqSkillLine)
             {
-                if (tally) ++tally->skill_line;
-                continue;
+                // A class skill line (a rogue's Poisons) is the class's own, not a profession: the bot holds it at the value its level gives
+                // (five per level, as a rogue's Poisons skill rises), and the poison ranks behind it open as at the trainer.
+                SkillLineEntry const* line = sSkillLineStore.LookupEntry(trainerSpell.ReqSkillLine);
+                if (!line || line->CategoryID != SKILL_CATEGORY_CLASS || !player->IsSpellFitByClassAndRace(trainerSpell.SpellId))
+                {
+                    if (tally) ++tally->skill_line;
+                    continue;
+                }
+                uint16 const wanted = uint16(std::min<uint32>(player->GetLevel() * 5, 300));
+                if (player->GetBaseSkillValue(trainerSpell.ReqSkillLine) < wanted)
+                    player->SetSkill(trainerSpell.ReqSkillLine, 0, wanted, 300);
             }
             if (BattlePets::BattlePetMgr::GetBattlePetSpeciesBySpell(trainerSpell.SpellId))
             {
@@ -224,6 +234,33 @@ namespace Trainer
             ++learned;
         }
         return learned;
+    }
+
+    std::string Trainer::DescribeFreeTeachRefusal(Player const* player, uint32 spellId) const
+    {
+        Spell const* trainerSpell = GetSpell(spellId);
+        if (!trainerSpell)
+            return "not on this trainer";
+        if (!(GetClassMask() & player->GetClassMask()))
+            return Trinity::StringFormat("trainer {} class mask {:#x} leaves the class out", _id, GetClassMask());
+        if (player->HasSpell(spellId))
+            return "known";
+        if (!player->IsSpellFitByClassAndRace(spellId))
+            return "IsSpellFitByClassAndRace refuses the spell";
+        if (trainerSpell->ReqSkillLine && player->GetBaseSkillValue(trainerSpell->ReqSkillLine) < trainerSpell->ReqSkillRank)
+        {
+            SkillLineEntry const* line = sSkillLineStore.LookupEntry(trainerSpell->ReqSkillLine);
+            return Trinity::StringFormat("skill line {} rank {} needed, player has {} ({})", trainerSpell->ReqSkillLine, trainerSpell->ReqSkillRank,
+                player->GetBaseSkillValue(trainerSpell->ReqSkillLine), line && line->CategoryID == SKILL_CATEGORY_CLASS ? "class line" : "other line");
+        }
+        for (int32 req : trainerSpell->ReqAbility)
+            if (req && !player->HasSpell(req))
+                return Trinity::StringFormat("needs spell {} first", req);
+        if (player->GetLevel() < trainerSpell->ReqLevel)
+            return Trinity::StringFormat("needs level {}", trainerSpell->ReqLevel);
+        if (BattlePets::BattlePetMgr::GetBattlePetSpeciesBySpell(spellId))
+            return "battle pet";
+        return "would be taught";
     }
 
     Spell const* Trainer::GetSpell(uint32 spellId) const

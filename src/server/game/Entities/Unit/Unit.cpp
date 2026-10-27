@@ -844,6 +844,11 @@ bool Unit::HasBreakableByDamageCrowdControlAura(Unit const* excludeCasterChannel
     return effects;
 }
 
+// Running totals of the rage a melee hit rewarded (the damage it was computed from and the power gained, in tenths of rage), read by the damage
+// parity run to log rage per hit against the formula.
+TC_GAME_API std::atomic<uint64> g_classicRageHitDamage(0);
+TC_GAME_API std::atomic<uint64> g_classicRageHitGained(0);
+
 /*static*/ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage const* cleanDamage, DamageEffectType damagetype, SpellSchoolMask damageSchoolMask, SpellInfo const* spellProto, bool durabilityLoss)
 {
     uint32 damageDone = damage;
@@ -2349,6 +2354,23 @@ void Unit::AttackerStateUpdate(Unit* victim, WeaponAttackType attType, bool extr
             // Send log damage message to client
             Unit::DealDamageMods(damageInfo.Attacker, victim, damageInfo.Damage, &damageInfo.Absorb);
 
+            {
+                uint8 outcome = HIT_OUTCOME_OTHER;
+                switch (damageInfo.HitOutCome)
+                {
+                    case MELEE_HIT_MISS:     outcome = HIT_OUTCOME_MISS; break;
+                    case MELEE_HIT_DODGE:    outcome = HIT_OUTCOME_DODGE; break;
+                    case MELEE_HIT_PARRY:    outcome = HIT_OUTCOME_PARRY; break;
+                    case MELEE_HIT_BLOCK:    outcome = HIT_OUTCOME_BLOCK; break;
+                    case MELEE_HIT_GLANCING: outcome = HIT_OUTCOME_GLANCING; break;
+                    case MELEE_HIT_CRIT:     outcome = HIT_OUTCOME_CRIT; break;
+                    case MELEE_HIT_CRUSHING: outcome = HIT_OUTCOME_CRUSHING; break;
+                    case MELEE_HIT_NORMAL:   outcome = HIT_OUTCOME_HIT; break;
+                    default: break;
+                }
+                sScriptMgr->OnHitOutcome(this, victim, 0, outcome, damageInfo.Damage);
+            }
+
             // sparring
             if (Creature* victimCreature = victim->ToCreature())
             {
@@ -2371,6 +2393,8 @@ void Unit::AttackerStateUpdate(Unit* victim, WeaponAttackType attType, bool extr
                 {
                     damageInfo.HitInfo |= HITINFO_RAGE_GAIN;
                     damageInfo.RageGained = RewardClassicRage(rageDamage, true);
+                    g_classicRageHitDamage.fetch_add(rageDamage, std::memory_order_relaxed);
+                    g_classicRageHitGained.fetch_add(uint64(std::max<int64>(int64(damageInfo.RageGained), 0)), std::memory_order_relaxed);
                 }
             }
 
@@ -6691,6 +6715,7 @@ void Unit::SetCharm(Unit* charm, bool apply)
 
     // Hook for OnHeal Event
     sScriptMgr->OnHeal(healer, victim, (uint32&)gain);
+    sScriptMgr->OnHealOutcome(healer, victim, healInfo.GetSpellInfo() ? healInfo.GetSpellInfo()->Id : 0, addhealth, uint32(gain));
 
     Unit* unit = healer;
     if (healer && healer->GetTypeId() == TYPEID_UNIT && healer->IsTotem())
