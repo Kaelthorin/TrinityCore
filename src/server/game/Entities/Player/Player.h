@@ -3495,6 +3495,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
 
         // Temporary removed pet cache
         uint32 m_temporaryUnsummonedPetNumber;
+        uint32 m_botSheathIdleMs = 0;                       // bot only: ms with weapons drawn and no fight
         uint32 m_petResummonDelay;                          // ms until the pet remembered at login is summoned (0 = none pending)
         Optional<ReactStates> m_temporaryPetReactState;
         uint32 m_oldpetspell;

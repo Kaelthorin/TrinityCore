@@ -970,6 +970,19 @@ void Player::Update(uint32 p_time)
             m_petResummonDelay -= p_time;
     }
 
+    // A bot has no client to send CMSG_SET_SHEATHED: after a kill it keeps its bow or weapon drawn and stands in the aim pose.
+    // A moment with no fight and no victim puts the weapons away, as a player's client does.
+    if (GetSession()->IsBot())
+    {
+        if (GetSheath() == SHEATH_STATE_UNARMED || IsInCombat() || GetVictim() || !IsAlive())
+            m_botSheathIdleMs = 0;
+        else if ((m_botSheathIdleMs += p_time) >= 3000)
+        {
+            m_botSheathIdleMs = 0;
+            SetSheath(SHEATH_STATE_UNARMED);
+        }
+    }
+
     DeathRecap::RecordFrame(this, p_time);
     DeathRecap::UpdateViewer(this);
 
