@@ -448,6 +448,10 @@ inline bool FelhunterDuty(BotSnapshotView const& s, GroupSnapshotView const& g)
 // The summon spell this Classic warlock should have out (0 = none known).
 inline uint32 ClassicWarlockPet(BotSnapshotView const& s, GroupSnapshotView const* g)
 {
+    // The Demonology (DS/Ruin) warlock brings the Imp wherever it plays and sacrifices it (Apl_Classic_Warlock ShouldDemonicSacrifice: Burning Shadow,
+    // +15 % Shadow in the client data). 178 demonology: an ambient bot picks its demon by guid, got the Succubus, and the sacrifice rule (Imp only) never ran.
+    if (s.spec() == 266 && s.knows_spell(18788) && s.knows_spell(SUMMON_IMP))
+        return SUMMON_IMP;
     if (g && g->exists() && s.is_in_instance())
     {
         // A raid warlock always has the Imp out: its Blood Pact is +stamina for the party (a tank's health), which

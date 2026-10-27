@@ -71,7 +71,10 @@ bool UpkeepWindow(BotSnapshotView const& s, GroupSnapshotView const& g)
 // InitFood / InitPotions), so a companion never runs dry.
 bool SuppliesGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!(Services::Config().classic_class_supplies() || Services::Config().behavior_ammo_supply()) || !UpkeepWindow(s, g))
+    if (!(Services::Config().classic_class_supplies() || Services::Config().behavior_ammo_supply()))
+        return false;
+    // Playerbot.AlwaysBuffs: adding items takes no time, so a living bot is restocked in a fight as well; otherwise between fights only.
+    if (Classic::AlwaysOn(s, AlwaysSwitch::Supplies, &g) ? !s.is_alive() : !UpkeepWindow(s, g))
         return false;
     thread_local std::vector<uint32> shortItems;
     Classic::ShortClassSupplies(s, shortItems);
@@ -585,6 +588,30 @@ bool RaidConsumablesFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView 
     return true;
 }
 
+// ---------- idle:classic_resist_gear ----------
+// Playerbot.Raid.ResistGear: before a boss that deals a resistance school (the potion rows) the bot wears the resistance pieces
+// (BotPopulationManager::SwapResistGear); once the boss is gone, or another school is wanted, its own gear is back. Between pulls only.
+
+constexpr uint64 kResistGearKeyBit = 1ull << 34;
+
+bool ResistGearGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
+{
+    if (!Services::Config().raid_resist_gear() || !UpkeepWindow(s, g) || s.recently_in_combat(3000))
+        return false;
+    uint8 const want = Classic::PickResistGearSchool(s);
+    return want != ai.resist_gear_school() && !ai.action_recently_tried(BotAI::ActionKind::ClassUpkeep, want | kResistGearKeyBit, now_ms);
+}
+bool ResistGearFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
+{
+    uint8 const want = Classic::PickResistGearSchool(s);
+    if (!emit.resist_gear(want))
+        return false;
+    ai.note_action_retry(BotAI::ActionKind::ClassUpkeep, want | kResistGearKeyBit, now_ms);
+    ai.set_resist_gear_school(want);
+    ai.set_last_rule_fired("idle:classic_resist_gear");
+    return true;
+}
+
 } // namespace
 
 void RegisterClassicUpkeepRules(IdleRuleRegistry& r)
@@ -612,6 +639,7 @@ void RegisterClassicUpkeepRules(IdleRuleRegistry& r)
     add("idle:classic_mana_gem",  992, &ManaGemGate,   &ManaGemFire);
     add("idle:classic_conjure", 992, &ConjureGate, &ConjureFire);
     add("idle:classic_fear_ward", 992, &FearWardGate, &FearWardFire);
+    add("idle:classic_resist_gear", 993, &ResistGearGate, &ResistGearFire);
     add("idle:classic_raid_consumables", 991, &RaidConsumablesGate, &RaidConsumablesFire);
 }
 

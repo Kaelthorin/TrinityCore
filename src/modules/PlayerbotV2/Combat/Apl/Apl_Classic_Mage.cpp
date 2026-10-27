@@ -92,11 +92,21 @@ uint32 IceBlockSpell(ApPredicateContext const&)
     return ICE_BLOCK;
 }
 
+// A Fire mage: the specialization says so (62 Arcane and 64 Frost never are). Knowing Pyroblast or Combustion alone cannot decide it: the 166 Arcane
+// mage held them and ran the fire rules, 111 Scorch casts in a leg and no Frostbolt. With no specialization set the spells decide.
+bool FireBuild(ApPredicateContext const& ctx)
+{
+    uint32 const spec = ctx.bot.spec();
+    if (spec == 63) return true;
+    if (spec == 62 || spec == 64) return false;
+    return ctx.bot.knows_spell(PYROBLAST) || ctx.bot.knows_spell(COMBUSTION);
+}
+
 // Fire talents -> Fireball; else Frostbolt; Fireball before Frostbolt is
 // trained; Arcane Missiles only if nothing else is known.
 uint32 NukeSpell(ApPredicateContext const& ctx)
 {
-    bool const fire_build = ctx.bot.knows_spell(PYROBLAST) || ctx.bot.knows_spell(COMBUSTION);
+    bool const fire_build = FireBuild(ctx);
     if (fire_build && ctx.bot.knows_spell(FIREBALL)) return FIREBALL;
     if (ctx.bot.knows_spell(FROSTBOLT))              return FROSTBOLT;
     if (ctx.bot.knows_spell(FIREBALL))               return FIREBALL;
@@ -242,7 +252,7 @@ bool ShouldFireBlast(ApPredicateContext const& ctx)
 {
     // Instant but on the global cooldown and mana-hungry: worth it while moving (a hard cast cannot run) or as a filler for a fire
     // build with mana to spare; a frost / arcane mage standing still casts its main spell instead.
-    bool const fire_build = ctx.bot.knows_spell(PYROBLAST) || ctx.bot.knows_spell(COMBUSTION);
+    bool const fire_build = FireBuild(ctx);
     return HasLiveTarget(ctx) && ManaPct(ctx) >= 25 && (ctx.bot.is_moving() || (fire_build && ManaPct(ctx) >= 50))
         && (Ready(ctx, FIRE_BLAST) && ctx.bot.victim_in_spell_range(FIRE_BLAST));
 }
@@ -250,7 +260,8 @@ void DoFireBlast(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FI
 
 bool ShouldNuke(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, NukeSpell(ctx));
+    uint32 const spell = NukeSpell(ctx);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, spell) && ctx.bot.victim_in_spell_range(spell));
 }
 void DoNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(NukeSpell(ctx), ctx.bot.victim()); }
 
@@ -259,7 +270,7 @@ void DoNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(NukeSpe
 // Fireball on fire, Arcane Missiles on arcane), same mana gates as the nuke.
 bool NukeUsable(ApPredicateContext const& ctx, uint32 spell)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, spell);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, spell) && ctx.bot.victim_in_spell_range(spell));
 }
 bool ShouldFrostboltNuke(ApPredicateContext const& ctx)      { return NukeUsable(ctx, FROSTBOLT); }
 bool ShouldFireballNuke(ApPredicateContext const& ctx)       { return NukeUsable(ctx, FIREBALL); }
@@ -275,7 +286,7 @@ SchoolHint::SchoolChoice const kSchoolChoices[] = {
 // shared, so the mage only casts it when no mage has them at 5 with time left.
 bool ShouldScorch(ApPredicateContext const& ctx)
 {
-    if (!(ctx.bot.knows_spell(PYROBLAST) || ctx.bot.knows_spell(COMBUSTION)) || !Classic::BossFight(ctx.bot))
+    if (!FireBuild(ctx) || !Classic::BossFight(ctx.bot))
         return false;
     if (!NukeUsable(ctx, SCORCH)) return false;
     AuraEntry const* fv = ctx.bot.find_aura_any_caster(FIRE_VULNERABILITY, ctx.bot.victim());
@@ -288,7 +299,7 @@ void DoSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHi
 
 bool ShouldWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0
+    return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0
         && ManaPct(ctx) < NukeManaFloor(ctx);
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }

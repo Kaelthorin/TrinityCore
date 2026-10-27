@@ -20,6 +20,8 @@ namespace Playerbot::Diagnostics {
 
 namespace ScnClass { constexpr std::uint8_t Warrior = 1, Paladin = 2, Hunter = 3, Rogue = 4, Priest = 5, Shaman = 7, Mage = 8, Warlock = 9, Druid = 11; }
 namespace ScnRace  { constexpr std::uint8_t Human = 1, Orc = 2, Dwarf = 3, NightElf = 4, Undead = 5, Tauren = 6, Gnome = 7, Troll = 8; }
+namespace ScnSchool { constexpr std::uint8_t Fire = 2, Nature = 3, Frost = 4, Shadow = 5; }   // SpellSchools values
+namespace ScnItem { constexpr std::uint32_t OnyxiaScaleCloak = 15138; }   // its aura 22683 is what Shadow Flame 22539 checks (SpellEffects.cpp)
 
 struct ScenarioMember
 {
@@ -27,6 +29,10 @@ struct ScenarioMember
     std::uint8_t race;
     std::uint8_t cls;
     ScenarioRoleKind role;
+    // The talent build the member runs (Classic virtual spec id, the retail ids of Api/ClassicTalentBuilds.cpp: 71 Arms, 253 Beast Mastery ...).
+    // 0 = the role's default spec. Set after the role is pinned and applied as a respec, so a reused character changes build.
+    std::uint32_t spec = 0;
+    bool melee = false;                // the dps_scorecard raid stands a melee member at the boss, everyone else at casting range
 };
 
 // Parity: the damage_parity family (DamageParity.h) - one bot, a target dummy, measurements; done when its legs have run.
@@ -62,8 +68,14 @@ struct ScenarioDef
     // The raid lands at least this far from that creature (0 = the default 40 y). A boss that aggroes on sight (Onyxia: 58 y) is not held, so a
     // landing inside its reach starts the fight on whoever stands nearest instead of on the tank walking in (onyxia_full n6, 2026-10-14).
     float arrive_min_yards = 0.f;
-    // Staging kills every hostile on the map but the goal boss, its formation and this entry (the boss's own adds); 0 = none.
+    // The school the squad gears resistance for, as a vanilla raid dressed for the fight (nature for Princess Huhuran); 0 = none. Every
+    // armour and jewellery slot takes the piece with the most of it under the tier's item level (GearGenerationContext::resist_school).
+    std::uint8_t resist_school = 0;
+    // A piece every raider wears for the fight whatever it scores (the Onyxia Scale Cloak against the drakes' Shadow Flame); 0 = none.
+    std::uint32_t wear_entry = 0;
+    // Staging kills every hostile on the map but the goal boss, its formation and these entries (the boss's own adds); 0 = none.
     std::uint32_t keep_entry = 0;
+    std::uint32_t keep_entry_b = 0, keep_entry_c = 0;
     // A fight with no boss death to wait for (Majordomo Executus yields when his eight adds are dead): the goal is reached when this many
     // creatures of these two entries have died on the map. 0 = the goal boss's death.
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;
@@ -76,6 +88,8 @@ struct ScenarioDef
     // The damage_parity family (goal Parity): which measurement (Parity::Kind: 1 damage legs, 2 finisher sweep, 3 talent audit) and how long a
     // damage leg measures. 0 = not a parity scenario.
     std::uint8_t parity = 0;
+    // A damage_parity run played as this specialization (ChrSpecialization id, warrior Fury 72, Protection 73); 0 = what the talents say.
+    std::uint32_t parity_spec = 0;
     std::uint32_t parity_leg_s = 180;
     // The name of a member played like the owner's own character: from the start of the run its bot logic is detached and the runner drives it,
     // following the main tank and attacking what the tank attacks (a player who only presses "assist"). The group logic still sees a
@@ -119,10 +133,14 @@ struct DungeonRow
 
 // Ordered by level, lowest first: `runall` re-levels the shared party for each row, and a character is only ever levelled up.
 // Entrances are the Classic areatrigger_teleport targets; levels are the dungeon's usual range; the boss is the first one on the way in.
-// Dire Maul, Stratholme, Scholomance, Sunken Temple, Maraudon and Blackrock Spire are not here yet: several entrances or a first boss
-// that is not on the way in (add them once their routes have been looked at).
+// The two Forever dungeons enter by their server-side area triggers (world_safe_locs 1104100 / 1104102). In a dungeon with several wings
+// or entrances each wing gets its own row from the entrance nearest its first fixed-spawn boss: a boss that flees (Pusillin), a rare on a
+// pool (Skul, Hearthsinger Forresten), a summon (Timmy, the Ramstein waves) or one hidden until an event (the Sunken Temple dragons wait
+// for the six trolls) is never the goal. Upper Blackrock Spire is not here: its door needs the Seal of Ascension, which no bot carries.
 inline constexpr DungeonRow kDungeons[] = {
     { "rfc_oggleflint",       "Ragefire Chasm: level 14 party to Oggleflint",              389,     0.797643f,   -8.23429f,  -15.5288f, 270.f, 14, 11517, "Oggleflint",          15 },
+    { "hot_faldrim",          "Hall of Thanes: level 16 party to Faldrim Anvilmar",        3065,   -95.62f,     -0.16f,    510.94f,     0.f, 16, 261306, "Faldrim Anvilmar",  20 },
+    { "rol_witherfang",       "Ruins of Lordaeron: level 18 party to Witherfang",          2999,  1804.15f,   149.174f,    70.399f,  266.f, 18, 250483, "Witherfang",        20 },
     { "wc_cobrahn",           "Wailing Caverns: level 18 party to Lord Cobrahn",           43,   -158.441f,   131.601f,  -74.2552f, 335.f, 18,  3669, "Lord Cobrahn",       20 },
     { "deadmines_rhahkzor",   "Deadmines: level 21 party to Rhahk'Zor",                    36,    -14.5732f, -385.475f,   62.4561f,  90.f, 21,   644, "Rhahk'Zor",          20 },
     { "sfk_rethilgore",       "Shadowfang Keep: level 24 party to Rethilgore",             33,   -228.191f,  2111.41f,    76.8904f,  70.f, 24,  3914, "Rethilgore",         15 },
@@ -131,10 +149,22 @@ inline constexpr DungeonRow kDungeons[] = {
     { "smgraveyard_vishas",   "Scarlet Monastery Graveyard: level 30 party to Vishas",     189,  1687.27f,   1050.09f,    18.6773f,  90.f, 30,  3983, "Interrogator Vishas",15 },
     { "rfk_aggem",            "Razorfen Kraul: level 31 party to Aggem Thorncurse",        47,   1942.27f,   1544.23f,    83.3055f,  75.f, 31,  4424, "Aggem Thorncurse",   20 },
     { "gnomeregan_grubbis",   "Gnomeregan: level 32 party to Grubbis",                     90,   -329.098f,    -3.20722f, -152.851f, 170.f, 32,  7361, "Grubbis",            20 },
+    { "smlibrary_loksey",     "Scarlet Monastery Library: level 33 party to Houndmaster Loksey", 189, 253.672f, -206.624f, 18.6773f, 270.f, 33, 3974, "Houndmaster Loksey", 20 },
+    { "smarmory_herod",       "Scarlet Monastery Armory: level 36 party to Herod",         189,  1608.1f,   -318.919f,   18.6714f, 270.f, 36,  3975, "Herod",              25 },
+    { "smcathedral_mograine", "Scarlet Monastery Cathedral: level 38 party to Mograine",   189,   853.179f, 1319.18f,    18.6714f,  90.f, 38,  3976, "Scarlet Commander Mograine", 25 },
     { "rfd_tutenkash",        "Razorfen Downs: level 40 party to Tuten'kash",              129,  2593.68f,   1111.23f,    50.9518f, 270.f, 40,  7355, "Tuten'kash",         25 },
     { "uldaman_revelosh",     "Uldaman: level 44 party to Revelosh",                       70,   -228.859f,    46.1018f,  -46.0186f,  90.f, 44,  6910, "Revelosh",           20 },
+    { "maraudon_noxxion",     "Maraudon (orange): level 46 party to Noxxion",              349,  1016.83f,  -458.52f,   -43.4737f, 360.f, 46, 13282, "Noxxion",            25 },
     { "zf_antusul",           "Zul'Farrak: level 48 party to Antu'sul",                    209,  1212.67f,    842.04f,      8.93346f, 360.f, 48,  8127, "Antu'sul",           25 },
+    { "st_mijan",             "Sunken Temple: level 50 party to Mijan",                    109,  -315.903f,  100.197f, -131.849f,  180.f, 50,  5717, "Mijan",              25 },
     { "brd_roccor",           "Blackrock Depths: level 54 party to Lord Roccor",           230,   456.929f,    34.0923f,  -68.0896f, 270.f, 54,  9025, "Lord Roccor",        20 },
+    { "lbrs_omokk",           "Lower Blackrock Spire: level 56 party to Highlord Omokk",   229,    78.3534f, -226.841f,   49.7662f, 270.f, 56,  9196, "Highlord Omokk",     25 },
+    { "dmeast_zevrim",        "Dire Maul East: level 56 party to Zevrim Thornhoof",        429,  -203.166f, -322.997f,   -2.72467f, 270.f, 56, 11490, "Zevrim Thornhoof",   25 },
+    { "dmwest_tendris",       "Dire Maul West: level 57 party to Tendris Warpwood",        429,    33.1083f,  158.977f,  -3.47126f,  45.f, 57, 11489, "Tendris Warpwood",   25 },
+    { "dmnorth_moldar",       "Dire Maul North: level 57 party to Guard Mol'dar",          429,   254.92f,   -19.463f,   -2.5596f,  315.f, 57, 14326, "Guard Mol'dar",      20 },
+    { "scholo_jandice",       "Scholomance: level 58 party to Jandice Barov",              289,   190.819f,   126.329f,  137.227f,  360.f, 58, 10503, "Jandice Barov",      25 },
+    { "stratlive_galford",    "Stratholme (main gate): level 58 party to Archivist Galford", 329, 3392.92f, -3395.03f, 143.135f,  90.f, 58, 10811, "Archivist Galford",  30 },
+    { "stratud_barthilas",    "Stratholme (service gate): level 58 party to Magistrate Barthilas", 329, 3590.87f, -3643.22f, 138.491f, 315.f, 58, 10435, "Magistrate Barthilas", 20 },
 };
 
 inline ScenarioDef MakeDungeonScenario(DungeonRow const& r)
@@ -207,7 +237,46 @@ struct RaidBossRow
     float arrive_min_yards = 0.f;       // see ScenarioDef::arrive_min_yards
     std::uint32_t goal_adds_a = 0, goal_adds_b = 0, goal_adds_needed = 0;   // see ScenarioDef::goal_adds_needed
     std::uint32_t spare_entry = 0;      // see ScenarioDef::spare_entry
+    std::uint32_t keep_entry_b = 0, keep_entry_c = 0;   // two more entries staging leaves alive (a trio, the other Horsemen); see ScenarioDef::keep_entry
+    std::uint8_t resist_school = 0;     // see ScenarioDef::resist_school
+    std::uint32_t wear_entry = 0;       // see ScenarioDef::wear_entry
 };
+
+// A row whose fight keeps two or three kinds of creature alive (the bug trio, the Four Horsemen): the extra ones, without spelling out
+// every field in between.
+constexpr RaidBossRow Keeps(RaidBossRow r, std::uint32_t b, std::uint32_t c = 0)
+{
+    r.keep_entry_b = b;
+    r.keep_entry_c = c;
+    return r;
+}
+
+// A row whose boss sees players from further than the core's aggro reach (under 20 y): his script's MoveInLineOfSight attacks, or pulls
+// the room, within a distance of its own, so the raid lands <yards> away, that distance plus 8 for the squad's spread round the landing
+// spot. The 124 runs of bwl_broodlord (classic_boss_broodlord_lashlayer.cpp: 40 y in sight) and aq40_huhuran (classic_boss_huhuran.cpp:
+// 80 y, no sight needed) both began in the landing second on a shadow priest, the tanks 39 y from the boss; the vanilla scripts' values
+// are in the instances' classic_boss_*.cpp.
+constexpr RaidBossRow Sight(RaidBossRow r, float yards)
+{
+    r.arrive_min_yards = yards;
+    return r;
+}
+
+// A row whose fight a vanilla raid dressed resistance gear for: the school (ScnSchool) every raider wears in each armour and jewellery slot
+// that has a piece with it under the tier's item level (ScenarioDef::resist_school).
+constexpr RaidBossRow Resist(RaidBossRow r, std::uint8_t school)
+{
+    r.resist_school = school;
+    return r;
+}
+
+// A row whose fight needs one piece on every raider whatever it scores (ScnItem; ScenarioDef::wear_entry): the Onyxia Scale Cloak, without
+// which Shadow Flame puts its 22682 burn on the target (SpellEffects.cpp: 22539 checks aura 22683).
+constexpr RaidBossRow Wears(RaidBossRow r, std::uint32_t entry)
+{
+    r.wear_entry = entry;
+    return r;
+}
 
 // In the order of the raid. Each starts at the boss's room with the encounter pre-spawned (the earlier bosses alive too).
 inline constexpr RaidBossRow kMcBosses[] = {
@@ -233,6 +302,10 @@ struct RaidEntrance { std::uint32_t map; float x, y, z, o_deg; };
 inline constexpr RaidEntrance kMcEntrance  = { 409, 1091.89f, -466.985f, -105.084f, 180.f };   // areatrigger_teleport 1102886
 inline constexpr RaidEntrance kBwlEntrance = { 469, -7673.2f, -1106.2f, 396.65f, 200.f };   // areatrigger_teleport 1103726 (vanilla entrance target)
 inline constexpr RaidEntrance kOnyEntrance = { 249, 30.8916f, -54.079f, -5.02784f, 270.f };    // areatrigger_teleport 1102848
+inline constexpr RaidEntrance kZgEntrance   = { 309, -11916.6f, -1243.52f, 92.5338f, 270.f };  // areatrigger_teleport 1103928
+inline constexpr RaidEntrance kAq20Entrance = { 509, -8436.53f, 1519.17f, 31.907f, 150.f };    // areatrigger_teleport 1104008
+inline constexpr RaidEntrance kAq40Entrance = { 531, -8221.35f, 2014.34f, 129.071f, 50.f };    // areatrigger_teleport 1104010
+inline constexpr RaidEntrance kNaxxEntrance = { 533, 3005.87f, -3435.01f, 293.882f, 0.f };     // areatrigger_teleport 1104055
 
 inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e, std::vector<ScenarioMember> squad)
 {
@@ -261,10 +334,14 @@ inline ScenarioDef MakeRaidScenario(RaidBossRow const& r, RaidEntrance const& e,
     d.limits.stray_yards = 120.f;                                    // a raid spreads over a room
     d.arrive_near_entry = r.boss_entry;
     d.keep_entry = r.keep_entry;
+    d.keep_entry_b = r.keep_entry_b;
+    d.keep_entry_c = r.keep_entry_c;
     d.goal_adds_a = r.goal_adds_a; d.goal_adds_b = r.goal_adds_b; d.goal_adds_needed = r.goal_adds_needed;
     d.spare_entry = r.spare_entry;
     d.lair_x = r.lair_x; d.lair_y = r.lair_y; d.lair_z = r.lair_z; d.lair_o = r.lair_o;
     d.arrive_min_yards = r.arrive_min_yards;
+    d.resist_school = r.resist_school;
+    d.wear_entry = r.wear_entry;
     d.order_attack = true;
     d.order_delay_ms = 20000;
     return d;
@@ -334,9 +411,157 @@ inline ScenarioDef MakeBwlRazorgoreScenario()
     return MakeRaidScenario(kRaz, kBwlEntrance, RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])));
 }
 
+// ---- The other raids, one boss at a time: Blackwing Lair, Zul'Gurub, the Ruins and the Temple of Ahn'Qiraj, Naxxramas ----
+// The same shape as the Molten Core rows: the squad enters at the instance entrance, staging kills the trash, places the raid in sight of
+// the boss and orders the attack. A boss kill passes the run; every death is a warning. Only bosses with a creature row of their own
+// are here. Left out, with the reason: Vaelastrasz (friendly until his gossip event starts the fight), Nefarian (Victor Nefarius' gossip
+// starts phase 1, Nefarian himself is summoned), Arlokk (the gong summons her), General Rajaxx (his seven waves come from Andorov's event),
+// Ouro (a trigger summons him) and Sapphiron (the instance spawns him once the four wings are cleared).
+// Reading a run: the [raid] lines of the bots' decisions (Logger.playerbot.v2=3), [raid_death] (spell, position) and the fight hp in [raid_fight].
+
+// A 20-player raid for Zul'Gurub and the Ruins: 2 tanks, 6 healers, 12 DPS, the same characters as the first half of the 40 (the names repeat).
+inline constexpr RaidRow kRaid20[] = {
+    { "Mctankw",  ScnRace::Human,    ScnClass::Warrior, ScenarioRoleKind::Tank,   2 },
+    { "Mcheals",  ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Healer, 3 },
+    { "Mchealp",  ScnRace::Human,    ScnClass::Paladin, ScenarioRoleKind::Healer, 2 },
+    { "Mchealdr", ScnRace::NightElf, ScnClass::Druid,   ScenarioRoleKind::Healer, 1 },
+    { "Mcmage",   ScnRace::Human,    ScnClass::Mage,    ScenarioRoleKind::Dps,    3 },
+    { "Mclock",   ScnRace::Human,    ScnClass::Warlock, ScenarioRoleKind::Dps,    2 },
+    { "Mcrogue",  ScnRace::Human,    ScnClass::Rogue,   ScenarioRoleKind::Dps,    2 },
+    { "Mchunt",   ScnRace::Dwarf,    ScnClass::Hunter,  ScenarioRoleKind::Dps,    2 },
+    { "Mcwarr",   ScnRace::Dwarf,    ScnClass::Warrior, ScenarioRoleKind::Dps,    2 },
+    { "Mcshad",   ScnRace::Human,    ScnClass::Priest,  ScenarioRoleKind::Dps,    1 },
+};
+
+// Blackwing Lair after Razorgore (bwl_razorgore above has the orb fight). Broodlord: the Suppression Devices of his room stay (game objects),
+// the rogues disarm them. The three drakes: Wing Buffet throws the tank, Shadow Flame is a cone. Chromaggus: five Brood Afflictions, two breaths.
+inline constexpr RaidBossRow kBwlBosses[] = {
+    Sight({ "bwl_broodlord",  "Blackwing Lair: 40 level 60 raiders to Broodlord Lashlayer (Suppression Devices, Mortal Strike, Blast Wave)",
+      12017, "Broodlord Lashlayer", 20 }, 48.f),   // sees 40 y
+    // The three drakes and Nefarian cast Shadow Flame: every raider wears the Onyxia Scale Cloak. Firemaw's Flame Buffet is fire, stacking
+    // on everyone in 100 y: the raid wore fire resistance for him (123: 36 of 38 deaths to Flame Buffet).
+    Resist(Wears({ "bwl_firemaw", "Blackwing Lair: 40 level 60 raiders to Firemaw (Flame Buffet stacks, Wing Buffet, Shadow Flame cone)",
+      11983, "Firemaw",             20 }, ScnItem::OnyxiaScaleCloak), ScnSchool::Fire),
+    Wears({ "bwl_ebonroc",  "Blackwing Lair: 40 level 60 raiders to Ebonroc (Shadow of Ebonroc tank swap, Wing Buffet)",
+      14601, "Ebonroc",             20 }, ScnItem::OnyxiaScaleCloak),
+    Wears({ "bwl_flamegor", "Blackwing Lair: 40 level 60 raiders to Flamegor (Frenzy tranquilized, Wing Buffet, Shadow Flame cone)",
+      11981, "Flamegor",            20 }, ScnItem::OnyxiaScaleCloak),
+    { "bwl_chromaggus", "Blackwing Lair: 40 level 60 raiders to Chromaggus (Brood Afflictions dispelled, Time Lapse tank swap)",
+      14020, "Chromaggus",          25 },
+};
+
+// Zul'Gurub, 20 raiders. Venoxis' four cobras and Hakkar's Sons stand for the fight; Thekal's Zath and Lor'Khan (the three must die together)
+// and Mandokir's Vilebranch Speaker (his death starts the fight; Ohgan is summoned) stay.
+inline constexpr RaidBossRow kZgBosses[] = {
+    { "zg_jeklik",    "Zul'Gurub: 20 level 60 raiders to High Priestess Jeklik (bats, Great Heal kicked, Pierce Armor tank swap)",
+      14517, "High Priestess Jeklik", 20 },
+    { "zg_venoxis",   "Zul'Gurub: 20 level 60 raiders to High Priest Venoxis (cobras, Holy Wrath spread, snake form poison cloud)",
+      14507, "High Priest Venoxis",   20, 11373 },   // Razzashi Cobra
+    { "zg_marli",     "Zul'Gurub: 20 level 60 raiders to High Priestess Mar'li (spawns first, Poison Volley, Corrosive Poison dispel)",
+      14510, "High Priestess Mar'li", 20 },
+    Keeps({ "zg_thekal", "Zul'Gurub: 20 level 60 raiders to High Priest Thekal, Zath and Lor'Khan (the three die together, then the tiger)",
+      14509, "High Priest Thekal", 25, 11348 }, 11347),   // Zath, Lor'Khan
+    { "zg_mandokir",  "Zul'Gurub: 20 level 60 raiders to Bloodlord Mandokir (the Speaker starts it, Ohgan first, Threatening Gaze)",
+      11382, "Bloodlord Mandokir",    25, 11391 },   // Vilebranch Speaker
+    { "zg_jindo",     "Zul'Gurub: 20 level 60 raiders to Jin'do the Hexxer (totems first, Hex, Delusions, brain-washed raiders)",
+      11380, "Jin'do the Hexxer",     20 },
+    { "zg_hakkar",    "Zul'Gurub: 20 level 60 raiders to Hakkar (Corrupted Blood carrier runs, Cause Insanity, Blood Siphon)",
+      14834, "Hakkar",                25, 11357 },   // Son of Hakkar
+    { "zg_gahzranka", "Zul'Gurub: 20 level 60 raiders to Gahz'ranka (Frost Breath cone, Massive Geyser threat reset)",
+      15114, "Gahz'ranka",            15 },
+};
+
+// Ruins of Ahn'Qiraj, 20 raiders. Buru's eggs stay (he must be led over them).
+inline constexpr RaidBossRow kAq20Bosses[] = {
+    { "aq20_kurinnaxx", "Ruins of Ahn'Qiraj: 20 level 60 raiders to Kurinnaxx (Mortal Wound tank swap, Sand Traps, Wide Slash cone)",
+      15348, "Kurinnaxx",              20 },
+    { "aq20_moam",      "Ruins of Ahn'Qiraj: 20 level 60 raiders to Moam (Mana Fiends first, Arcane Eruption, drains kicked)",
+      15340, "Moam",                   20 },
+    { "aq20_buru",      "Ruins of Ahn'Qiraj: 20 level 60 raiders to Buru the Gorger (the chase, eggs, hatchlings, the 20% transform)",
+      15370, "Buru the Gorger",        25, 15514 },   // Buru Egg
+    { "aq20_ayamiss",   "Ruins of Ahn'Qiraj: 20 level 60 raiders to Ayamiss the Hunter (larva first, swarmers, Poison Stinger)",
+      15369, "Ayamiss the Hunter",     20 },
+    { "aq20_ossirian",  "Ruins of Ahn'Qiraj: 20 level 60 raiders to Ossirian the Unscarred (Curse of Tongues, tornados, War Stomp)",
+      15339, "Ossirian the Unscarred", 25 },
+};
+
+// Temple of Ahn'Qiraj, 40 raiders. The bug trio dies Yauj, Kri, Vem (the goal is the last); Sartura's Royal Guards and Vek'lor stand with
+// their boss; C'Thun's eye and tentacles are summoned by the instance when the raid reaches him.
+inline constexpr RaidBossRow kAq40Bosses[] = {
+    Sight({ "aq40_skeram",   "Temple of Ahn'Qiraj: 40 level 60 raiders to The Prophet Skeram (True Fulfillment, Arcane Explosion kicked, images)",
+      15263, "The Prophet Skeram",     20 }, 36.f),   // sees 28 y
+    Sight(Keeps({ "aq40_bugtrio", "Temple of Ahn'Qiraj: 40 level 60 raiders to the bug trio, Yauj then Kri then Vem (Great Heal kicked, Toxic Vapors)",
+      15544, "Vem", 25, 15543 }, 15511), 68.f),   // Princess Yauj, Lord Kri; they see 60 y
+    Sight({ "aq40_sartura",  "Temple of Ahn'Qiraj: 40 level 60 raiders to Battleguard Sartura (guards first, Whirlwinds left)",
+      15516, "Battleguard Sartura",    20, 15984 }, 93.f),   // Sartura's Royal Guard; she sees 85 y
+    Sight({ "aq40_fankriss", "Temple of Ahn'Qiraj: 40 level 60 raiders to Fankriss the Unyielding (Mortal Wound tank swap, spawns, hatchlings)",
+      15510, "Fankriss the Unyielding", 20 }, 108.f),   // sees 100 y
+    // Viscidus's Poison Shock and Poison Bolt Volley are nature: the other nature resistance fight of the temple.
+    Resist(Sight({ "aq40_viscidus", "Temple of Ahn'Qiraj: 40 level 60 raiders to Viscidus (frost to freeze, melee to shatter, globs, toxin clouds)",
+      15299, "Viscidus",               25 }, 103.f), ScnSchool::Nature),   // sees 95 y
+    Resist(Sight({ "aq40_huhuran", "Temple of Ahn'Qiraj: 40 level 60 raiders to Princess Huhuran (Frenzy tranquilized, Noxious Poison, the 30% volley)",
+      15509, "Princess Huhuran",       20 }, 88.f), ScnSchool::Nature),   // sees 80 y, no line of sight needed; worn in nature resistance
+    { "aq40_twins",    "Temple of Ahn'Qiraj: 40 level 60 raiders to the Twin Emperors (physical on Vek'nilash, casters on Vek'lor, teleports)",
+      15275, "Emperor Vek'nilash",   25, 15276 },   // Emperor Vek'lor
+    { "aq40_cthun",    "Temple of Ahn'Qiraj: 40 level 60 raiders to C'Thun (the eye and Dark Glare, tentacles, the stomach)",
+      15727, "C'Thun",                 30 },
+};
+
+// Naxxramas, 40 raiders. The adds that belong to a fight stay: Anub'Rekhan's Crypt Guards, Faerlina's Worshippers and Followers, the
+// Deathknight Understudies, the other three Horsemen, Gluth's Zombie Chows, Stalagg and Feugen.
+inline constexpr RaidBossRow kNaxxBosses[] = {
+    Sight({ "naxx_anubrekhan", "Naxxramas: 40 level 60 raiders to Anub'Rekhan (Locust Swarm kite, Crypt Guards, scarabs)",
+      15956, "Anub'Rekhan",            20, 16573 }, 63.f),   // Crypt Guard; sees 55 y
+    Keeps({ "naxx_faerlina", "Naxxramas: 40 level 60 raiders to Grand Widow Faerlina (Worshipper sacrifice after each Enrage, Rain of Fire)",
+      15953, "Grand Widow Faerlina", 20, 16506 }, 16505),   // Naxxramas Worshipper, Follower
+    Sight({ "naxx_maexxna",    "Naxxramas: 40 level 60 raiders to Maexxna (Web Wrap freed, Necrotic Poison dispelled, Poison Shock cone)",
+      15952, "Maexxna",                20 }, 48.f),   // sees 40 y
+    { "naxx_noth",       "Naxxramas: 40 level 60 raiders to Noth the Plaguebringer (the curse dispelled first, spread, balcony adds)",
+      15954, "Noth the Plaguebringer", 20 },
+    { "naxx_heigan",     "Naxxramas: 40 level 60 raiders to Heigan the Unclean (the eruption dance, Decrepit Fever, Mana Burn range)",
+      15936, "Heigan the Unclean",     20 },
+    { "naxx_loatheb",    "Naxxramas: 40 level 60 raiders to Loatheb (spores, Corrupted Mind heal rotation)",
+      16011, "Loatheb",                25 },
+    { "naxx_razuvious",  "Naxxramas: 40 level 60 raiders to Instructor Razuvious (priests control the understudies that tank him)",
+      16061, "Instructor Razuvious",   20, 16803 },   // Deathknight Understudy
+    { "naxx_gothik",     "Naxxramas: 40 level 60 raiders to Gothik the Harvester (the side split, waves, the gate, teleports)",
+      16060, "Gothik the Harvester",   25 },
+    Sight(Keeps({ "naxx_horsemen", "Naxxramas: 40 level 60 raiders to the Four Horsemen (marks, the tank rotation, Void Zones, Meteor)",
+      16062, "Highlord Mograine", 25, 16063 }, 16064, 16065), 83.f),   // Zeliek, Korth'azz, Blaumeux; they see 75 y
+    { "naxx_patchwerk",  "Naxxramas: 40 level 60 raiders to Patchwerk (Hateful Strike soaked by three off tanks)",
+      16028, "Patchwerk",              15 },
+    { "naxx_grobbulus",  "Naxxramas: 40 level 60 raiders to Grobbulus (Mutating Injection carrier runs, poison clouds, Slime Spray cone)",
+      15931, "Grobbulus",              20 },
+    Sight({ "naxx_gluth",      "Naxxramas: 40 level 60 raiders to Gluth (Mortal Wound tank swap, Frenzy tranquilized, Zombie Chows)",
+      15932, "Gluth",                  20, 16360 }, 57.f),   // Zombie Chow; sees 49 y
+    Keeps({ "naxx_thaddius", "Naxxramas: 40 level 60 raiders to Thaddius (Stalagg and Feugen first, Static Field, Polarity Shift sides)",
+      15928, "Thaddius", 25, 15929 }, 15930),   // Stalagg, Feugen
+    { "naxx_kelthuzad",  "Naxxramas: 40 level 60 raiders to Kel'Thuzad (phase 1 adds, Detonate Mana, Shadow Fissures, Guardians shackled)",
+      15990, "Kel'Thuzad",            30 },
+};
+
+inline std::vector<ScenarioDef> MakeOtherRaidScenarios()
+{
+    std::vector<ScenarioDef> v;
+    auto squad40 = [] { return RaidSquad(kMcRaid, sizeof(kMcRaid) / sizeof(kMcRaid[0])); };
+    auto squad20 = [] { return RaidSquad(kRaid20, sizeof(kRaid20) / sizeof(kRaid20[0])); };
+    for (RaidBossRow const& r : kBwlBosses)
+        v.push_back(MakeRaidScenario(r, kBwlEntrance, squad40()));
+    for (RaidBossRow const& r : kZgBosses)
+        v.push_back(MakeRaidScenario(r, kZgEntrance, squad20()));
+    for (RaidBossRow const& r : kAq20Bosses)
+        v.push_back(MakeRaidScenario(r, kAq20Entrance, squad20()));
+    for (RaidBossRow const& r : kAq40Bosses)
+        v.push_back(MakeRaidScenario(r, kAq40Entrance, squad40()));
+    for (RaidBossRow const& r : kNaxxBosses)
+        v.push_back(MakeRaidScenario(r, kNaxxEntrance, squad40()));
+    return v;
+}
+
 // ---- damage_parity: one level 60 bot per class against a level 63 target dummy ----
-// damage_parity_<class>   seven legs of `leg_s` seconds (no gear / tier 1 / tier 3 / +spell power / +attack power / 0 armor / five Sunders)
+// damage_parity_<class>   four reference legs of `leg_s` seconds (no gear / tier 1 / tier 3 / tier 3 with raid buffs and five Sunders), then on request or after a failed check the sensitivity legs (+spell power / +attack power / 0 armor / five Sunders)
 // finisher_sweep_<class>  rogue, druid, warrior: every combo point or rage scaled spell at 1-5 points / rising rage, the damage must grow
+// threat_audit_<class>    rogue, priest, hunter, druid: the threat reducer's drop on a dummy's threat list against vanilla's
 // talent_audit_<class>    the class's key talents in the spellbook with their effects, and (warlock) Improved Shadow Bolt's +20 % after a crit
 struct ParityRow
 {
@@ -380,6 +605,120 @@ inline ScenarioDef MakeParityScenario(ParityRow const& r, char const* name, char
     return d;
 }
 
+// ---- dps_scorecard_raid: one raid, every dps spec, one boss dummy ----
+// A tank, three raid buffers and one bot per dps spec (Classic builds: 19) in Tier 3, all hitting one level 63 dummy (armor 3731, no resistances,
+// two billion health) at the same time for `parity_leg_s` seconds. The runner forms one raid group; the bots keep their own logic, so the
+// buffers cast the raid buffs, the shared debuffs come from whoever has them (Sunder Armor, curses, Shadow Weaving ...), and the bots drink
+// their flasks and elixirs as in any raid. Parity::Kind::Group writes one row per bot to DpsScorecard.tsv. Alliance only (one raid group).
+struct ScorecardRow
+{
+    char const* name;
+    std::uint8_t race;
+    std::uint8_t cls;
+    std::uint32_t spec;
+    ScenarioRoleKind role;
+    bool melee;
+};
+
+inline constexpr ScorecardRow kScorecardRaid[] = {
+    // Not scored: the main tank (Sunder Armor, Demoralizing Shout) and the three buffers (Fortitude/Spirit, Kings/Might/Wisdom, Mark of the Wild).
+    { "Dsctank",    ScnRace::Human,    ScnClass::Warrior, 73,  ScenarioRoleKind::Tank,   true  },
+    { "Dscpriest",  ScnRace::Human,    ScnClass::Priest,  257, ScenarioRoleKind::Healer, false },
+    { "Dscpaladin", ScnRace::Human,    ScnClass::Paladin, 65,  ScenarioRoleKind::Healer, false },
+    { "Dscdruid",   ScnRace::NightElf, ScnClass::Druid,   105, ScenarioRoleKind::Healer, false },
+    // The dps specs.
+    { "Dscarms",    ScnRace::Human,    ScnClass::Warrior, 71,  ScenarioRoleKind::Dps,    true  },
+    { "Dscfury",    ScnRace::Human,    ScnClass::Warrior, 72,  ScenarioRoleKind::Dps,    true  },
+    { "Dscret",     ScnRace::Human,    ScnClass::Paladin, 70,  ScenarioRoleKind::Dps,    true  },
+    { "Dscbm",      ScnRace::Dwarf,    ScnClass::Hunter,  253, ScenarioRoleKind::Dps,    false },
+    { "Dscmm",      ScnRace::Dwarf,    ScnClass::Hunter,  254, ScenarioRoleKind::Dps,    false },
+    { "Dscsurv",    ScnRace::Dwarf,    ScnClass::Hunter,  255, ScenarioRoleKind::Dps,    false },
+    { "Dsccombat",  ScnRace::Human,    ScnClass::Rogue,   260, ScenarioRoleKind::Dps,    true  },
+    { "Dscassn",    ScnRace::Human,    ScnClass::Rogue,   259, ScenarioRoleKind::Dps,    true  },
+    { "Dscshadow",  ScnRace::Human,    ScnClass::Priest,  258, ScenarioRoleKind::Dps,    false },
+    { "Dscele",     ScnRace::Dwarf,    ScnClass::Shaman,  262, ScenarioRoleKind::Dps,    false },
+    { "Dscenh",     ScnRace::Dwarf,    ScnClass::Shaman,  263, ScenarioRoleKind::Dps,    true  },
+    { "Dscfire",    ScnRace::Human,    ScnClass::Mage,    63,  ScenarioRoleKind::Dps,    false },
+    { "Dscfrost",   ScnRace::Human,    ScnClass::Mage,    64,  ScenarioRoleKind::Dps,    false },
+    { "Dscarcane",  ScnRace::Human,    ScnClass::Mage,    62,  ScenarioRoleKind::Dps,    false },
+    { "Dscaff",     ScnRace::Human,    ScnClass::Warlock, 265, ScenarioRoleKind::Dps,    false },
+    { "Dscdemo",    ScnRace::Human,    ScnClass::Warlock, 266, ScenarioRoleKind::Dps,    false },
+    { "Dscdest",    ScnRace::Human,    ScnClass::Warlock, 267, ScenarioRoleKind::Dps,    false },
+    { "Dscbalance", ScnRace::NightElf, ScnClass::Druid,   102, ScenarioRoleKind::Dps,    false },
+    { "Dscferal",   ScnRace::NightElf, ScnClass::Druid,   103, ScenarioRoleKind::Dps,    true  },
+};
+
+// ---- support_scorecard_<tank>: one raid with five healers and four dps, a boss that hits the tank and pulses the raid ----
+// The healers and the tank of the support scorecard (Parity::BeginGroup with support): the boss swings at the tank and shoots a pulse at raiders in turn,
+// the healers keep everyone up, four dps give the tank something to out-thread. One scenario per tank, so each tank spec is measured on its own
+// against the same healers. The healers also buff (Fortitude and Spirit, Kings, Mark of the Wild). Alliance only.
+struct SupportTank
+{
+    char const* suffix;
+    ScorecardRow row;
+};
+
+inline constexpr SupportTank kSupportTanks[] = {
+    { "warrior", { "Spttankw", ScnRace::Human,    ScnClass::Warrior, 73,  ScenarioRoleKind::Tank, true } },
+    { "paladin", { "Spttankp", ScnRace::Human,    ScnClass::Paladin, 66,  ScenarioRoleKind::Tank, true } },
+    { "druid",   { "Spttankd", ScnRace::NightElf, ScnClass::Druid,   104, ScenarioRoleKind::Tank, true } },
+};
+
+inline constexpr ScorecardRow kSupportRaid[] = {
+    { "Spthpriest", ScnRace::Human,    ScnClass::Priest,  257, ScenarioRoleKind::Healer, false },
+    { "Sptdpriest", ScnRace::Human,    ScnClass::Priest,  256, ScenarioRoleKind::Healer, false },
+    { "Spthpala",   ScnRace::Human,    ScnClass::Paladin, 65,  ScenarioRoleKind::Healer, false },
+    { "Sptrdruid",  ScnRace::NightElf, ScnClass::Druid,   105, ScenarioRoleKind::Healer, false },
+    { "Sptrshaman", ScnRace::Dwarf,    ScnClass::Shaman,  264, ScenarioRoleKind::Healer, false },
+    { "Sptfury",    ScnRace::Human,    ScnClass::Warrior, 72,  ScenarioRoleKind::Dps,    true  },
+    { "Sptcombat",  ScnRace::Human,    ScnClass::Rogue,   260, ScenarioRoleKind::Dps,    true  },
+    { "Sptfire",    ScnRace::Human,    ScnClass::Mage,    63,  ScenarioRoleKind::Dps,    false },
+    { "Sptaff",     ScnRace::Human,    ScnClass::Warlock, 265, ScenarioRoleKind::Dps,    false },
+};
+
+inline ScenarioDef MakeSupportScenario(SupportTank const& tank, char const* name, char const* summary)
+{
+    ScenarioDef d{};
+    d.name = name;
+    d.summary = summary;
+    d.level = 60;
+    d.squad.push_back({ tank.row.name, tank.row.race, tank.row.cls, tank.row.role, tank.row.spec, tank.row.melee });
+    for (ScorecardRow const& r : kSupportRaid)
+        d.squad.push_back({ r.name, r.race, r.cls, r.role, r.spec, r.melee });
+    d.map = 0;
+    d.x = 0.f; d.y = 0.f; d.z = 0.f; d.o = 0.f;
+    d.goal = ScenarioGoalKind::Parity;
+    d.goal_entry = 0;
+    d.goal_name = "";
+    d.timeout_ms = 30u * 60u * 1000u;
+    d.limits.expected_map = 0;
+    d.parity = 9;                      // the group runtime in support mode
+    d.parity_leg_s = 120;
+    d.full_clear = true;
+    return d;
+}
+
+inline ScenarioDef MakeScorecardScenario()
+{
+    ScenarioDef d{};
+    d.name = "dps_scorecard_raid";
+    d.summary = "DPS scorecard: one Tier 3 raid, a tank, three buffers and one bot per dps spec, all on one boss dummy for 2 minutes (Playerbot.DamageParity.LegSeconds changes it); one row per bot in DpsScorecard.tsv";
+    d.level = 60;
+    for (ScorecardRow const& r : kScorecardRaid)
+        d.squad.push_back({ r.name, r.race, r.cls, r.role, r.spec, r.melee });
+    d.map = 0;
+    d.x = 0.f; d.y = 0.f; d.z = 0.f; d.o = 0.f;
+    d.goal = ScenarioGoalKind::Parity;
+    d.goal_entry = 0;
+    d.goal_name = "";
+    d.timeout_ms = 40u * 60u * 1000u;   // 23 characters set up four a step, then 60 s of buffing, a warm-up and the measurement
+    d.limits.expected_map = 0;
+    d.parity = 8;                      // Parity::Kind::Group
+    d.parity_leg_s = 120;
+    d.full_clear = true;               // long: `runall` with no filter leaves it out
+    return d;
+}
+
 inline std::vector<ScenarioDef> const& ScenarioCatalogue()
 {
     static std::vector<ScenarioDef> const defs = []
@@ -399,7 +738,10 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
             static constexpr DungeonRow kFull = { "deadmines_full", "Deadmines: level 21 party, entrance to Edwin VanCleef",
                                                   36, -14.5732f, -385.475f, 62.4561f, 90.f, 21, 639, "Edwin VanCleef", 45 };
             ScenarioDef d = MakeDungeonScenario(kFull);
-            d.limits.bounds = { true, -420.f, 100.f, -900.f, -340.f, 0.f, 110.f };
+            // The floor is under the cove, not at z 0: past the Iron Clad Door the route to Mr. Smite (route chain [37]-[40], z 0.14) crosses
+            // the cove's water, which the squad swims at its surface, z -0.0 over a bottom at -3 to -7 (deadmines_full 048360b9: all five
+            // out_of_bounds at (-90,-707) on the route to Smite, the run otherwise a VanCleef kill). Falling through the map lands far below.
+            d.limits.bounds = { true, -420.f, 100.f, -900.f, -340.f, -25.f, 110.f };
             d.full_clear = true;
             // In the order of the clear (creature entries from the Deadmines creature table: a wrong one is reported when the run starts).
             // Staging spots: waypoints of the Deadmines route chain (map 36, seq in brackets) 33-55 y of walk before each boss room.
@@ -422,13 +764,18 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
         v.push_back(MakeOnyScenario());
         v.push_back(MakeOnyDodgeScenario());
         v.push_back(MakeBwlRazorgoreScenario());
+        for (ScenarioDef& d : MakeOtherRaidScenarios())
+            v.push_back(std::move(d));
         // The names are built once and kept: ScenarioDef carries char const*.
         static std::deque<std::string> s_parity_names;
         for (ParityRow const& r : kParityClasses)
         {
             s_parity_names.push_back(std::string("damage_parity_") + r.cls_name);
-            s_parity_names.push_back("Damage parity, " + std::string(r.cls_name) + ": seven legs against a level 63 dummy, per-spell outcomes, stat sensitivity, armor, DPS against the vanilla ranges");
+            s_parity_names.push_back("Damage parity, " + std::string(r.cls_name) + ": up to eight legs against a level 63 dummy, per-spell outcomes, stat sensitivity, armor, DPS against the vanilla ranges");
             v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 1, 45));
+            // The hunter of a raid was Marksmanship (Aimed Shot, Mortal Shots, Lethal Shots): the 146 and 147 runs took the class's default, Beast Mastery.
+            if (r.cls == ScnClass::Hunter)
+                v.back().parity_spec = 254;
             if (r.cls == ScnClass::Rogue || r.cls == ScnClass::Druid || r.cls == ScnClass::Warrior)
             {
                 s_parity_names.push_back(std::string("finisher_sweep_") + r.cls_name);
@@ -454,10 +801,61 @@ inline std::vector<ScenarioDef> const& ScenarioCatalogue()
                 s_parity_names.push_back("Trap audit, hunter: Explosive, Immolation, Frost and Freezing Trap out of combat, a dummy walked onto each, the trap must fire and do its effect");
                 v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 6, 8));
             }
+            if (r.cls == ScnClass::Rogue || r.cls == ScnClass::Priest || r.cls == ScnClass::Hunter || r.cls == ScnClass::Druid)
+            {
+                s_parity_names.push_back(std::string("threat_audit_") + r.cls_name);
+                s_parity_names.push_back("Threat audit, " + std::string(r.cls_name) + ": the threat reducer (Feint, Fade, Disengage, Cower) cast with 500 and 5000 threat on a level 63 dummy, the drop measured against vanilla's");
+                v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 7, 6));
+            }
             s_parity_names.push_back(std::string("talent_audit_") + r.cls_name);
             s_parity_names.push_back("Talent audit, " + std::string(r.cls_name) + ": key talents in the spellbook with their effects" +
                                      (r.cls == ScnClass::Warlock ? ", Improved Shadow Bolt +20 % after a crit" : ""));
             v.push_back(MakeParityScenario(r, s_parity_names[s_parity_names.size() - 2].c_str(), s_parity_names.back().c_str(), 3, 10));
+        }
+        // The other specializations of the classes that play one spec in the base scenario (warrior Arms, mage Frost, warlock Affliction/Demonology).
+        for (ScenarioDef const& base : std::vector<ScenarioDef>(v))
+        {
+            struct SpecVariant { char const* cls; char const* suffix; std::uint32_t spec; char const* label; };
+            static constexpr SpecVariant kVariants[] = {
+                { "warrior", "fury", 72u, "Fury" }, { "warrior", "prot", 73u, "Protection" },
+                { "mage", "fire", 63u, "Fire" }, { "mage", "arcane", 62u, "Arcane" },
+                { "warlock", "affliction", 265u, "Affliction" }, { "warlock", "demonology", 266u, "Demonology" }, { "warlock", "destruction", 267u, "Destruction" },
+                { "druid", "cat", 103u, "Feral (cat)" }, { "shaman", "elemental", 262u, "Elemental" },
+            };
+            for (SpecVariant const& variant : kVariants)
+            {
+                if (std::string(base.name) != std::string("damage_parity_") + variant.cls)
+                    continue;
+                static std::deque<std::string> s_spec_names;
+                s_spec_names.push_back(std::string("damage_parity_") + variant.cls + "_" + variant.suffix);
+                s_spec_names.push_back(std::string("Damage parity, ") + variant.cls + " played as " + variant.label + ": up to eight legs against a level 63 dummy, per-spell outcomes");
+                ScenarioDef d = base;
+                d.name = s_spec_names[s_spec_names.size() - 2].c_str();
+                d.summary = s_spec_names.back().c_str();
+                d.parity_spec = variant.spec;
+                v.push_back(std::move(d));
+            }
+        }
+        // The base mage and warlock scenarios name their spec too: with parity_spec 0 the run kept whatever talents the character held, and after a
+        // fire run the "frost" mage was a Fire mage (166: Fireball and Scorch cast, "never got Frostbolt accepted").
+        for (ScenarioDef& d : v)
+        {
+            if (std::string(d.name) == "damage_parity_mage") d.parity_spec = 64u;
+            if (std::string(d.name) == "damage_parity_warlock") d.parity_spec = 265u;
+            if (std::string(d.name) == "damage_parity_shaman") d.parity_spec = 263u;   // an elemental run left its talents on the character (195: the base ran as a caster)
+            // The rest of the base scenarios, pinned to the spec their reference ranges were written for, so no run depends on the talents the last run left.
+            if (std::string(d.name) == "damage_parity_paladin") d.parity_spec = 70u;    // Retribution
+            if (std::string(d.name) == "damage_parity_rogue") d.parity_spec = 260u;     // Assassination, the build the runs have played
+            if (std::string(d.name) == "damage_parity_priest") d.parity_spec = 258u;    // Shadow
+            if (std::string(d.name) == "damage_parity_druid") d.parity_spec = 102u;     // Balance (the cat is damage_parity_druid_cat)
+        }
+        v.push_back(MakeScorecardScenario());
+        static std::deque<std::string> s_support_names;   // ScenarioDef carries char const*
+        for (SupportTank const& t : kSupportTanks)
+        {
+            s_support_names.push_back(std::string("support_scorecard_") + t.suffix);
+            s_support_names.push_back(std::string("Healer and tank scorecard: one Tier 3 raid with a ") + t.suffix + " tank, five healers and four dps on a boss that hits the tank and pulses the raid; effective healing, overheal, mana, threat and damage taken per bot in DpsScorecard.tsv");
+            v.push_back(MakeSupportScenario(t, s_support_names[s_support_names.size() - 2].c_str(), s_support_names.back().c_str()));
         }
         return v;
     }();

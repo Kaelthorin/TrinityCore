@@ -14,6 +14,7 @@
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotIntent.h"
+#include "Bot/QuestLoot.h"
 #include "Bot/States/MaintainHelpers.h"   // States::DungeonLootDrain
 #include "Bot/ClassicUpkeep.h"
 #include "Services.h"
@@ -66,15 +67,21 @@ uint32 ResolveSkinningSpell(Player* p)
     return APPRENTICE_SKINNING;
 }
 
+// Some quest drop on this corpse is the bot's to take.
+bool HasPendingQuestLoot(Player* p, Creature* c)
+{
+    Loot* loot = c->GetLootForPlayer(p);
+    if (!loot) return false;
+    for (uint8 ls = 0; ls < loot->items.size(); ++ls)
+        if (IsPendingQuestLoot(p, loot, ls))
+            return true;
+    return false;
+}
+
 bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    // A bot a player leads or owns does not loot: the player loots, so no bot runs off to a corpse. The queue is emptied so the corpses
-    // are not walked to after the group is left. Bots with no player around them keep looting.
-    if (s.is_led_by_player())
-    {
-        Services::Registry().with_loot(s.bot_id(), [](std::deque<ObjectGuid>& q) { q.clear(); });
-        return false;
-    }
+    // A bot a player leads or owns loots only its own quest drops (LootDrainFire): the player takes the rest, so no bot runs off to a
+    // corpse for gold or gear, but in vanilla each member with the quest has to loot its own quest items.
     // Told to stay: the corpse can wait until it is released.
     if (ai.is_manual_mode(s.published_at_ms()) && ai.owner_command() == BotAI::OwnerCommand::Stay)
         return false;
@@ -84,7 +91,7 @@ bool LootDrainGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     // corpses and back to the tank without drinking.
     if (s.is_in_instance() && s.max_power(POWER_MANA) > 0 && Classic::DrinksForPull(s, &g)
         && s.power_pct(POWER_MANA) < Classic::OocDrinkStartManaPct(s, &g, 0)
-        && Classic::BestConsumable(s, Classic::ConsumableKind::Drink))   // no drink in the bags: it loots rather than waits for nothing
+        && Classic::RecoveryConsumable(s, Classic::ConsumableKind::Drink))   // nothing to drink (supplies off, empty bags): it loots rather than waits
         return false;
     // Loot etiquette with a human in the group (the owner's AddLootAction): no
     // looting while the bot or a human of the group on its map is still
@@ -123,6 +130,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     if (!p) return false;
     float bx, by, bz; s.position(bx, by, bz);
     bool emitted = false;
+    const bool quest_only = s.is_led_by_player();
     // Guard for the Phase-2 rotate: remembers the first corpse rotated to
     // the back this tick so the drain loop can't spin on a single corpse.
     ObjectGuid rotate_sentinel;
@@ -133,6 +141,8 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
             {
                 Creature* c = ObjectAccessor::GetCreature(*p, q.front());
                 if (!c || !c->IsInWorld()) { q.pop_front(); continue; }
+                // Led by a player: a corpse with nothing of the bot's quest on it is the player's, never walked to.
+                if (quest_only && !HasPendingQuestLoot(p, c)) { q.pop_front(); continue; }
                 const float dx = c->GetPositionX() - bx;
                 const float dy = c->GetPositionY() - by;
                 const float dz = c->GetPositionZ() - bz;
@@ -206,6 +216,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                     //   Phase 3: skinning loot present       -> LootIntent, keep.
                     //   Done:    nothing left / not skinnable -> pop.
                     const bool can_skin =
+                        !quest_only &&
                         p->HasSkill(SKILL_SKINNING_LOCAL) &&
                         c->GetCreatureDifficulty() &&
                         c->GetCreatureDifficulty()->SkinLootID != 0;
@@ -242,7 +253,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                     bool has_pending_loot = false;
                     if (loot)
                     {
-                        if (loot->gold != 0)
+                        if (loot->gold != 0 && !quest_only)
                             has_pending_loot = true;
                         else
                             for (uint8 ls = 0; ls < loot->items.size(); ++ls)
@@ -262,6 +273,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                                 NotNormalLootItem* ffaItem = nullptr;
                                 LootItem* li = loot->LootItemInSlot(ls, p, &ffaItem);
                                 if (!li || li->is_blocked) continue;
+                                if (quest_only && !IsPendingQuestLoot(p, loot, ls)) continue;
                                 const bool taken = ffaItem ? ffaItem->is_looted
                                                            : li->is_looted;
                                 if (taken) continue;
@@ -288,7 +300,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                         // Either way drain via LootIntent. Keep the corpse
                         // queued if it is still skinnable so the skin step
                         // gets a turn next tick once this loot is released.
-                        emit.emit(LootIntent{c->GetGUID()});
+                        emit.emit(LootIntent{c->GetGUID(), quest_only});
                         // Keep the corpse queued if it's a skinnable TYPE
                         // (can_skin), not only if the SKINNABLE flag is already
                         // set: the flag may not appear until the normal loot is
@@ -376,7 +388,7 @@ bool LootDrainFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
                     // A human leads the instance group: the bots follow him (Follow / Stay obeyed), so a corpse far from him waits
                     // in the queue until he walks near it. The owner, Deadmines 2026-10-10: he hit Follow and two bots stayed down
                     // the tunnel - the loot walk leased the follow-recall away (grant_detour below).
-                    if (s.is_in_instance() && !g.leader_is_bot())
+                    if ((s.is_in_instance() || quest_only) && !g.leader_is_bot())
                         if (auto const* mems = g.members())
                             for (GroupMemberSummary const& m : *mems)
                                 if (!m.is_bot && m.online && m.is_alive && m.map_id == s.map_id())

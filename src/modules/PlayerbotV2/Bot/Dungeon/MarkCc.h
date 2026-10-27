@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "../BotSnapshot.h"
+#include "../CcDeny.h"
 
 namespace Playerbot::MarkCc {
 
@@ -100,14 +101,16 @@ inline uint8 TypeOf(NearbyUnit const& u)
     return t ? uint8(t->type) : uint8(0);
 }
 
-// The option this bot can hold `creature_type` with (known spell, type fits, Sap only out of combat), else nullptr.
-// `ooc` = neither the bot nor the mob is in combat.
+// The option this bot can hold `creature_type` with (known spell, type fits, Sap only out of combat, a kind its owner has not
+// said no to: "@warlock no fear", CcDeny.h; no Sap while the owner keeps the rogue out of Stealth: "stealth off"), else nullptr. `ooc` = neither the bot nor the mob is in combat.
 template <class View>
 Option const* PickOption(View const& s, uint8 cls, uint8 creature_type, bool ooc)
 {
     if (creature_type == 0) return nullptr;   // a player: never by symbol
     for (Option const& o : OptionsFor(cls))
-        if ((o.type_mask & (1u << creature_type)) && (!o.ooc_only || ooc) && s.knows_spell(SpellFor(s, o)) &&
+        if ((o.type_mask & (1u << creature_type)) && (!o.ooc_only || ooc) && (CcDeny::KindOfSpell(o.spell) & s.raw().cc_deny) == 0 &&
+            (!o.needs_stealth || !s.raw().owner_picks.stealth_off) &&
+            s.knows_spell(SpellFor(s, o)) &&
             (!o.needs_no_pet || !s.has_pet()) && (!o.needs_reagent || s.has_reagents(SpellFor(s, o))))
             return &o;
     return nullptr;
@@ -182,7 +185,7 @@ bool TryCast(View const& s, Emit& emit, ObjectGuid target)
     float const dx = u->x - p.x, dy = u->y - p.y, dz = u->z - p.z;
     float const dist = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (!o)
-        return LogRefusal(low, now, s.name().c_str(), "no spell of this class holds that creature type (or not known / no shard)",
+        return LogRefusal(low, now, s.name().c_str(), "no spell of this class holds that creature type (or not known / no shard / the owner said no to it)",
                           u->entry, TypeOf(*u), dist), false;
     if (o->needs_stealth && !s.has_aura(kStealth))
     {
@@ -195,10 +198,31 @@ bool TryCast(View const& s, Emit& emit, ObjectGuid target)
     // Out of reach: walk into it instead of standing out of range (Garr 2026-10-09: the banishers kept their formation slot 38-57 yd
     // from the Firesworn, 103 refusals, and the adds ran loose later). The stop point is a few yards inside the range on the line
     // from the mob.
+    // A mob on this caster comes first: a hard cast on another mob while it is being hit is the death of a mage (brd_roccor 127:
+    // Scnmage re-sheeped the Anvilrage Guardsman with a Bloodhound on it and died in the cast). The hold on the very mob hitting
+    // it is the answer to that one, and a trap at the feet goes out regardless.
+    if (!o->self_cast && u->victim != s.guid())
+        for (NearbyUnit const& a : s.raw().combat.attackers)
+            if (a.hp > 0 && a.guid != target && a.victim == s.guid())
+                return LogRefusal(low, now, s.name().c_str(), "a mob is on this caster", u->entry, TypeOf(*u), dist), false;
     if (dist > o->range)
     {
+        // Never past the tank toward the mob: the walk-in stops no closer to it than the tank stands, less a couple of yards
+        // (brd_roccor 127: the mage walked from 50 y to 27 y of a pack the tank was still 37 y from, stood in front of the pull
+        // and the pack ate it). With the tank further off than the spell reaches, the caster waits for the tank's pull spot.
+        float stop = std::max(o->range - 5.0f, 5.0f);
+        float tank_d = -1.0f;
+        for (NearbyUnit const& f : s.raw().combat.nearby_friends)
+        {
+            if (f.role != Role::Tank || f.hp <= 0) continue;
+            float const tx = u->x - f.x, ty = u->y - f.y, tz = u->z - f.z;
+            float const td = std::sqrt(tx * tx + ty * ty + tz * tz);
+            if (tank_d < 0.0f || td < tank_d) tank_d = td;
+        }
+        if (tank_d >= 0.0f && stop < tank_d - 2.0f) stop = tank_d - 2.0f;
+        if (stop > o->range)
+            return LogRefusal(low, now, s.name().c_str(), "out of range, the tank stands further off: waiting behind it", u->entry, TypeOf(*u), dist), false;
         LogRefusal(low, now, s.name().c_str(), "out of range, moving in", u->entry, TypeOf(*u), dist);
-        float const stop = std::max(o->range - 5.0f, 5.0f);
         float const f = stop / dist;   // fraction of the mob->bot line
         return emit.move_to(u->x + (p.x - u->x) * f, u->y + (p.y - u->y) * f, u->z + (p.z - u->z) * f, /*run=*/true);
     }

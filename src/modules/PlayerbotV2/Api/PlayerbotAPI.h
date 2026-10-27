@@ -90,6 +90,9 @@ namespace PathBudget
     void BeginWorldTick(uint32 now_ms, uint32 budget_ms);
     void EndWorldTick();
     bool HasBudget(uint32 now_ms);
+    // Did a pathfind request find the window spent since BeginWorldTick? The drain pass then starts at another bot next time, so the
+    // bots at the tail of the registry are not the ones that wait every time.
+    bool Refused();
 }
 
 // API: thin facade over Player and friends. Constructed transiently per call
@@ -327,6 +330,9 @@ public:
     // when the server let it in nowhere. A dead bot is refused (Locked): the
     // ghost path is ghost_enter_area_trigger.
     Result enter_area_trigger(uint32 area_trigger_id);
+    // always_buffs: Playerbot.AlwaysBuffs. mask = kAlwaysMask* kinds on where the bot stands: add the aura rows of the BuffSet `set` (Bot/AlwaysBuffs.h) of an on kind the bot lacks, direct, no cast, and take off the rows of an off kind;
+    // mask 0 takes every always-on aura off. Logs [always_buff] for what it changes.
+    Result always_buffs(uint8 set, uint8 mask);
     // spirit_resurrect: spirit-healer instant rez. Mirrors
     // WorldSession::SendSpiritResurrect: ResurrectPlayer(0.5f, applySickness=true)
     // + DurabilityLossAll(0.25f) + SpawnCorpseBones, then teleport to the
@@ -673,7 +679,8 @@ public:
     // Loot a creature corpse: pick up gold + auto-store all items the bot has
     // permission to take. Skips group-loot blocks (Need/Greed in flight). The
     // caller is responsible for moving the bot into loot range first.
-    Result loot_corpse(ObjectGuid corpse);
+    // quest_items_only: take only the quest drops this bot may loot (a bot a player leads leaves the rest to him).
+    Result loot_corpse(ObjectGuid corpse, bool quest_items_only = false);
 
     // Vendor / repair
     // sell_item_by_entry: sells one stack of the given item to the nearby
@@ -754,7 +761,7 @@ public:
     // Returns Locked when the quest isn't complete or the choice is out
     // of range.
     static constexpr uint32 kRewardChoiceAuto = 0xFF;
-    Result complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 reward_choice);
+    Result complete_quest(ObjectGuid quest_giver, uint32 quest_id, uint32 reward_choice, bool copy_leader = false);
     // Drop the quest from the bot's quest log. Used by stuck/obsolete
     // cleanup. Returns NotKnown when the quest isn't in the log.
     Result abandon_quest(uint32 quest_id);

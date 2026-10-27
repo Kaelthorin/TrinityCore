@@ -798,12 +798,14 @@ bool Clearest(Player* bot, std::vector<Player*> const& others, float wanted, Rai
 struct Sticky { float x, y, z; uint32_t at; char const* reason; };
 std::unordered_map<uint64_t, Sticky> g_sticky;
 std::unordered_map<uint64_t, uint32_t> g_lastSpread;
+std::unordered_map<uint64_t, uint32_t> g_lastSpreadLog;
 std::unordered_map<uint64_t, uint32_t> g_lastTankFace;
 std::unordered_map<uint64_t, uint32_t> g_lastFaceAway;
 std::unordered_map<uint64_t, uint32_t> g_lastRearStep;
 std::unordered_map<uint64_t, uint32_t> g_lastCarrierLog;
 std::unordered_map<uint64_t, uint32_t> g_lastBombLog;
 std::unordered_map<uint64_t, uint32_t> g_lastStuckLog;
+std::unordered_map<uint64_t, uint32_t> g_lastSafeCrossLog;
 
 bool UseSticky(Player* bot, std::vector<Circle> const& circles, uint32_t now, RaidOrder& out)
 {
@@ -1567,7 +1569,18 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
     {
         // A breath with listed safe points: walk to the nearest usable one (it may lie inside the corridor's padding, so it is not tested
         // against the circles), and stay on it while the corridor is open.
-        if (g_breathCast)
+        // Only for a member inside the corridor itself: one that stands only in the fire beside it walks out of the fire (Escape below).
+        // Live Onyxia 244 2026-10-24: the raiders on the north spot (-10,-180) found Heated Ground 22193 under them when the breath ended,
+        // the spot counted as burning and they were sent to the south one, 70 y across the hall through the fire in its middle (22198,
+        // 22199); seven died at -14,-201..-209 three to four seconds into the walk.
+        bool inCorridor = false;
+        for (size_t i = g_breathCircleFrom; g_breathCast && i < circles.size(); ++i)
+            if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), circles[i].x, circles[i].y) < circles[i].r)
+            {
+                inCorridor = true;
+                break;
+            }
+        if (g_breathCast && inCorridor)
         {
             std::vector<BreathSafe const*> spots;
             for (BreathSafe const& s : rules.breathSafe)
@@ -1582,15 +1595,33 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                 float pz = 0.0f;
                 // Not into other hazards (the fire the breath leaves round the pits: the listed points lie in it): the corridor's own circles
                 // start at g_breathCircleFrom, the ones before are the others.
-                bool burning = false;
+                // Nor through them on the way: the straight line stands in for the path across the open hall. A fire the bot already stands
+                // in is the one it is leaving.
+                bool burning = false, crossesFire = false;
                 for (size_t i = 0; i < g_breathCircleFrom && i < circles.size(); ++i)
+                {
                     if (Dist2D(s->x, s->y, circles[i].x, circles[i].y) < circles[i].r)
                     {
                         burning = true;
                         break;
                     }
+                    if (Dist2D(bot->GetPositionX(), bot->GetPositionY(), circles[i].x, circles[i].y) >= circles[i].r &&
+                        SegmentDist2D(bot->GetPositionX(), bot->GetPositionY(), s->x, s->y, circles[i].x, circles[i].y) < circles[i].r)
+                        crossesFire = true;
+                }
                 if (burning)
                     continue;
+                if (crossesFire)
+                {
+                    uint32_t& at = g_lastSafeCrossLog[bot->GetGUID().GetCounter()];
+                    if (now - at >= 3000u)
+                    {
+                        at = now;
+                        TC_LOG_INFO("playerbot.v2.raid", "[raid_breath] {} skips safe spot {:.1f},{:.1f} for breath {}: the walk crosses another hazard",
+                            bot->GetName(), s->x, s->y, g_breathCast);
+                    }
+                    continue;
+                }
                 if (!Usable(bot, s->x, s->y, bot->GetPositionZ(), pz, /*urgent*/ true, /*hazard*/ true))
                     continue;
                 SetMove(out, s->x, s->y, pz, "leave hazard");
@@ -1749,6 +1780,16 @@ void DecideMove(Plan const& plan, Member const& self, uint32_t now, std::vector<
                     if (now - at < 4000)
                         continue;
                     if (Clearest(bot, others, rule.radius, out, "spread", circles, /*urgent*/ false)) { at = now; Remember(bot, out, now); return; }
+                    // No spot: say why, once per bot every 10 s (zg_venoxis 2026-10-20 124: ten casters within 3 y of each other under a
+                    // 12 y spread, Holy Wrath 4-57k through all of them, and nothing in the log said what the spread had tried).
+                    uint32_t& logged = g_lastSpreadLog[bot->GetGUID().GetCounter()];
+                    if (now - logged >= 10000)
+                    {
+                        logged = now;
+                        TC_LOG_INFO("playerbot.v2.raid", "[raid_spread] {} wants {:.0f} y from the raid at {} and has {:.1f}: no spot ({}; "
+                                    "routine probes {}/{})", bot->GetName(), rule.radius, enemy->GetName(), nearest, g_clearestWhy,
+                                    g_pathProbes, kPathProbeRoutine);
+                    }
                 }
 
     // 3b. Face away (Magmadar): the tank that holds the enemy stands on the far side of it from the raid, so the enemy's back is

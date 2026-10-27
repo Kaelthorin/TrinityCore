@@ -291,6 +291,50 @@ bool OwnerRegistry::SetCcEnabled(uint32 account_id, bool enabled)
     return enabled ? cc_disabled_.erase(account_id) > 0 : cc_disabled_.insert(account_id).second;
 }
 
+uint16 OwnerRegistry::CcDenied(uint32 account_id, uint8 cls) const
+{
+    std::shared_lock lk(mtx_);
+    auto it = cc_deny_.find(account_id);
+    if (it == cc_deny_.end())
+        return 0;
+    CcDenyState const& st = it->second;
+    if (cls >= st.deny.size())
+        return st.every;
+    return uint16((st.every & ~st.allow[cls]) | st.deny[cls]);
+}
+
+void OwnerRegistry::SetCcDeny(uint32 account_id, uint8 cls, uint16 kinds, bool deny)
+{
+    std::unique_lock lk(mtx_);
+    CcDenyState& st = cc_deny_[account_id];
+    if (cls == 0 || cls >= st.deny.size())
+    {
+        // Every class: a class's own "yes" or "no" for these kinds gives way to this order.
+        if (deny) st.every |= kinds; else st.every &= uint16(~kinds);
+        for (size_t c = 0; c < st.deny.size(); ++c)
+        {
+            st.deny[c]  &= uint16(~kinds);
+            st.allow[c] &= uint16(~kinds);
+        }
+    }
+    else if (deny)
+    {
+        st.deny[cls]  |= kinds;
+        st.allow[cls] &= uint16(~kinds);
+    }
+    else
+    {
+        st.deny[cls]  &= uint16(~kinds);
+        st.allow[cls] |= uint16(kinds & st.every);
+    }
+}
+
+void OwnerRegistry::ClearCcDeny(uint32 account_id)
+{
+    std::unique_lock lk(mtx_);
+    cc_deny_.erase(account_id);
+}
+
 Role OwnerRegistry::DeclaredRole(BotId bot) const
 {
     std::shared_lock lk(mtx_);

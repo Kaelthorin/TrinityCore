@@ -1,4 +1,5 @@
-﻿#include "../WanderRule.h"
+﻿#include "Fleet/BotPool.h"
+#include "../WanderRule.h"
 #include "StateBase.h"
 #include "Bot/BotAI.h"
 #include "Bot/TownLife.h"
@@ -10,6 +11,7 @@
 #include "Bot/IdleRule.h"
 #include "Bot/QuestDoable.h"
 #include "Travel/ReachMemory.h"
+#include "Travel/TransportWaitMemory.h"
 #include "Bot/ClassTables.h"
 #include "Bot/Gear/BotGearGenerator.h"   // RaidGearActive / RaidEquipUpgrade (raid-gear upgrade test)
 #include "Bot/RecipeDifficulty.h"
@@ -33,7 +35,10 @@
 #include "Util/ConfigReader.h"  // full type for Services::Config() (detour pull-gate knobs)
 #include "Travel/QuestHubDatabase.h"
 #include "Fleet/TownGatherSource.h"
+#include "Bot/TownErrandConfig.h"
+#include "Bot/FalseCombatEscape.h"
 #include "Bot/World/ZonePicker.h"
+#include "Bot/World/SpreadSpot.h"
 #include "MaintainHelpers.h"       // ChunkedWalkToward (idle watch)
 #include "Travel/RepairVendorIndex.h"
 #include "Travel/UnifiedTravelGraph.h"
@@ -56,6 +61,8 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"      // sObjectMgr->GetGameObjectQuestItemList / GetCreatureQuestItemList
 #include "Bot/QuestObjectiveLocations.h"   // QuestItemDropsFrom* (loot-template quest item sources)
+#include "Bot/ShareMobs.h"
+#include "Bot/PartyLink.h"
 #include "Creature.h"
 #include "SharedDefines.h"
 #include "DBCEnums.h"       // Difficulty enum (cast from snapshot map_difficulty)
@@ -263,6 +270,8 @@ bool MaintainPet(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit,
     // Reset backoff as soon as the bot acquires a pet — the rule will
     // resume when the pet later dies / despawns.
     if (s.has_pet()) { ai.clear_pet_summon_backoff(); return false; }
+    // The owner keeps the pet away ("pet off", Bot/OwnerPicks.h).
+    if (s.owner_pet_off()) return false;
     // Can't summon while mounted / on a transport / in a vehicle — the cast
     // is rejected NOT_MOUNTED and re-tried forever. Wait until settled.
     if (InTransitNoMaintenance(s)) return false;
@@ -361,7 +370,10 @@ bool MaintainPet(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit,
         // dungeon / raid group, Voidwalker solo) - the same pick
         // Apl_Classic_Warlock replaces a wrong demon with, so the two never
         // fight over the pet.
-        if (IsVanillaRealm())
+        // The owner's demon ("prefer demon voidwalker", Bot/OwnerPicks.h) first, as Apl_Classic_Warlock's PetSpell.
+        if (uint32 const pin = s.owner_pick(OwnerPicks::Demon); pin && s.knows_spell(pin))
+            preferred[n++] = pin;
+        else if (IsVanillaRealm())
             if (uint32 const classic = Combat::Interrupt::ClassicWarlockPet(s, g))
                 preferred[n++] = classic;
         if (n > 0) {
@@ -2124,16 +2136,20 @@ constexpr float kRaidRangedTooClose  = 12.0f;  // an elite's melee splash reache
 constexpr float kRaidRangedStandOff  = 22.0f;  // inside every 30y spell / 40y heal, outside the splash
 constexpr float kRaidRangedJoinRange = 25.0f;  // a raid ranged bot this near the tank has joined
 
-// Ranged DPS or healer in a raid (5b's predicate, shared so the three rules
-// always agree on who stands back).
-static bool RaidRangedOrHealer(BotSnapshotView const& s, BotAI const& ai)
+// Ranged DPS or healer by role or spec; RaidRangedOrHealer is the same in a raid
+// (5b's predicate, shared so the three rules always agree on who stands back).
+static bool RangedOrHealerRole(BotSnapshotView const& s, BotAI const& ai)
 {
-    if (!s.is_in_raid()) return false;
     Role const r = ai.effective_role(s);
     if (r == Role::Tank) return false;
     uint8 const cls = s.raw().identity.cls;
     uint16 const spec = uint16(s.spec());
     return r == Role::Healer || IsHealerSpec(cls, spec) || IsRangedSpec(cls, spec);
+}
+
+static bool RaidRangedOrHealer(BotSnapshotView const& s, BotAI const& ai)
+{
+    return s.is_in_raid() && RangedOrHealerRole(s, ai);
 }
 
 // The same predicate for any dungeon / raid group (not battlegrounds): the
@@ -2172,6 +2188,26 @@ GroupMemberSummary const* GroupAnchorTank(BotSnapshotView const& s, BotAI const&
 // An engaged raid elite a ranged bot must keep clear of: alive, targetable,
 // in combat, elite / rare / boss, and fighting a group tank / member / member
 // pet (a mob on THIS bot is left to the tank - running only drags it along).
+// A live mob a group member crowd-controls (a sheep, a shackle) that is in combat with the group: the fight's last business. The
+// coordinator leaves it out of every kill list while it is held, so once its pack is dead nobody would ever kill it: the tank
+// advanced 150 y and pulled on with four while the mage, bound to re-sheep its moon mob, stood by it for 3 minutes (wc_cobrahn 127).
+// The sheep is killed last: the advance holds while it lives and the tank's pull takes it.
+static NearbyUnit const* HeldMobOfTheGroup(BotSnapshotView const& s, GroupSnapshotView const& g)
+{
+    auto const* mems = g.exists() ? g.members() : nullptr;
+    for (auto const& u : s.raw().combat.nearby_enemies)
+    {
+        if (u.hp <= 0 || u.is_player || u.untargetable || u.is_pacified || !u.unit_in_combat || !u.is_cc_locked || u.cc_caster.IsEmpty())
+            continue;
+        bool ours = u.cc_caster == s.guid();
+        if (!ours && mems)
+            for (auto const& m : *mems)
+                if (m.guid == u.cc_caster) { ours = true; break; }
+        if (ours) return &u;
+    }
+    return nullptr;
+}
+
 static bool RaidEngagedElite(NearbyUnit const& u)
 {
     if (u.hp <= 0 || u.is_player || u.untargetable || !u.unit_in_combat) return false;
@@ -2997,7 +3033,9 @@ struct FormationWalk { float x = 0.f, y = 0.f; uint32 since_ms = 0, giveup_until
 bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit)
 {
     constexpr float kFormationSlack = 7.0f;
-    if (!s.is_in_raid() || s.in_battleground() || !g.exists() || !g.members() || !RaidRangedOrHealer(s, ai))
+    // A raid group keeps its formation wherever it fights (support scorecard 233: in the open world the healers kept following their
+    // leader to 5 y from the boss, in melee reach for 35-114 of 120 s).
+    if (!(s.is_in_raid() || s.in_raid_group()) || s.in_battleground() || !g.exists() || !g.members() || !RangedOrHealerRole(s, ai))
         return false;
     if (ai.effective_role(s) == Role::Tank || s.is_casting() || s.is_rooted())
         return false;
@@ -3069,6 +3107,16 @@ bool RaidFormationHold(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
     }
     return RaidRangedApproachTank(s, ai, g, *tk, emit, now_ms, "combat:raid_formation", "combat:raid_formation_hold",
                                   /*off_floor*/ false, kFormationSlack);
+}
+
+bool RaidFormationOwnsMovement(BotSnapshotView const& s, BotAI const& ai, GroupSnapshotView const& g)
+{
+    if (!(s.is_in_raid() || s.in_raid_group()) || s.in_battleground() || !g.exists() || !g.members() || !RangedOrHealerRole(s, ai))
+        return false;
+    if (ai.effective_role(s) == Role::Tank)
+        return false;
+    GroupMemberSummary const* tk = GroupAnchorTank(s, ai, g);
+    return tk && tk->online && tk->is_alive && tk->guid != s.raw().guid && tk->map_id == s.map_id() && tk->in_combat;
 }
 
 // ---------- Pre-pull spacing (raid / tanked dungeon group) ----------
@@ -3818,6 +3866,24 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
     const float step = std::min(kLosStep, dist - 2.0f);
     static constexpr float kLosBearings[] = { 0.0f, 0.5236f, -0.5236f, 1.0472f, -1.0472f, 1.5708f, -1.5708f };
     constexpr float kClearOfElite = kRaidRangedTooClose + 2.0f;
+    // In a 5-man every mob is an elite and the tank-held ones stand on the tank, so a step toward a tank 18 y away always lands
+    // within the raid splash clearance of one and every bearing is thrown out (wc_cobrahn 127: the priest 18 y from its tank with
+    // no sight line, "near an engaged elite 7" twice, six heals failed on line of sight and the tank died from 40% in 8 s). A
+    // dungeon mob held by the tank has no cleave to keep clear of: the step stays out of its melee reach only. A mob loose on a
+    // member keeps the raid clearance, since it may turn on the healer.
+    constexpr float kClearOfHeldDungeonElite = 6.0f;
+    const bool five_man = s.is_in_dungeon() && !s.is_in_raid();
+    auto const clear_of_elites = [&](float px, float py) -> bool
+    {
+        for (auto const& u : s.raw().combat.nearby_enemies)
+        {
+            if (!RaidEngagedElite(u)) continue;
+            const float clearance = five_man && ThreatVictim(u.victim_kind) == ThreatVictim::Tank ? kClearOfHeldDungeonElite : kClearOfElite;
+            const float ux = px - u.x, uy = py - u.y;
+            if (ux * ux + uy * uy < clearance * clearance) return false;
+        }
+        return true;
+    };
     Player* self = ObjectAccessor::FindConnectedPlayer(s.raw().guid);
     // Which filter threw out each bearing, for the "no walkable step" line (Deadmines 2026-10-15 n43: the priest stood 80 s
     // without a sight line to the tank and the log could not say what held it).
@@ -3828,14 +3894,7 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         const float px = bx + (dx * c - dy * sn) * step;
         const float py = by + (dx * sn + dy * c) * step;
         const float pz = bz + (az - bz) * std::min(1.0f, step / dist);
-        bool clear = true;
-        for (auto const& u : s.raw().combat.nearby_enemies)
-        {
-            if (!RaidEngagedElite(u)) continue;
-            const float ux = px - u.x, uy = py - u.y;
-            if (ux * ux + uy * uy < kClearOfElite * kClearOfElite) { clear = false; break; }
-        }
-        if (!clear) { ++rej_elite; continue; }
+        if (!clear_of_elites(px, py)) { ++rej_elite; continue; }
         if (RaidPointBlocked(s, px, py, pz, kHazardMargin) ||
             RaidPointInUnpulledReach(s, px, py, pz)) { ++rej_hazard; continue; }   // nor into an idle pack's reach
         // Never into a tanked boss's front arc: the cone sidestep would take
@@ -3876,15 +3935,8 @@ bool RaidCastLosStep(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView cons
         G3D::Vector3 pt;
         if (RaidPathStepToward(self, ax, ay, az, step, pt))
         {
-            bool clear = true;
-            for (auto const& u : s.raw().combat.nearby_enemies)
-            {
-                if (!RaidEngagedElite(u)) continue;
-                const float ux = pt.x - u.x, uy = pt.y - u.y;
-                if (ux * ux + uy * uy < kClearOfElite * kClearOfElite) { clear = false; break; }
-            }
             float ad2, afx, afy;
-            if (clear && !RaidPointBlocked(s, pt.x, pt.y, pt.z, kHazardMargin) &&
+            if (clear_of_elites(pt.x, pt.y) && !RaidPointBlocked(s, pt.x, pt.y, pt.z, kHazardMargin) &&
                 !RaidPointInUnpulledReach(s, pt.x, pt.y, pt.z) &&
                 !FrontArcBossAt(s, g, pt.x, pt.y, ad2, afx, afy) &&
                 !DungeonStepRefused(s, ai, pt.x, pt.y, pt.z, now_ms))
@@ -4238,28 +4290,45 @@ bool DungeonCombatPositioning(BotSnapshotView const& s, BotAI& ai,
                 //    the OOC route-follower never runs — merely disengaging left the
                 //    tank pinned (RFC regressed to 2/4, combat 578s, 2026-07-23).
                 // If no forward step resolves for either, fall through to disengage.
-                if (!immune_lock && wd2 >= kEscapeMinDisplaceSq)
+                // A bot the autopilot is suspended for (a human leads, Passive, a follow / stay order) never walks to a boss: it
+                // walks to the player it follows, else drops the fight in place (FalseCombatEscape.h).
+                GroupMemberSummary const* esc_leader = nullptr;
+                bool const esc_autopilot = !ai.dungeon_autopilot_suspended();
+                if (!esc_autopilot)
+                    if (auto const* mems = g.members())
+                    {
+                        ObjectGuid const ctl = s.controller_guid();
+                        for (auto const& m : *mems)
+                        {
+                            if (m.is_bot || !m.online || !m.is_alive || m.map_id != s.map_id() || m.guid == s.guid()) continue;
+                            if (!esc_leader || m.guid == ctl) esc_leader = &m;
+                        }
+                    }
+                GroupMemberSummary const* esc_tank = nullptr;
+                if (GroupMemberSummary const* tk = GroupAnchorTank(s, ai, g))
+                    if (tk->online && tk->is_alive && tk->guid != s.guid() && tk->map_id == s.map_id())
+                        esc_tank = tk;
+                FalseCombatEscape::Inputs esc_in;
+                esc_in.autopilot = esc_autopilot;
+                esc_in.is_tank = ai.effective_role(s) == Role::Tank;
+                esc_in.tank_known = esc_tank != nullptr;
+                // Beside the player already (8 y): nothing to walk to, the fight is dropped in place.
+                esc_in.leader_known = esc_leader &&
+                    (esc_leader->x - fcx) * (esc_leader->x - fcx) + (esc_leader->y - fcy) * (esc_leader->y - fcy) > 8.0f * 8.0f;
+                esc_in.immune_lock = immune_lock;
+                esc_in.far_from_boss = wd2 >= kEscapeMinDisplaceSq;
+                FalseCombatEscape::Goal const esc_goal = FalseCombatEscape::Pick(esc_in);
+                if (esc_goal != FalseCombatEscape::Goal::Disengage)
                 {
                     float qx, qy, qz;
                     bool have_step = false;
-                    char const* esc_tag = "";
-                    if (ai.effective_role(s) != Role::Tank)
-                    {
-                        if (GroupMemberSummary const* tk = GroupAnchorTank(s, ai, g))
-                            if (tk->online && tk->is_alive &&
-                                tk->guid != s.guid() && tk->map_id == s.map_id())
-                            {
-                                have_step = DungeonRouteStepTowardPos(
-                                    s, tk->x, tk->y, tk->z, 45.0f, qx, qy, qz);
-                                esc_tag = "TANK";
-                            }
-                    }
+                    char const* esc_tag = FalseCombatEscape::Tag(esc_goal);
+                    if (esc_goal == FalseCombatEscape::Goal::Leader)
+                        have_step = DungeonRouteStepTowardPos(s, esc_leader->x, esc_leader->y, esc_leader->z, 45.0f, qx, qy, qz);
+                    else if (esc_goal == FalseCombatEscape::Goal::Tank)
+                        have_step = DungeonRouteStepTowardPos(s, esc_tank->x, esc_tank->y, esc_tank->z, 45.0f, qx, qy, qz);
                     else
-                    {
-                        have_step = DungeonRouteStepTowardPos(
-                            s, wp.x, wp.y, wp.z, 45.0f, qx, qy, qz);
-                        esc_tag = "boss_wp";
-                    }
+                        have_step = DungeonRouteStepTowardPos(s, wp.x, wp.y, wp.z, 45.0f, qx, qy, qz);
                     if (have_step)
                     {
                         TC_LOG_INFO("playerbot.v2",
@@ -6037,7 +6106,28 @@ static void BgRouteMove(BotSnapshotView const& s, BotAI const& ai, BotIntentEmit
     int const route_variant = int(((uint32(s.guid().GetCounter()) * 2654435761u >> 11) +
                                    (s.raw().bg.score_alliance + s.raw().bg.score_horde) * 3u) % uint32(BgRoutes::Graph::kVariants));
     // A flag carrier always flanks: variant 0 is the plain shortest lane its chasers expect.
-    int const carrier_variant = s.bg_friendly_flag_carrier() == s.guid() ? 1 + route_variant % (BgRoutes::Graph::kVariants - 1) : route_variant;
+    int carrier_variant = s.bg_friendly_flag_carrier() == s.guid() ? 1 + route_variant % (BgRoutes::Graph::kVariants - 1) : route_variant;
+    // AV assault squads (the captain, the general, a node assault: they gather and go in together) walk one route, the plain shortest
+    // one: bot-only AV 262 / 263, from Snowfall 2 of the 8 variants take the river road to Drek'Thar and the others the Iceblood road,
+    // so a quarter of the squad split off and the rest arrived strung out (16 bots over 250 yd six minutes after the go).
+    // The general push walks round the enemy captain's garrison while he is alive (the team left him): AV 263, the Alliance push from
+    // Snowfall took the road through Iceblood Garrison past the living Galvangar and died there (about 120 deaths in 40 yd cells
+    // between (-480,-200) and (-560,-280)).
+    if (s.raw().bg.current_type_id == 1)
+    {
+        auto const& ord = s.raw().bg.order;
+        bool const assault = ord.kind == BgState::BgOrder::PushEndgame || (ord.kind == BgState::BgOrder::AttackNode && ord.squad == 1);
+        if (assault)
+        {
+            carrier_variant = 0;
+            // Drek'Thar / Vanndar, also on the push's graveyard steps (BgAvPlan::GeneralRouteGraveyard)
+            bool const general = ord.target_entry == 11946 || ord.target_entry == 11948;
+            if (general && !s.is_horde() && s.bg_av_galvangar_alive())
+                carrier_variant = BgRoutes::kAvoidGalvangar * BgRoutes::Graph::kVariants;
+            else if (general && s.is_horde() && s.bg_av_balinda_alive())
+                carrier_variant = BgRoutes::kAvoidBalinda * BgRoutes::Graph::kVariants;
+        }
+    }
     // Lane (playtest, WSG 2026-10-09: "straight out the tunnel and straight back"): every bot takes one of the recorded ways across the
     // field, picked by a per-bot hash that shifts with each cap. Flag carriers only take the flanking lanes (a defended flag room is
     // not entered through the mid line). The lane is forced through its recorded path by BgRoutes::NextWaypointLane.
@@ -6341,6 +6431,7 @@ bool BgTryUseObjectiveGo(BotSnapshotView const& s, BotAI& ai,
         emit.use_game_object(go->guid);
         ai.note_action_retry(BotAI::ActionKind::BgUseGo,
                              go_low, bg_now_ms);
+        ai.note_action_retry(BotAI::ActionKind::BgFormHold, 0, bg_now_ms);
         ai.set_last_rule_fired("idle:bg_use_objective_go");
         return true;
     }
@@ -7266,7 +7357,11 @@ bool DungeonConvergeToFight(BotSnapshotView const& s, BotAI& ai,
     // tank a detour) has not joined either: it is pulled back to a valid slot
     // even when in range and LoS (MC 2026-10-06: casters idle on the rocks).
     float off_floor_len = -1.0f;
-    const bool off_floor = Services::Config().behavior_raid_spacing() && raid_ranged && tank_fighting && !s.in_combat() && !s.is_casting() &&
+    // A 5-man healer / caster too (Deadmines deadmines_full 15 Oct, ship deck: the priest stood 9 y below the tank 3 y away on the
+    // map, td <= join range counted it as joined, LINE_OF_SIGHT x17 and the tank died): raid_ranged is false outside a raid, so the
+    // floor test uses the instance predicate and the walk below is the legacy step to the tank's own height.
+    const bool floor_ranged = raid_ranged || InstanceRangedOrHealer(s, ai);
+    const bool off_floor = Services::Config().behavior_raid_spacing() && floor_ranged && tank_fighting && !s.in_combat() && !s.is_casting() &&
                            td <= kJoinRange && RaidBotOffTankFloor(s, *tk, &off_floor_len);
     const bool stuck_out = tank_fighting && !s.in_combat() &&
                            !s.is_casting() && (td > kJoinRange || off_floor);
@@ -7494,8 +7589,11 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 for (auto const& m : *mems)
                     if (!m.is_bot && m.online && m.map_id == s.map_id())
                     { human_in_instance = true; break; }
+        // Not under an owner Hold / Stay: a bot told to hold its spot does not leave the instance (zg_thekal 2026-10-20: the tank
+        // hearthed from the landing in the tick between the scenario Hold lapsing at the order time and its renewal by the mana wait,
+        // after the trash clearing had killed Hakkar and marked the raid's final encounter done).
         if (s.dungeon_complete() && !s.in_combat() && !s.is_casting() &&
-            !human_in_instance)
+            !human_in_instance && !ai.holding_position(now_ms))
         {
             // Look for a teleporter GO. NearbyObject pre-resolves
             // teleport_dest_map for GAMEOBJECT_TYPE_SPELLCASTER (22)
@@ -7634,11 +7732,24 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 float hkx, hky, hkz; s.position(hkx, hky, hkz);
                 focus_kill_zone = (hkz < advice.tight_engage_below_z);
             }
-            const uint32 cc = (cc_cohered && !focus_kill_zone)
-                                  ? ClassCC(s.cls(), s.spec()) : 0;
-            if (cc != 0 && s.knows_spell(cc) && s.is_ready(cc))
+            // The hold spell comes from the vanilla tables of MarkCc (Polymorph, Sap, Shackle Undead, Hibernate ...), picked per mob
+            // by creature type. ClassCC's retail table gave a priest Mind Control: zf_antusul and gnomeregan_grubbis 127, the priest
+            // "held" a mob out of range for minutes (API_BEYOND_RANGE x7 per 11 s), this rule claimed every tick, it never drank, and
+            // the tank waited on healer mana until the run stalled.
+            uint32 cc = 0;
+            ObjectGuid pick;
+            auto const hold_spell_for = [&](NearbyUnit const& u) -> uint32
             {
-                ObjectGuid pick;
+                MarkCc::Option const* o = MarkCc::PickOption(s, s.cls(), MarkCc::TypeOf(u), /*ooc*/ !u.unit_in_combat);
+                if (!o || o->self_cast || o->root) return 0u;   // a trap at the feet or a root is no pre-pull hold
+                float ux, uy, uz; s.position(ux, uy, uz);
+                const float ddx = u.x - ux, ddy = u.y - uy, ddz = u.z - uz;
+                if (ddx * ddx + ddy * ddy + ddz * ddz > o->range * o->range || !u.in_los) return 0u;   // in reach from here, no walking in
+                uint32 const sp = MarkCc::SpellFor(s, *o);
+                return s.is_ready(sp) ? sp : 0u;
+            };
+            if (cc_cohered && !focus_kill_zone && MarkCc::IsMarkCcClass(s.cls()))
+            {
                 ObjectGuid const moon = g.raid_mark(/*moon*/ 4);
                 // Prefer moon-marked target if present and visible.
                 if (!moon.IsEmpty())
@@ -7653,7 +7764,8 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         if (u.is_cc_locked) break;
                         // MarksNeedOrder: the moon on an idle mob is a plan; the sheep on it is the pull.
                         if (!MarkGate::MayEngage(s, ai, &g, moon, &u)) break;
-                        pick = moon;
+                        cc = hold_spell_for(u);
+                        if (cc) pick = moon;
                         break;
                     }
                 }
@@ -7680,6 +7792,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     ObjectGuid const kill_focus = s.raw().pve_order.active ? s.raw().pve_order.kill_focus : ObjectGuid::Empty;
                     std::vector<CcCandidate> cands;
                     std::vector<ObjectGuid> cand_guids;
+                    std::vector<uint32> cand_spells;
                     for (auto const& u : s.raw().combat.nearby_enemies)
                     {
                         if (u.hp <= 0) continue;
@@ -7687,27 +7800,26 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         c.hits_me = u.victim == s.guid();
                         c.locked = u.is_cc_locked;
                         c.is_skull = !skull.IsEmpty() && u.guid == skull;
-                        // Mechanical deny-guard (2026-06-27). The group's CC spells
-                        // — Polymorph (118), Sap (6770), Freezing Trap (187650) — are
-                        // creature-type restricted and return BAD_TARGETS on
-                        // CREATURE_TYPE_MECHANICAL (9). Skip Mechanical candidates so
-                        // the mage never burns GCDs spamming Polymorph on a Defias
-                        // Reaper/Cannon (the 495K-Polymorph-BAD_TARGETS class the A6
-                        // guard exists to prevent). Deny-list (not allow-list) so a
-                        // valid CC is never silently disabled.
-                        c.wrong_type = u.creature_type == 9 && (cc == 118 || cc == 6770 || cc == 187650);
+                        // No hold of this class takes its creature type (a mechanical Defias Reaper under Polymorph: BAD_TARGETS
+                        // every tick, 2026-06-27), or it stands out of the spell's reach or sight from here.
+                        uint32 const sp = hold_spell_for(u);
+                        c.wrong_type = sp == 0;
                         for (uint32_t e : advice.cc_priority_entries)
                             if (e == u.entry) { c.in_priority_list = true; break; }
                         c.is_kill_focus = !kill_focus.IsEmpty() && u.guid == kill_focus;
                         cands.push_back(c);
                         cand_guids.push_back(u.guid);
+                        cand_spells.push_back(sp);
                     }
                     // The group's kill focus (the most dangerous engaged caster of the list) first, else the first eligible add
                     // (Bot/CcPick.h).
                     if (size_t const at = PickCcTarget(cands); at != kNoCcTarget)
+                    {
                         pick = cand_guids[at];
+                        cc = cand_spells[at];
+                    }
                 }
-                if (!pick.IsEmpty())
+                if (!pick.IsEmpty() && cc != 0)
                 {
                     emit.cast(cc, pick);
                     ai.set_last_rule_fired(moon == pick
@@ -9032,6 +9144,35 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                         { any_member_in_combat_adv = true; break; }
                     }
                 }
+            }
+            // A member's crowd-controlled mob still alive is the fight's last business (HeldMobOfTheGroup): no advance while it
+            // lives; the tank walks back within pull range of it and idle:tank_pull_next takes it as the last of its pack.
+            if (NearbyUnit const* held = !any_member_in_combat_adv && s.is_in_dungeon() && !s.is_in_raid() ? HeldMobOfTheGroup(s, g) : nullptr)
+            {
+                any_member_in_combat_adv = true;
+                float hx, hy, hz;
+                s.position(hx, hy, hz);
+                const float hd = std::sqrt((held->x - hx) * (held->x - hx) + (held->y - hy) * (held->y - hy) + (held->z - hz) * (held->z - hz));
+                if (RaidLogDue(RaidLogKey(s, RaidLogKind::PullHeld) ^ 0x68656c64u, now_ms, 5000u))
+                    TC_LOG_INFO("playerbot.v2", "[tank_advance] {} holds: the crowd-controlled entry {} ({}) {:.0f}y away is still alive, it is killed last",
+                                s.name(), held->entry, held->guid.GetCounter(), hd);
+                if (hd > 25.0f)
+                    if (Player* self_h = ObjectAccessor::FindConnectedPlayer(s.raw().guid))
+                    {
+                        G3D::Vector3 hstep;
+                        bool h_off = false;
+                        if (DungeonTargetReachableAndStep(self_h, held->x, held->y, held->z, kRaidPackLookahead, hstep, &h_off) &&
+                            !DungeonStepAlreadyInFlight(s, hstep.x, hstep.y, hstep.z) &&
+                            !DungeonStepRefused(s, ai, hstep.x, hstep.y, hstep.z, now_ms) &&
+                            emit.move_to(hstep.x, hstep.y, hstep.z, /*run=*/true))
+                        {
+                            if (h_off)
+                                ai.set_dungeon_cross(hstep.x, hstep.y, hstep.z, now_ms + 12000);
+                            ai.note_move_commit(s.map_id(), hstep.x, hstep.y, hstep.z, now_ms);
+                            ai.set_last_rule_fired("idle:dungeon_tank_to_held_mob");
+                            return true;
+                        }
+                    }
             }
             if (any_member_in_combat_adv)
             {
@@ -11242,10 +11383,22 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                 // dungeon pull. The bots never set marks themselves, so every icon on a mob is the owner's call.
                 const bool dungeon_flow_pull = s.is_in_dungeon() && Services::Config().behavior_dungeon_flow();
                 float bx, by, bz; s.position(bx, by, bz);
+                // The sheep is killed last: a member's crowd-controlled mob whose pack is dead (no other mob engaged with the group,
+                // no idle mob within 20 y of it that the pull would wake) is pulled like an idle mob (HeldMobOfTheGroup).
+                NearbyUnit const* held_last = s.is_in_dungeon() && !s.is_in_raid() ? HeldMobOfTheGroup(s, g) : nullptr;
+                if (held_last)
+                    for (auto const& o : s.raw().combat.nearby_enemies)
+                    {
+                        if (o.hp <= 0 || o.is_player || o.untargetable || o.is_pacified || o.guid == held_last->guid) continue;
+                        if (o.unit_in_combat && !o.victim.IsEmpty() && !o.is_cc_locked) { held_last = nullptr; break; }
+                        const float ox = o.x - held_last->x, oy = o.y - held_last->y, oz = o.z - held_last->z;
+                        if (!o.unit_in_combat && !o.no_xp_kill && ox * ox + oy * oy + oz * oz <= 20.0f * 20.0f) { held_last = nullptr; break; }
+                    }
                 for (auto const& u : s.raw().combat.nearby_enemies)
                 {
                     if (u.hp <= 0) continue;
-                    if (!u.victim.IsEmpty()) continue;          // already engaged by someone
+                    const bool last_held = held_last && u.guid == held_last->guid;
+                    if (!u.victim.IsEmpty() && !last_held) continue;          // already engaged by someone
                     if (IsKnownBossUnit(s.map_id(), u)) continue;   // bosses (either boss flag, or the tactics table's) go through engage_boss
                     // Environmental/unkillable mobs (scene props, Mining Powder
                     // entry 48284, training dummies) have no_xp_kill or PACIFIED.
@@ -11289,7 +11442,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     // as later engagement rules. Creature-cast CC
                     // (mob CC'ing mob — rare but exists) falls through
                     // because cc_caster won't be in nearby_friends.
-                    if (u.is_cc_locked && !u.cc_caster.IsEmpty())
+                    if (u.is_cc_locked && !u.cc_caster.IsEmpty() && !last_held)
                     {
                         bool cc_by_ally = (u.cc_caster == s.guid());
                         if (!cc_by_ally)
@@ -11334,6 +11487,9 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
                     { bestSq = dsq; best = &u; best_is_priority = true; continue; }
                     if (dsq < bestSq) { bestSq = dsq; best = &u; }
                 }
+                if (best && held_last && best->guid == held_last->guid)
+                    TC_LOG_INFO("playerbot.v2", "[raid_pull] {} pulls the crowd-controlled entry {} ({}): the last of its pack, killed last",
+                                s.name(), best->entry, best->guid.GetCounter());
                 if (best)
                 {
                     // Pull-separately gate (M+ Bolstering, certain raid
@@ -12041,7 +12197,7 @@ bool DungeonDispatch(BotSnapshotView const& s, BotAI& ai,
             {
                 char const* why = s.is_casting() ? "casting" : s.recently_in_combat(5000) ? "combat_within_5s"
                     : s.raw().movement.is_mounted ? "mounted" : !Classic::SafeToRecover(s, &g) ? "not_safe_to_sit(group member fighting within 45y or enemy engaged with the group within 30y)"
-                    : !Classic::BestConsumable(s, Classic::ConsumableKind::Drink) ? "no_drink_item_recognised"
+                    : !Classic::RecoveryConsumable(s, Classic::ConsumableKind::Drink) ? "no_drink_item_recognised"
                     : s.is_moving() ? "moving" : "other";
                 TC_LOG_INFO("playerbot.v2", "[healer_drink] {} is at mana {}% and not drinking: {} (cast {}, last cast {}, last rule {})", s.name(),
                             s.power_pct(POWER_MANA), why, s.current_cast_spell_id(), s.last_cast_spell_id(),
@@ -12519,17 +12675,24 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
             // left to do (this code is only reached then) and the bot stands at its gate spot, it mounts and waits mounted; the
             // moment is spread 20..80 s before the gates open so the room does not mount in one go.
             // 2026-10-08 (playtest, WSG: "the bots are still mounted in here"): no mounts in the start room at all. A bot that arrived
-            // mounted gets off, and none mounts until the gates open (API::mount also refuses during STATUS_WAIT_JOIN).
-            if (s.raw().movement.is_mounted && !s.on_vehicle())
+            // mounted gets off, and none mounts until the gates open (API::mount also refuses there while the WSG doors are closed).
+            // 2026-10-24 (playtest, AB: "should already be mounted"): the dismount and the no-mount hold are only for a start room where the
+            // server refuses a mount (bg_mount_ok: Battleground::GetMountRefusal, the closed WSG doors or an indoor WMO group). Where
+            // players can mount (the open AB start areas), the bots mount in the last seconds of the countdown and ride out on the gates.
+            if (s.raw().movement.is_mounted && !s.on_vehicle() && !s.bg_mount_ok())
             {
                 TC_LOG_INFO("playerbot.v2", "[bg_indoor_dismount] {} dismounts in the start room (prep, {} ms to the gates)", s.name(), s.bg_start_delay_ms());
                 emit.dismount();
                 ai.set_last_rule_fired("idle:bg_prep_dismount");
                 return true;
             }
-            bool const mount_due = false;
             uint32 const now_ms = GameTime::GetGameTimeMS();
             uint32 const bot_salt = uint32(s.guid().GetCounter()) * 2654435761u;
+            // Per-bot moment 12..30 s before the gates, so the room does not mount in one go and a cast cut short still has the 25 s
+            // BgMount retry before the gates open.
+            uint32 const mount_lead_ms = 12000u + (bot_salt >> 7) % 18000u;
+            bool const mount_due = s.bg_mount_ok() && !s.raw().movement.is_mounted && !s.on_vehicle() && s.best_mount_spell() != 0 &&
+                                   s.bg_start_delay_ms() > 0 && s.bg_start_delay_ms() <= mount_lead_ms;
             // The owner, AB test: during the two-minute countdown the team waits at its start gate, loosely spread like players, instead
             // of wandering the start area. WSG / AB / AV have gate anchors; each bot gets its own spot 3..10 y inside the gate and
             // up to 7 y to either side, walks there once and stays (buff / mount rules above still run).
@@ -14322,6 +14485,11 @@ bool BgDispatch(BotSnapshotView const& s, BotAI& ai,
                 float dy = e.y - self_y;
                 float dsq = dx * dx + dy * dy;
                 if (dsq > eng_range * eng_range) continue;  // PvP engage range
+                // A creature only when it already fights us or a teammate, or is the order's target (BgTargetPick::CreatureWorthOpening):
+                // the bot does not pull Korrak or a garrison on its own on the way to its order.
+                if (!e.guid.IsPlayer() &&
+                    !BgTargetPick::CreatureWorthOpening(e, s.guid(), s.pet_guid(), s.nearby_friends(), uint32(s.raw().bg.order.target_entry)))
+                    continue;
                 // Players over mobs (AV/IoC creatures): the fight the owner wants is player vs player. A mob only counts as 'closer'
                 // by 20 y so a guard next to the bot does not hide a player behind it.
                 float const eng_score = dsq + (e.guid.IsPlayer() ? 0.f : 400.f);
@@ -15532,6 +15700,17 @@ void EnsureTravelPlan(BotSnapshotView const& s, BotAI& ai,
                     req.allow_hearth = false;   // hearth would lose travel progress
                     req.skip_trivial = ai.travel_force_graph();
                     Route route = Services::TravelGraph().FindRoute(req);
+                    if (!route.ok && req.from_map == req.to_map)
+                    {
+                        // A far same-map goal with no route falls back to a straight walk that
+                        // cannot find a long way round; say which side had no graph node to
+                        // attach to, or that the search ran dry between them.
+                        TC_LOG_INFO("playerbot.v2",
+                            "[travel_noroute] bot={} map={} from=({:.0f},{:.0f},{:.0f}) to=({:.0f},{:.0f},{:.0f}) dist={:.0f} from_attach={} to_attach={} visited={}",
+                            s.bot_id(), req.from_map, bx, by, bz, tx, ty, tz,
+                            std::sqrt((tx - bx) * (tx - bx) + (ty - by) * (ty - by)),
+                            route.from_attach_count, route.to_attach_count, route.visited_nodes);
+                    }
                     if (route.ok && !route.legs.empty())
                     {
                         auto& g = Services::TravelGraph();
@@ -15752,11 +15931,50 @@ bool DriveTravelPlanTo(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& em
                         if (ride && !s.on_transport())
                         {
                             emit.use_game_object(ride->guid);   // API: board once it stands still at the dock
+                            ::Playerbot::V2::Travel::TransportWaitMemory::Instance().NoteBoarded(lg->payload);
+                            ai.set_transport_wait_since_ms(0);
                             ai.set_last_rule_fired("idle:board_transport");
                             return true;
                         }
                         // Transport not in yet: hold on the dock (no chasing a
                         // moving ship / car — it comes back to this stop).
+                        // A ride that has not come in for TransportWaitMemory::kGiveUpMs is given up: the plan is dropped, and once two
+                        // bots have done so the router leaves the ride out for a while. The Deeprun Tram soak (2026-10-18) had eight bots
+                        // standing on the Stormwind platform for their whole 20 minutes.
+                        {
+                            using ::Playerbot::V2::Travel::TransportWaitMemory;
+                            uint32 const now = s.published_at_ms();
+                            if (ai.transport_wait_since_ms() == 0)
+                                ai.set_transport_wait_since_ms(now);
+                            uint32 const since = ai.transport_wait_since_ms();
+                            if (now - ai.transport_wait_logged_ms() >= 60000u && now - since >= 60000u)
+                            {
+                                ai.set_transport_wait_logged_ms(now);
+                                uint32 seen = 0, serving = 0;
+                                float nearest = -1.f;
+                                for (auto const& go : s.raw().world_objects.nearby_objects)
+                                {
+                                    if (go.go_type != 15 && go.go_type != 11) continue;
+                                    ++seen;
+                                    if (!Services::Portals().ServesSameRoute(lg->payload, go.entry)) continue;
+                                    ++serving;
+                                    float const d = std::sqrt((go.x - bx) * (go.x - bx) + (go.y - by) * (go.y - by) + (go.z - bz) * (go.z - bz));
+                                    if (nearest < 0.f || d < nearest) nearest = d;
+                                }
+                                TC_LOG_INFO("playerbot.v2",
+                                    "[xport_wait] {} waits {} s at the dock ({:.0f},{:.0f},{:.0f}) map {} for route {}: transports in sight {} (this route {}, nearest {:.0f} y; board range {:.0f} y)",
+                                    s.name(), (now - since) / 1000u, bx, by, bz, s.map_id(), lg->payload, seen, serving, nearest, kTransportBoardRange);
+                            }
+                            if (TransportWaitMemory::ShouldGiveUp(since, now))
+                            {
+                                TransportWaitMemory::Instance().NoteGaveUp(lg->payload, now);
+                                TC_LOG_INFO("playerbot.v2", "[xport_wait] {} gave up waiting for route {} after {} s; plan dropped", s.name(), lg->payload,
+                                    (now - since) / 1000u);
+                                ai.clear_travel_plan();   // also clears the wait clock
+                                ai.set_last_rule_fired("idle:transport_wait_giveup");
+                                return true;
+                            }
+                        }
                         ai.set_last_rule_fired("idle:wait_for_transport");
                         return true;
                     }
@@ -16824,6 +17042,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                     if (!entry_matches(u.entry)) continue;
                     if (u.hp <= 0) continue;
                     if (u.victim != ObjectGuid::Empty) continue;
+                    if (V2::ShareMobs::LeaveMob(s, u)) continue;   // a real player's mob (Playerbot.World.ShareMobs)
                     if (recent_active && u.guid == recent) continue;
                     const float dx = u.x - bx, dy = u.y - by, dz = u.z - bz;
                     const float distSq = dx*dx + dy*dy + dz*dz;
@@ -16876,6 +17095,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                     if (!u.guid.IsCreature()) continue;
                     if (u.hp <= 0) continue;
                     if (u.victim != ObjectGuid::Empty) continue;
+                    if (V2::ShareMobs::LeaveMob(s, u)) continue;   // a real player's mob (Playerbot.World.ShareMobs)
                     if (recent_active && u.guid == recent) continue;
                     // Dropper = creature_questitem row OR loot template
                     // (vanilla quest items have no questitem rows).
@@ -17013,6 +17233,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
             const ObjectGuid recent = ai.last_engage_target();
             const bool recent_active = !recent.IsEmpty() &&
                                        (now_ms - ai.last_engage_at_ms() < ai.last_engage_shield_ms());
+            bool const party_follower = V2::Parties::Following(s);
 
             for (auto const& u : s.raw().combat.nearby_enemies)
             {
@@ -17030,6 +17251,9 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (u.level > maxLevel) continue;   // no lower bound: level scaling gives XP on lower-base mobs
                 if (u.hp_pct() < kMinHpPctToTag) continue;
                 if (u.victim != ObjectGuid::Empty) continue;
+                // A real player's camp or quest mob is his (Playerbot.World.ShareMobs): the bot grinds elsewhere.
+                if (V2::ShareMobs::LeaveMob(s, u)) continue;
+                if (party_follower) continue;   // in a small party the leader pulls (Playerbot.World.Parties, idle:party_assist)
                 if (recent_active && u.guid == recent) continue;
                 const float dx = u.x - bx;
                 const float dy = u.y - by;
@@ -17684,7 +17908,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
         // all-bot group) must NOT be pulled to a hub by this rule — it would
         // scatter the group. Solo autonomous bots (ungrouped) still relocate.
         if (!_prof_mode && !has_same_map_turnin && !s.objective_is_relocation() &&
-            !s.in_group() &&
+            !s.in_group() && (Services::Config().world_questing() || !s.is_free_world_bot()) &&
             (s.raw().quest_log.quests.empty() || nothing_local))
         {
             // Pick the nearest hub the bot hasn't already tried unproductively
@@ -17738,6 +17962,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
             {
                 if (!h) continue;
                 if (ai.hub_recently_tried(h->hubId, hub_now_ms)) continue;
+                if (ai.goal_blacklisted(h->location.GetPositionX(), h->location.GetPositionY(), hub_now_ms)) continue;
                 // T-P0a: emit.move_to is map-implicit — it pathfinds on the
                 // bot's CURRENT map. Feeding it a cross-map hub's coordinates
                 // produces a doomed same-map pathfind toward a point that
@@ -17802,10 +18027,19 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 chosen = h;
                 break;
             }
+            if (chosen != nullptr && ai.hub_walk_stalled(chosen->hubId, s.raw().position.x, s.raw().position.y, hub_now_ms))
+            {
+                // Walking at this hub for 40 s and not moving: take the next hub (or the wander below) instead of asking again.
+                ai.note_hub_tried(chosen->hubId, hub_now_ms);
+                ai.blacklist_goal(chosen->location.GetPositionX(), chosen->location.GetPositionY(), hub_now_ms);
+                chosen = nullptr;
+            }
             if (chosen != nullptr)
             {
-                emit.move_to(chosen->location.GetPositionX(),
-                             chosen->location.GetPositionY(),
+                float hub_tx = 0.f, hub_ty = 0.f;
+                ::Playerbot::V2::World::HubStandPoint(chosen->location.GetPositionX(), chosen->location.GetPositionY(), chosen->radius,
+                                                      s.guid().GetCounter(), hub_tx, hub_ty);
+                emit.move_to(hub_tx, hub_ty,
                              chosen->location.GetPositionZ(),
                              /*run*/ true);
                 ai.set_last_rule_fired("idle:travel_to_hub");
@@ -19381,7 +19615,7 @@ bool AutoactDispatch(BotSnapshotView const& s, BotAI& ai,
                 if (!ai.action_recently_tried(BotAI::ActionKind::BgPort,
                                                mt_key, mt_now_ms))
                 {
-                    emit.cast(s.best_mount_spell());
+                    emit.emit(MountIntent{s.best_mount_spell()});   // stops the bot first: a mount cast is refused while moving
                     ai.note_action_retry(BotAI::ActionKind::BgPort,
                                          mt_key, mt_now_ms);
                     ai.set_last_rule_fired("idle:mount_for_travel");
@@ -20508,16 +20742,36 @@ void DispatchIdle(BotAI& ai,
         uint32 const now = s.published_at_ms();
         float px, py, pz;
         s.position(px, py, pz);
-        bool const exempt = s.has_owner_character() || s.in_group() || s.in_battleground() || s.is_in_instance() || s.on_transport()
+        // A scenario squad member stands where the test put it; the watch walk sent a priest to the hub at a parity leg's start (147: 29 s lost).
+        bool const exempt = ::Playerbot::Pool::IsScenarioBot(s.guid().GetCounter()) || s.has_owner_character() || s.in_group() || s.in_battleground() || s.is_in_instance() || s.on_transport()
             || s.is_mounted() || s.is_swimming() || s.in_combat() || s.is_casting() || s.hp_pct() < 70
             || Classic::IsEating(s) || Classic::IsDrinking(s)   // a meal or a mana drink is a reason to stand
             || (ai.last_rule_fired() && (std::strcmp(ai.last_rule_fired(), "idle:inn_rest") == 0            // resting at the inn is a reason to stand
                                          || std::strcmp(ai.last_rule_fired(), "idle:mailbox") == 0        // and standing at a mailbox
+                                         || std::strcmp(ai.last_rule_fired(), "idle:town_linger") == 0    // or at the place of a town errand
+                                         || std::strcmp(ai.last_rule_fired(), "idle:gathering") == 0      // or at a campfire outside the gate
+                                         || std::strcmp(ai.last_rule_fired(), "idle:gate_duel") == 0      // or watching a gate duel
                                          || std::strcmp(ai.last_rule_fired(), "idle:res_sick_wait") == 0)); // so is waiting out Resurrection Sickness
         // The watch's own forced walk overwrites the last rule; keep the one before it, which is what held the bot.
         if (char const* lr = ai.last_rule_fired(); lr && std::strcmp(lr, "idle:watch_walk") != 0)
             w.prev_rule = lr;
-        if (V2::IdleStuck(w, px, py, now, exempt))
+        // In a capital with the town errands on, a bot standing IdleSec (20 s) with no reason is caught sooner, and the first strikes
+        // just drop its errand so idle:town_errand sends it to a new place across the city; the forced walks below follow from the
+        // third strike, when the errand rule is not what holds it.
+        bool const town_errands = ::Playerbot::V2::TownErrand::Cfg().errands && ::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id());
+        bool const stuck = V2::IdleStuck(w, px, py, now, exempt, town_errands ? ::Playerbot::V2::TownErrand::Cfg().idle_ms : ::Playerbot::V2::TownErrand::Cfg().field_idle_ms);
+        if (stuck && town_errands && w.strikes < 3)
+        {
+            auto& te = ai.town_errand();
+            if (te.place) ::Playerbot::V2::TownErrand::Spots::Get().Release(te.place, s.guid().GetCounter());
+            if (te.key) te.recent.add(te.key);
+            te.Clear();
+            ::Playerbot::V2::TownLife::Counters().idle_town.fetch_add(1, std::memory_order_relaxed);
+            TC_LOG_INFO("playerbot.v2", "[idle] bot={} lvl={} map={} zone={} stationary {}s last_rule={} strikes={} -> new errand",
+                s.name(), uint32(s.level()), s.map_id(), s.zone_id(), ::Playerbot::V2::TownErrand::Cfg().idle_ms / 1000u,
+                ai.last_rule_fired() ? ai.last_rule_fired() : "-", w.strikes);
+        }
+        else if (stuck)
         {
             // Found standing again and again while the quest approach (it only runs more than 80 y from the goal) was the last thing
             // to move it: the goal cannot be closed from here (Derno and Phili, Burning Steppes, strikes 1..5 for 45 minutes: a forced walk
@@ -20580,7 +20834,8 @@ void DispatchIdle(BotAI& ai,
             (::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id()) ? ::Playerbot::V2::TownLife::Counters().idle_town : ::Playerbot::V2::TownLife::Counters().idle_field)
                 .fetch_add(1, std::memory_order_relaxed);
             TC_LOG_INFO("playerbot.v2", "[idle] bot={} lvl={} map={} zone={} stationary {}s last_rule={} strikes={} -> {} ({:.0f},{:.0f})",
-                s.name(), uint32(s.level()), s.map_id(), s.zone_id(), V2::kIdleStuckMs / 1000u,
+                s.name(), uint32(s.level()), s.map_id(), s.zone_id(),
+                (town_errands ? ::Playerbot::V2::TownErrand::Cfg().idle_ms : ::Playerbot::V2::TownErrand::Cfg().field_idle_ms) / 1000u,
                 ai.last_rule_fired() ? ai.last_rule_fired() : "-", w.strikes, what, tx, ty);
         }
         if (w.has_target && !exempt)

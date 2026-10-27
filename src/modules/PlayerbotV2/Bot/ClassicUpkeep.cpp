@@ -4,6 +4,7 @@
 #include "BotSnapshotView.h"
 #include "ClassTables.h"
 #include "ClassicSupplies.h"
+#include "VirtualSupply.h"
 #include "Group/GroupSnapshot.h"
 #include "Raid/RaidEncounters.h"
 #include "SharedDefines.h"
@@ -30,6 +31,8 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include "Bot/ResistGear.h"
+#include "Bot/AlwaysBuffs.h"
 
 namespace Playerbot::Classic {
 
@@ -164,6 +167,16 @@ int BlessingAt(BotSnapshotView const& s, size_t paladin_index, std::span<Blessin
     for (size_t i = paladin_index; i < order.size(); ++i)
         if (s.knows_spell(kBlessings[order[i]].normal))
             return order[i];
+    return -1;
+}
+
+// The blessing (kBlessings index) an owner pick names ("prefer blessing might"; OwnerPicks.h), -1 = none.
+int PinnedBlessing(uint32 spell)
+{
+    if (spell)
+        for (size_t i = 0; i < std::size(kBlessings); ++i)
+            if (kBlessings[i].normal == spell)
+                return int(i);
     return -1;
 }
 
@@ -415,8 +428,26 @@ bool SubgroupHasTank(BotSnapshotView const& s, GroupSnapshotView const& g)
     return false;
 }
 
+// The owner's totem `pin` for this element ("prefer earth stoneskin"; OwnerPicks.h), which the shaman knows. It stands in for the
+// element's whole plan (the reactive Tremor / cleansing totems included: the owner asked for this one). A damage fire totem goes
+// down only near a living victim, as the plan's Searing does; Magma and Fire Nova with a mob within their reach.
+uint32 OwnerTotem(BotSnapshotView const& s, Element e, uint32 pin)
+{
+    if (e != FIRE || pin == FROST_RESISTANCE_TOTEM || pin == FLAMETONGUE_TOTEM)
+        return pin;
+    if (pin == MAGMA_TOTEM || pin == FIRE_NOVA_TOTEM)
+        return s.enemies_within(8.0f) >= 1 ? pin : 0;
+    NearbyUnit const* v = s.victim_info();
+    if (!v || v->hp_pct() < 25)
+        return 0;
+    float bx, by, bz; s.position(bx, by, bz);
+    return Dist2(v->x, v->y, v->z, bx, by, bz) <= 18.f * 18.f ? pin : 0;
+}
+
 uint32 DesiredTotem(BotSnapshotView const& s, GroupSnapshotView const& g, Element e)
 {
+    if (uint32 const pin = s.owner_pick(OwnerPicks::Slot(OwnerPicks::TotemEarth + e)); pin && s.knows_spell(pin))
+        return OwnerTotem(s, e, pin);
     bool const self_melee = !ShamanIsCaster(s.spec());
     auto const melee_mate = [](GroupMemberSummary const& m) { return m.role == Role::Tank || IsMeleeSpec(m.cls, m.spec); };
     size_t const index = ShamanIndexInParty(s, g);
@@ -500,14 +531,19 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
     if (s.cls() != CLASS_PALADIN || s.is_mounted())
         return {};
     int64 const min_ms = in_combat ? 0 : 60'000;
+    // The owner's blessing for this paladin, when it knows it: it gives that one to everyone and leaves the group split.
+    int pinned = PinnedBlessing(s.owner_pick(OwnerPicks::Blessing));
+    if (pinned >= 0 && !s.knows_spell(kBlessings[pinned].normal))
+        pinned = -1;
 
     auto const* members = g.members();
     if (!members || members->empty())
     {
-        // Solo: bless self by own role.
+        // Solo: bless self by own role (or the owner's blessing).
         bool const tank = IsTankSpec(CLASS_PALADIN, uint16(s.spec()));
-        int const b = BlessingAt(s, 0, tank ? std::span<Blessing const>(kSoloTankOrder)
-                                          : MemberBlessingOrder(CLASS_PALADIN, s.spec(), false));
+        int const b = pinned >= 0 ? pinned
+                    : BlessingAt(s, 0, tank ? std::span<Blessing const>(kSoloTankOrder)
+                                            : MemberBlessingOrder(CLASS_PALADIN, s.spec(), false));
         if (b < 0 || !s.is_ready(kBlessings[b].normal))
             return {};
         AuraEntry const* mine = s.find_aura(kBlessings[b].normal);
@@ -519,18 +555,63 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
         return { kBlessings[b].normal, s.guid(), key };
     }
 
+    bool const raid = g.is_raid();
+    bool const greater_ok = s.item_count(SYMBOL_OF_KINGS) > 0;
+    float bx, by, bz; s.position(bx, by, bz);
+    auto in_reach = [&](GroupMemberSummary const& m)
+    {
+        return m.online && m.is_alive && m.map_id == s.map_id()
+            && (m.guid == s.guid() || Dist2(m.x, m.y, m.z, bx, by, bz) <= kBlessRange * kBlessRange);
+    };
+
+    // The owner's blessing: every member in reach gets it, as a Greater Blessing per class once Symbol of Kings is in the bags.
+    // Salvation never goes on a tank (it cuts the tank's threat); that tank gets nothing from this paladin.
+    if (pinned >= 0)
+    {
+        Blessing const pb = Blessing(pinned);
+        bool const greater = greater_ok && s.knows_spell(kBlessings[pb].greater) && GreaterBlessingWorks(kBlessings[pb].greater);
+        for (GroupMemberSummary const& m : *members)
+        {
+            if (!m.cls || m.cls >= 16 || !in_reach(m) || HasBlessing(m.buffs, pb, min_ms)) continue;
+            bool const tank = IsTankMember(s, m);
+            if (tank && pb == SALVATION) continue;
+            bool class_has_tank = false;
+            for (GroupMemberSummary const& o : *members)
+                if (o.cls == m.cls && o.online && IsTankMember(s, o)) { class_has_tank = true; break; }
+            if (greater && !(class_has_tank && pb == SALVATION))
+            {
+                uint64 const key = (1ull << 48) | (uint64(pb) << 8) | m.cls;
+                if (s.is_ready(kBlessings[pb].greater) && !skip(key))
+                    return { kBlessings[pb].greater, m.guid, key };
+                continue;
+            }
+            uint64 const key = (2ull << 48) | (uint64(pb) << 40) | (m.guid.GetCounter() & 0xFFFFFFFFFFull);
+            if (s.is_ready(kBlessings[pb].normal) && !skip(key))
+                return { kBlessings[pb].normal, m.guid, key };
+        }
+        return {};
+    }
+
+    // Blessings the owners of the other bot paladins pinned ("prefer blessing might"): those paladins give them to everyone, so
+    // they are left out of the split, and the pinned paladins do not count in it.
+    auto const pinned_other = [&](GroupMemberSummary const& m)
+    {
+        return m.cls == CLASS_PALADIN && m.is_bot && m.online && m.is_alive && m.map_id == s.map_id() && m.guid != s.guid()
+            && PinnedBlessing(m.owner_blessing) >= 0;
+    };
+    uint8 others_pinned = 0;   // bit per Blessing
+    for (GroupMemberSummary const& m : *members)
+        if (pinned_other(m))
+            others_pinned = uint8(others_pinned | (1u << PinnedBlessing(m.owner_blessing)));
+
     // This paladin's index among the group's bot paladins on the map (by
     // guid, stable across ticks). A human paladin blesses by hand: its
     // blessings still count as present (HasBlessing reads any caster).
     size_t index = 0;
     for (GroupMemberSummary const& m : *members)
         if (m.cls == CLASS_PALADIN && m.is_bot && m.online && m.is_alive && m.map_id == s.map_id()
-            && m.guid != s.guid() && m.guid < s.guid())
+            && m.guid != s.guid() && m.guid < s.guid() && !pinned_other(m))
             ++index;
-
-    bool const raid = g.is_raid();
-    bool const greater_ok = s.item_count(SYMBOL_OF_KINGS) > 0;
-    float bx, by, bz; s.position(bx, by, bz);
 
     // Kings for the tanks (+10% stamina is the biggest blessing a tank gets): the lowest-guid Protection bot paladin
     // of the map owns Kings on every class that has a tank in it (Kings is a Protection talent), whatever the class
@@ -538,7 +619,7 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
     ObjectGuid kings_guid;
     for (GroupMemberSummary const& m : *members)
         if (m.cls == CLASS_PALADIN && m.is_bot && m.online && m.is_alive && m.map_id == s.map_id() && m.spec == 66
-            && (kings_guid.IsEmpty() || m.guid < kings_guid))
+            && !pinned_other(m) && !(others_pinned & (1u << KINGS)) && (kings_guid.IsEmpty() || m.guid < kings_guid))
             kings_guid = m.guid;
     size_t const index_without_kings = (!kings_guid.IsEmpty() && kings_guid != s.guid() && kings_guid < s.guid()) ? index - 1 : index;
     struct ClassPlan { std::array<Blessing, 6> order{}; size_t n = 0; size_t index = 0; };
@@ -553,20 +634,16 @@ CastPick PickBlessing(BotSnapshotView const& s, GroupSnapshotView const& g, bool
                 return p;
             }
             for (Blessing b : base)
-                if (b != KINGS)
+                if (b != KINGS && !(others_pinned & (1u << b)))
                     p.order[p.n++] = b;
             p.index = index_without_kings;
             return p;
         }
         for (Blessing b : base)
-            p.order[p.n++] = b;
+            if (!(others_pinned & (1u << b)))
+                p.order[p.n++] = b;
         p.index = index;
         return p;
-    };
-    auto in_reach = [&](GroupMemberSummary const& m)
-    {
-        return m.online && m.is_alive && m.map_id == s.map_id()
-            && (m.guid == s.guid() || Dist2(m.x, m.y, m.z, bx, by, bz) <= kBlessRange * kBlessRange);
     };
     uint16 seen = 0;   // bit per recipient class already planned (classes 1..11)
     for (GroupMemberSummary const& first : *members)
@@ -664,8 +741,30 @@ CastPick PickImbue(BotSnapshotView const& s, bool in_combat)
     return {};
 }
 
+// A damage caster's weapon oil: Brilliant Wizard Oil (+36 spell damage, +1% crit) on the main hand while it carries no temporary enchant, as
+// every raiding caster ran it. Not the shaman (its Flametongue imbue holds the same slot) and not the healers (Brilliant Mana Oil is a separate pick).
+constexpr uint32 BRILLIANT_WIZARD_OIL = 20749;
+static bool IsDamageCaster(BotSnapshotView const& s)
+{
+    switch (s.cls())
+    {
+        case CLASS_MAGE:
+        case CLASS_WARLOCK: return true;
+        case CLASS_PRIEST:  return s.spec() == 258;                        // Shadow
+        case CLASS_DRUID:   return s.spec() == 102;                        // Balance
+        default:            return false;
+    }
+}
+
 ItemPick PickPoison(BotSnapshotView const& s)
 {
+    if (IsDamageCaster(s) && !s.is_mounted())
+    {
+        WeaponUpkeep const& mh = s.classic_upkeep().main_hand;
+        if (!mh.guid.IsEmpty() && s.item_count(BRILLIANT_WIZARD_OIL) > 0 && (!mh.temp_enchant || mh.temp_remaining.count() < 60'000))
+            return { BRILLIANT_WIZARD_OIL, mh.guid };
+        return {};
+    }
     if (s.cls() != CLASS_ROGUE || s.is_mounted())
         return {};
     auto best_in_bags = [&s](char const* family) -> uint32
@@ -711,7 +810,7 @@ uint32 PickTotem(BotSnapshotView const& s, GroupSnapshotView const& g)
         if (cur.spell == want && cur.totem)
         {
             // In place: keep it unless the fight moved away from it.
-            if (e == FIRE)
+            if (e == FIRE && want != FROST_RESISTANCE_TOTEM && want != FLAMETONGUE_TOTEM)
             {
                 NearbyUnit const* v = s.victim_info();
                 if (!v || Dist2(v->x, v->y, v->z, cur.totem->x, cur.totem->y, cur.totem->z) <= 18.f * 18.f)
@@ -772,9 +871,9 @@ uint32 HealRank(BotSnapshotView const& s, GroupSnapshotView const& g, uint32 spe
 void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out)
 {
     out.clear();
-    // Ammo for the equipped bow / crossbow / gun: short under 30% of the target (the entry is the
+    // Ammo for the equipped bow / crossbow / gun: short under 60% of the target (the entry is the
     // ammo item the restock will hand out, so it doubles as the retry-lockout key).
-    if (Services::Config().behavior_ammo_supply() && s.ammo_kind() != 0 && s.ammo_count() < AmmoLowBelow())
+    if (Services::Config().behavior_ammo_supply() && s.ammo_kind() != 0 && s.ammo_count() < (AlwaysOn(s, AlwaysSwitch::Supplies) ? AMMO_TARGET : AmmoLowBelow()))
         if (uint32 const ammo = BestAmmo(s.ammo_kind(), s.level()))
             out.push_back(ammo);
     if (!Services::Config().classic_class_supplies())
@@ -798,7 +897,9 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out)
         }
         else
             have = s.item_count(best);
-        if (have < std::max<uint32>(1u, SupplyTarget(f, s.level()) / 2u))
+        // Playerbot.AlwaysBuffs: topped up to the full stack as soon as one is used, not only under half of it.
+        uint32 const want = AlwaysOn(s, AlwaysSwitch::Supplies) ? SupplyTarget(f, s.level()) : std::max<uint32>(1u, SupplyTarget(f, s.level()) / 2u);
+        if (have < want)
             out.push_back(best);
     }
 }
@@ -972,6 +1073,13 @@ uint32 BestConsumable(BotSnapshotView const& s, ConsumableKind kind, bool conjur
     return best;
 }
 
+uint32 RecoveryConsumable(BotSnapshotView const& s, ConsumableKind kind)
+{
+    bool const water = kind == ConsumableKind::Drink;
+    uint32 const rank = Services::Config().classic_class_supplies() ? VirtualRecoveryRank(water, s.cls(), uint8(s.level())) : 0;
+    return RecoveryItemOrVirtual(BestConsumable(s, kind), Services::Config().classic_class_supplies(), rank);
+}
+
 bool CombatConsumableUsedRecently(BotSnapshotView const& s, uint32 window_ms)
 {
     for (InventoryItem const& it : s.raw().inventory.bag_items)
@@ -1004,9 +1112,11 @@ bool IsDrinking(BotSnapshotView const& s) { return HasRegenAura(s, true); }
 
 bool RecoverBeforeWalking(BotSnapshotView const& s)
 {
-    if (s.hp_pct() < 50) return true;
     if (IsEating(s) || IsDrinking(s)) return true;
-    return s.max_power(POWER_MANA) > 0 && s.power_pct(POWER_MANA) < 20 && BestConsumable(s, ConsumableKind::Drink) != 0;
+    // Hurt: stop only for a meal the bot can sit down to; with nothing to eat it keeps going instead of standing about (it never sits
+    // just to regenerate).
+    if (s.hp_pct() < 50 && RecoveryConsumable(s, ConsumableKind::Food) != 0) return true;
+    return s.max_power(POWER_MANA) > 0 && s.power_pct(POWER_MANA) < 20 && RecoveryConsumable(s, ConsumableKind::Drink) != 0;
 }
 
 bool SafeToRecover(BotSnapshotView const& s, GroupSnapshotView const* g)
@@ -1132,6 +1242,8 @@ bool RaidConsumableBuffUp(BotSnapshotView const& s, RaidConsumable const& c)
     return false;
 }
 
+} // namespace
+
 // The raid role whose kit the bot uses. The group's role wins (a healer-flipped paladin takes the healer kit), then
 // the tank test the blessings use, then the spec.
 RaidConsumableRole RaidConsumableRoleOf(BotSnapshotView const& s, GroupSnapshotView const& g)
@@ -1155,9 +1267,15 @@ RaidConsumableRole RaidConsumableRoleOf(BotSnapshotView const& s, GroupSnapshotV
     return role;
 }
 
+namespace {
+
+constexpr uint8 kDungeonKitMinLevel = 58;   // the flasks and elixirs of the kits need level 51-55; dungeon runs of the raiding bots are 58+
+
 bool RaidConsumablesApply(BotSnapshotView const& s)
 {
-    return IsVanillaRealm() && s.in_group() && s.is_in_raid() && s.is_alive() && !s.is_mounted() && ConsumablesAllowed(s);
+    // A raid, and, with Playerbot.Raid.ConsumablesInDungeons, any dungeon instance a bot of the raiding levels is in with a group.
+    bool const where = s.is_in_raid() || (s.is_in_instance() && s.level() >= kDungeonKitMinLevel && Services::Config().raid_consumables_in_dungeons());
+    return IsVanillaRealm() && s.in_group() && where && s.is_alive() && !s.is_mounted() && ConsumablesAllowed(s);
 }
 
 } // namespace
@@ -1167,6 +1285,18 @@ bool ConsumablesAllowed(BotSnapshotView const& s)
     // A battleground or arena map is PvP; everything else (open world, dungeons, raids) is PvE.
     bool const pvp = s.in_battleground() || s.is_bg_orphan();
     return pvp ? Services::Config().consumables_pvp() : Services::Config().consumables_pve();
+}
+
+AlwaysPlace AlwaysPlaceOf(BotSnapshotView const& s, GroupSnapshotView const* g)
+{
+    if (s.in_battleground() || s.is_bg_orphan())
+        return AlwaysPlace::Battleground;
+    return s.is_in_raid() || s.is_in_instance() || (g && g->is_raid()) ? AlwaysPlace::Raid : AlwaysPlace::World;
+}
+
+bool AlwaysOn(BotSnapshotView const& s, AlwaysSwitch what, GroupSnapshotView const* g)
+{
+    return Services::Config().always_on(what, AlwaysPlaceOf(s, g));
 }
 
 uint32 PickRaidConsumable(BotSnapshotView const& s, GroupSnapshotView const& g)
@@ -1183,9 +1313,18 @@ uint32 PickRaidConsumableStock(BotSnapshotView const& s, GroupSnapshotView const
 {
     if (!RaidConsumablesApply(s))
         return 0;
+    // A resistance potion is stocked only for a school this raid's bosses deal; one for another school counts as handled.
+    uint32 const map_id = s.map_id();
+    auto const school_wanted = [map_id](RaidConsumable const& c)
+    {
+        for (Resist r : { Resist::Fire, Resist::Frost, Resist::Nature, Resist::Shadow })
+            if (c.item == ResistPotionItem(r))
+                return InstanceDealsSchool(map_id, r);
+        return true;
+    };
     RaidConsumable const* next = NextRaidConsumableToStock(RaidConsumableRoleOf(s, g),
         [&](uint32 item) { return s.item_count(item); },
-        [&](RaidConsumable const& c) { return RaidConsumableBuffUp(s, c); });
+        [&](RaidConsumable const& c) { return RaidConsumableBuffUp(s, c) || (c.combat && !school_wanted(c)); });
     return next ? next->item : 0;
 }
 
@@ -1207,10 +1346,10 @@ RecoveryPick PickRecovery(BotSnapshotView const& s, int32 start_hp, int32 start_
     bool const eating = IsEating(s);
     bool const drinking = IsDrinking(s);
     if (!eating && hp < start_hp)
-        if (uint32 const food = BestConsumable(s, ConsumableKind::Food))
+        if (uint32 const food = RecoveryConsumable(s, ConsumableKind::Food))
             return { food, false };
     if (!drinking && mana_user && mana < start_mana)
-        if (uint32 const drink = BestConsumable(s, ConsumableKind::Drink))
+        if (uint32 const drink = RecoveryConsumable(s, ConsumableKind::Drink))
             return { drink, false, true };
     // A grouped instance DPS (start_mana == kPullReadyDpsManaPct) sits only to 85%: the rest is minutes of waiting for the raid.
     int32 const top_mana = start_mana == kPullReadyDpsManaPct ? 85 : kTopOffPct;
@@ -1302,7 +1441,9 @@ bool BossFight(BotSnapshotView const& s)
         return false;
     }
     NearbyUnit const* v = s.victim_info();
-    return v && v->hp > 0 && (IsBossUnit(*v) || v->max_hp >= 100'000);
+    // Open world: a boss or a big pool as before, and now also an elite or a pack of three or more, so a bot grinding or questing
+    // kills them faster; the long cooldowns still come back for the bosses.
+    return v && v->hp > 0 && (IsBossUnit(*v) || v->max_hp >= 100'000 || v->is_elite_or_rare || s.attackers_count() >= 3);
 }
 
 namespace {
@@ -1353,6 +1494,7 @@ void NoteManaItemRefused(BotSnapshotView const& s)
     if (s.max_power(POWER_MANA) <= 0 || !s.in_combat() || !s.is_in_instance() || s.power_pct(POWER_MANA) > 20 || !LogPaced(s, 0x6D616E61u))
         return;
     uint32 potions = 0, runes = 0, gems = 0, other = 0, rune_items = 0;
+    std::string states;   // each mana item in the bags: what UsableNow reads for it
     for (InventoryItem const& it : s.raw().inventory.bag_items)
     {
         if (it.entry == 12662)
@@ -1360,6 +1502,9 @@ void NoteManaItemRefused(BotSnapshotView const& s)
         if (!IsConsumableClass(it.item_class, it.item_subclass))
             continue;
         ConsumableInfo const& info = Classify(it.entry);
+        if (info.kinds & (KindBit(ConsumableKind::ManaPotion) | KindBit(ConsumableKind::ManaItem)))
+            states += fmt::format(" [{} req {} (bot {}), skill {}/{}, cooldown {} ms]", it.entry, info.req_level, uint32(s.level()),
+                                  info.req_skill ? s.skill_value(uint16(info.req_skill)) : 0u, info.req_skill_rank, s.cd_remaining(info.spell).count());
         if (info.kinds & KindBit(ConsumableKind::ManaPotion))
             potions += it.count;
         else if (info.kinds & KindBit(ConsumableKind::ManaItem))
@@ -1394,9 +1539,9 @@ void NoteManaItemRefused(BotSnapshotView const& s)
         }
     }
     TC_LOG_INFO("playerbot.v2", "[raid_consume] {} mana {}% and no mana item picked: casting {}, consumables allowed {}, a combat consumable used recently {}, "
-                "usable potion {}, in the bags: {} mana potions, {} runes ({} Demonic Runes by entry), {} gems, {} other combat consumables, hp {}%",
+                "usable potion {}, in the bags: {} mana potions, {} runes ({} Demonic Runes by entry), {} gems, {} other combat consumables, hp {}%, items:{}",
                 s.name(), s.power_pct(POWER_MANA), s.is_casting() ? 1 : 0, ConsumablesAllowed(s) ? 1 : 0, CombatConsumableUsedRecently(s) ? 1 : 0,
-                BestConsumable(s, ConsumableKind::ManaPotion), potions, runes, rune_items, gems, other, s.hp_pct());
+                BestConsumable(s, ConsumableKind::ManaPotion), potions, runes, rune_items, gems, other, s.hp_pct(), states);
 }
 
 // ======================= Raid support =======================
@@ -1859,8 +2004,11 @@ uint32 ResistPotionItem(Resist r)
 {
     switch (r)
     {
-        case Resist::Fire: return 13457;   // Greater Fire Protection Potion
-        default:           return 0;
+        case Resist::Fire:   return 13457;   // Greater Fire Protection Potion
+        case Resist::Frost:  return 13456;   // Greater Frost Protection Potion
+        case Resist::Nature: return 13458;   // Greater Nature Protection Potion
+        case Resist::Shadow: return 13459;   // Greater Shadow Protection Potion
+        default:             return 0;
     }
 }
 
@@ -1881,6 +2029,27 @@ uint32 PickResistPotion(BotSnapshotView const& s)
     if (CombatConsumableUsedRecently(s))
         return 0;
     return item;
+}
+
+uint8 PickResistGearSchool(BotSnapshotView const& s)
+{
+    if (!IsVanillaRealm() || !s.in_group() || !s.is_in_raid() || !s.is_alive() || !ResistSwapMap(s.map_id()) || !ConsumablesAllowed(s))
+        return 0;
+    Raid::RaidRules const* rules = Raid::RulesForMap(s.map_id());
+    if (!rules || rules->resistPotion.empty())
+        return 0;
+    for (NearbyUnit const& u : s.nearby_enemies())   // nearest first
+    {
+        if (u.hp <= 0 || u.is_player || !IsBossUnit(u))
+            continue;
+        for (Raid::ResistPotion const& rp : rules->resistPotion)
+            if (rp.enemy == u.entry)
+                for (auto const& [school, spell_school] : { std::pair{ Resist::Fire, uint8(SPELL_SCHOOL_FIRE) }, std::pair{ Resist::Nature, uint8(SPELL_SCHOOL_NATURE) },
+                                                            std::pair{ Resist::Frost, uint8(SPELL_SCHOOL_FROST) }, std::pair{ Resist::Shadow, uint8(SPELL_SCHOOL_SHADOW) } })
+                    if (rp.item == ResistPotionItem(school))
+                        return spell_school;
+    }
+    return 0;
 }
 
 CastPick PickFearWard(BotSnapshotView const& s, GroupSnapshotView const& g)
@@ -2079,6 +2248,17 @@ uint32 BestMageConjure(ConsumableKind kind, std::function<bool(uint32)> const& k
     return best ? best->spell : 0;
 }
 
+bool IsMageConjure(uint32 spell, ConsumableKind& kind)
+{
+    for (ConjureSpell const& c : MageConjureSpells())
+        if (c.spell == spell)
+        {
+            kind = c.kind;
+            return true;
+        }
+    return false;
+}
+
 bool MageConjuresFamily(uint8 cls, std::string_view family, std::function<bool(uint32)> const& knows)
 {
     if (cls != CLASS_MAGE)
@@ -2107,6 +2287,10 @@ uint32 MageConjureSpell(BotSnapshotView const& s, ConsumableKind kind, uint32 wa
         if (it.item_class == ITEM_CLASS_CONSUMABLE && Classify(it.entry).conjured
             && (Classify(it.entry).kinds & KindBit(kind)))
             have += it.count;
+    // No conjured stack to top up and no free slot: the cast fails (DONT_REPORT) and the mage stood recasting it every half minute
+    // (live 244, Devonia in Stormwind with full bags).
+    if (have == 0 && s.bag_free_slots() == 0)
+        return 0;
     return have < want_below ? spell : 0;
 }
 
@@ -2557,7 +2741,10 @@ uint32 PickPaladinAura(BotSnapshotView const& s, GroupSnapshotView const& g)
 
     auto const* members = g.members();
     uint32 pick = 0;
-    if (!members || members->empty())
+    // The owner's aura ("prefer aura fire"; OwnerPicks.h), when this paladin knows it: held whatever the party plan says.
+    if (uint32 const pin = s.owner_pick(OwnerPicks::Aura); pin && s.knows_spell(pin))
+        pick = pin;
+    else if (!members || members->empty())
     {
         Role const role = IsTankSpec(CLASS_PALADIN, uint16(s.spec())) ? Role::Tank
                         : IsHealerSpec(CLASS_PALADIN, uint16(s.spec())) ? Role::Healer : Role::Dps;
@@ -2585,6 +2772,12 @@ uint32 PickPaladinAura(BotSnapshotView const& s, GroupSnapshotView const& g)
             if (!m.is_bot)
             {
                 if (uint32 const h = HeldAura(m); h && nt < 8) taken[nt++] = h;
+                continue;
+            }
+            // Another bot paladin holding its owner's aura: taken, and that paladin is out of the plan.
+            if (m.guid != s.guid() && m.owner_aura)
+            {
+                if (nt < 8) taken[nt++] = m.owner_aura;
                 continue;
             }
             pals.push_back(&m);
@@ -2870,6 +3063,109 @@ bool IsCurseDispelSpell(uint32 spell)
         if (eff.IsEffect(SPELL_EFFECT_DISPEL) && eff.MiscValue == int32(DISPEL_CURSE))
             return true;
     return false;
+}
+
+} // namespace Playerbot::Classic
+
+namespace Playerbot {
+
+namespace {
+
+std::string_view SpellEnglishName(SpellInfo const* si)
+{
+    return si && si->SpellName ? std::string_view((*si->SpellName)[LOCALE_enUS]) : std::string_view();
+}
+
+void ResolveAlwaysAura(AlwaysAura const& row, std::vector<uint32>& out)
+{
+    if (row.kind == AlwaysKind::Spell)
+    {
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(row.id, DIFFICULTY_NONE);
+        if (SpellEnglishName(si).find(row.name) != std::string_view::npos)
+            out.push_back(row.id);
+        else
+            TC_LOG_ERROR("playerbot.v2", "[always_buff] spell {} is not '{}', skipped", row.id, row.name);
+        return;
+    }
+    ItemTemplate const* tmpl = sObjectMgr->GetItemTemplate(row.id);
+    if (!tmpl || std::string_view(tmpl->GetName(LOCALE_enUS)).find(row.name) == std::string_view::npos)
+    {
+        TC_LOG_ERROR("playerbot.v2", "[always_buff] item {} is not '{}', skipped", row.id, row.name);
+        return;
+    }
+    for (ItemEffectEntry const* eff : tmpl->Effects)
+    {
+        if (!eff || eff->TriggerType != ITEM_SPELLTRIGGER_ON_USE || eff->SpellID <= 0)
+            continue;
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(uint32(eff->SpellID), DIFFICULTY_NONE);
+        if (!si)
+            continue;
+        bool triggers = false;
+        for (SpellEffectInfo const& e : si->GetEffects())
+        {
+            if (row.kind == AlwaysKind::Stone)
+            {
+                if (e.IsEffect(SPELL_EFFECT_ENCHANT_ITEM_TEMPORARY))
+                    out.push_back(uint32(e.MiscValue));
+            }
+            else if (e.TriggerSpell)
+            {
+                out.push_back(e.TriggerSpell);
+                triggers = true;
+            }
+        }
+        // A scroll or elixir leaves its own aura; food only eats and triggers the stat buff (Well Fed). The eating aura (Food 1129 / 1131, an on-use
+        // spell of its own beside the Well Fed one) ends when the bot stands, so it is never up on a bot that fights: as a row aura it read as
+        // missing on every check and idle:always_buff fired every 10 s for each bot through the whole support scorecard (233, "+1129").
+        if (row.kind == AlwaysKind::Item && !triggers && !si->HasAuraInterruptFlag(SpellAuraInterruptFlags::Standing))
+            out.push_back(uint32(eff->SpellID));
+    }
+}
+
+} // namespace
+
+std::span<uint32 const> AlwaysAuraEffects(AlwaysAura const& row)
+{
+    static std::mutex mu;
+    static std::map<std::pair<uint8, uint32>, std::vector<uint32>> cache;
+    std::lock_guard<std::mutex> lk(mu);
+    auto const key = std::make_pair(uint8(row.kind), row.id);
+    auto it = cache.find(key);
+    if (it == cache.end())
+    {
+        std::vector<uint32> v;
+        ResolveAlwaysAura(row, v);
+        it = cache.emplace(key, std::move(v)).first;
+    }
+    return it->second;
+}
+
+} // namespace Playerbot
+
+namespace Playerbot::Classic {
+
+uint32 PickStrangerBuff(BotSnapshotView const& s, uint8 held, bool target_has_mana, uint8& bit_out)
+{
+    bit_out = 0;
+    if (!IsVanillaRealm() || s.in_combat() || s.is_mounted() || SelfInDruidForm(s))
+        return 0;
+    struct Def { uint8 cls; uint32 base; uint8 bit; bool mana_only; };
+    static constexpr Def kDefs[] = {
+        { CLASS_PRIEST, 1243, 1, false },   // Power Word: Fortitude
+        { CLASS_MAGE,   1459, 2, true  },   // Arcane Intellect
+        { CLASS_DRUID,  1126, 4, false },   // Mark of the Wild
+    };
+    for (Def const& d : kDefs)
+    {
+        if (d.cls != s.cls() || (held & d.bit) || (d.mana_only && !target_has_mana) || !s.knows_spell(d.base))
+            continue;
+        uint32 const spell = EffectiveBuffSpell(s, d.base);
+        if (!spell || !SpellAppliesAura(sSpellMgr->GetSpellInfo(spell, DIFFICULTY_NONE)) || !s.is_ready(spell))
+            continue;
+        bit_out = d.bit;
+        return spell;
+    }
+    return 0;
 }
 
 } // namespace Playerbot::Classic

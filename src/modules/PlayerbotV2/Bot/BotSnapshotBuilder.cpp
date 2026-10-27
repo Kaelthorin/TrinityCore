@@ -14,6 +14,7 @@
 #include "StatPriority.h"
 #include "Gear/BotGearGenerator.h"   // RaidGearActive / RaidEquipUpgrade (raid-gear upgrade test)
 #include "../Services.h"
+#include "../Diagnostics/DamageParity.h"
 #include "../Util/ConfigReader.h"     // ConfigReader full type — Services::Config() use below
 #include "../Fleet/BotGuildMgr.h"
 #include "../Fleet/CraftOrderBoard.h"
@@ -2379,6 +2380,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     {
         snap->tactic_burn = bot_ai->tactic_burn();
         snap->tactic_save_mana = bot_ai->tactic_save_mana();
+        snap->owner_picks = bot_ai->owner_picks();
+        snap->aoe_denied = bot_ai->aoe_denied();
     }
     snap->social_events.has_duel_request = p->duel && p->duel->State == DUEL_STATE_CHALLENGED &&
                                   p->duel->Initiator != p;
@@ -3061,6 +3064,9 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                     if (eff->TriggerType == ITEM_SPELLTRIGGER_ON_USE)
                     {
                         dst.on_use_spell_id = static_cast<uint32>(eff->SpellID);
+                        if (SpellInfo const* use_info = sSpellMgr->GetSpellInfo(eff->SpellID, DIFFICULTY_NONE))
+                            if (SpellHistory const* use_hist = p->GetSpellHistory(); use_hist && use_hist->HasCooldown(use_info, item->GetEntry()))
+                                dst.on_use_cd_ms = static_cast<uint32>(std::max<int64>(1, use_hist->GetRemainingCooldown(use_info).count()));
                         break;
                     }
                 }
@@ -3260,7 +3266,12 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         uint8 const want = gun ? ITEM_SUBCLASS_BULLET : ITEM_SUBCLASS_ARROW;
         for (auto const& it : snap->inventory.bag_items)
             if (it.item_class == ITEM_CLASS_PROJECTILE && it.item_subclass == want)
-                snap->consumables.ammo_count += it.count;
+            {
+                // A stack the bot cannot use yet (above its level) is no ammo: AutoSelectAmmo skips it as well.
+                ItemTemplate const* ammo_proto = sObjectMgr->GetItemTemplate(it.entry);
+                if (ammo_proto && p->CanUseItem(ammo_proto) == EQUIP_ERR_OK)
+                    snap->consumables.ammo_count += it.count;
+            }
     }
 
     // Wand damage school, the same rule Spell::Spell applies to a wand user's
@@ -3359,6 +3370,22 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         }
     }
 
+    // ---- Owner crowd-control orders ("@warlock no fear", "off cc"): those of the player who commands the bot, the owner, or the
+    // group's controller for a bot whose owner is not in the group (BotCommandParser::ApplyCcOrder). ----
+    if (Services::Initialized())
+    {
+        uint32 cc_account = 0;
+        if (snap->led_by_player && !snap->owner_in_group)
+        {
+            if (Player const* c = ObjectAccessor::FindConnectedPlayer(snap->controller_guid); c && c->GetSession())
+                cc_account = c->GetSession()->GetAccountId();
+        }
+        else
+            cc_account = Services::Owners().GetOwner(snap->bot_id).account_id;
+        if (cc_account)
+            snap->cc_deny = Services::Owners().CcDenied(cc_account, snap->identity.cls);
+    }
+
     // ---- Spellbook (sorted, binary-searchable in BotSnapshotView::knows_spell) ----
     // Filter (active && !disabled) + copy + sort of the whole SpellMap
     // (300+ entries) used to run every Build, though the result only
@@ -3393,6 +3420,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
         if (ks_throttled)
         {
             snap->spellbook.known_spells = ks_ai->cached_known_spells();
+            snap->spellbook.range_bonus = ks_ai->cached_range_bonus();
         }
         else
         {
@@ -3403,8 +3431,17 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 snap->spellbook.known_spells.push_back(spell_id);
             }
             std::sort(snap->spellbook.known_spells.begin(), snap->spellbook.known_spells.end());
+            // The range the cast is held to (Spell::CalcMinMaxRange) carries the caster's SpellModOp::Range modifiers: 241 support scorecard, the fire
+            // mage with Flame Throwing (+6 y) stood 24 y from the boss, inside Fire Blast's 26 y, and never cast it in 8 of 9 runs because the
+            // rotation read the spell's 20 y.
+            snap->spellbook.range_bonus.clear();
+            for (uint32 sid : snap->spellbook.known_spells)
+                if (SpellInfo const* si = sSpellMgr->GetSpellInfo(sid, DIFFICULTY_NONE); si && si->RangeEntry)
+                    if (float const bonus = si->GetMaxRange(false, p) - si->GetMaxRange(false); bonus != 0.0f)
+                        snap->spellbook.range_bonus.emplace_back(sid, bonus);
             if (ks_ai)
             {
+                ks_ai->mutable_cached_range_bonus() = snap->spellbook.range_bonus;
                 ks_ai->mutable_cached_known_spells() = snap->spellbook.known_spells;
                 ks_ai->set_cached_spellmap_size(ks_active);
                 ks_ai->set_last_known_spells_scan_ms(ks_now);
@@ -3822,6 +3859,11 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     {
         if (Spell* casting = p->GetCurrentSpell(static_cast<CurrentSpellTypes>(slot)))
         {
+            // A cast whose cast time is over and whose projectile is still in flight (LAUNCHED) is no longer a cast in progress: the core
+            // accepts the next cast (Unit::IsNonMeleeSpellCast skips it) and the bot is free to act. Counting it held every caster idle for the
+            // flight time of its Fireball / Frostbolt / Shadow Bolt (0.4-0.9 s after each, ~15 s of every 120).
+            if (slot == CURRENT_GENERIC_SPELL && casting->getState() == SPELL_STATE_LAUNCHED)
+                continue;
             snap->cast.is_casting           = true;
             snap->cast.current_cast_spell_id = casting->m_spellInfo->Id;
             const int32 rem            = casting->GetRemainingCastTime();
@@ -3852,9 +3894,11 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
     threat_tanks.clear();
     snap->combat.group_tank = ObjectGuid::Empty;
     snap->combat.big_raid = false;
+    snap->combat.raid_group = false;
     if (Group const* tg = p->GetGroup())
     {
         snap->combat.big_raid = tg->GetMembersCount() > 15;
+        snap->combat.raid_group = tg->isRaidGroup();
         for (auto const& slot : tg->GetMemberSlots())
         {
             Player* mp = slot.guid == p->GetGUID() ? p : ObjectAccessor::GetPlayer(*p, slot.guid);
@@ -3903,6 +3947,13 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                         break;
                     }
             u.stun_immune = immune;
+        }
+        // Bleed immunity (warrior Rend): the whole spell, so a mechanic
+        // immunity on the spell or on its periodic effect both count.
+        if (p->GetClass() == CLASS_WARRIOR)
+        {
+            static SpellInfo const* const rend = sSpellMgr->GetSpellInfo(772, DIFFICULTY_NONE);
+            u.bleed_immune = rend && t->IsImmunedToSpell(rend, MAX_EFFECT_MASK, p);
         }
         if (u.has_threat_list)
         {
@@ -4009,10 +4060,15 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
             if (CreatureTemplate const* act = ac->GetCreatureTemplate())
             {
                 u.creature_type = uint8(act->type);
-                if (act->unit_flags & UNIT_FLAG_PACIFIED)
-                    u.is_pacified = true;
-                if (act->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
-                    u.untargetable = true;
+                // The template flags mark static props. A unit that is hitting somebody is no prop: an event boss
+                // (Pyroguard Emberseer) is spawned with them and its script clears them on the live unit.
+                if (!ac->GetVictim())
+                {
+                    if (act->unit_flags & UNIT_FLAG_PACIFIED)
+                        u.is_pacified = true;
+                    if (act->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
+                        u.untargetable = true;
+                }
             }
         }
         // Attacker-side CC scan — same shape as nearby_enemies. Without
@@ -4044,6 +4100,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 if (IsDemoApDebuff(asi->Id))
                     NoteApDebuff(u, abase);
                 if (asi->Mechanic == MECHANIC_ROOT) u.root_caster = abase->GetCasterGUID();   // MarkCc: Entangling Roots up (not CC-locked)
+                if (asi->Mechanic == MECHANIC_ROOT || asi->Mechanic == MECHANIC_SNARE) u.snared = true;   // Concussive Shot, Wing Clip, Frostbolt: a hunter can step back
                 int pri = -1;
                 switch (asi->Mechanic)
                 {
@@ -4607,7 +4664,8 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 if (CreatureTemplate const* ct = c->GetCreatureTemplate())
                     u.is_ranged_caster = ct->unit_class == CLASS_MAGE;   // creatures only have warrior, paladin, rogue and mage
                 u.is_boss_rank = c->isWorldBoss()
-                    || c->GetCreatureClassification() == CreatureClassifications::Obsolete;   // vanilla rank 3 "boss"
+                    || c->GetCreatureClassification() == CreatureClassifications::Obsolete    // vanilla rank 3 "boss"
+                    || Diagnostics::Parity::IsSupportBoss(c->GetGUID());                       // the support scorecard's boss dummy
                 // Folds CREATURE_STATIC_FLAG_NO_XP + template flags_extra
                 // NO_XP. Training dummies and other no-reward targets must
                 // never be grind-engaged (they don't die, grant nothing, and
@@ -4657,10 +4715,16 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 {
                     // CreatureType is uint8 in TC; Beast=1, etc.
                     u.creature_type = uint8(ct->type);
-                    if (ct->unit_flags & UNIT_FLAG_PACIFIED)
-                        u.is_pacified = true;
-                    if (ct->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
-                        u.untargetable = true;
+                    // Static props only: a unit that is hitting somebody is no prop. Pyroguard Emberseer is spawned with these flags
+                    // and its script clears them on the live unit, so the template flags kept the attackable boss out of the
+                    // raid tracker and the DPS stood idle (UBRS 20 Oct).
+                    if (!c->GetVictim())
+                    {
+                        if (ct->unit_flags & UNIT_FLAG_PACIFIED)
+                            u.is_pacified = true;
+                        if (ct->unit_flags & UNIT_FLAG_UNINTERACTIBLE)
+                            u.untargetable = true;
+                    }
                     // Elite / RareElite / Rare = legit high-HP, slow kills; the
                     // unkillable-target leash must never abandon them.
                     u.is_elite_or_rare =
@@ -4771,6 +4835,7 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 if (IsDemoApDebuff(asi->Id))
                     NoteApDebuff(u, abase);
                 if (asi->Mechanic == MECHANIC_ROOT) u.root_caster = abase->GetCasterGUID();   // MarkCc: Entangling Roots up (not CC-locked)
+                if (asi->Mechanic == MECHANIC_ROOT || asi->Mechanic == MECHANIC_SNARE) u.snared = true;   // Concussive Shot, Wing Clip, Frostbolt: a hunter can step back
                 int pri = -1;
                 switch (asi->Mechanic)
                 {
@@ -8225,6 +8290,49 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 }
                 snap->world_objects.nearby_objects.push_back(n);
             }
+
+            // Tram cars (type-11 GOs that run between two stations on one map, the Deeprun Tram): they sit in the grid, so the
+            // MO-transport set above never holds them, and the 30 y object scan only sees one standing right beside the bot. A
+            // bot waiting on the platform for a ride looked at "transports in sight 0" for 300 s, then gave the route up. The
+            // cars are few and known (PortalIndex), so look them up by spawn id within the same 200 y.
+            if (Services::Initialized() && Services::Portals().IsInitialized())
+            {
+                auto const& car_ids = Services::Portals().ShuttleSpawnIds(p->GetMapId());
+                if (!car_ids.empty())
+                {
+                    static std::atomic<uint32> s_carLogAt{0};
+                    uint32 const cnow = GameTime::GetGameTimeMS();
+                    uint32 last = s_carLogAt.load(std::memory_order_relaxed);
+                    if (cnow - last >= 120000u && s_carLogAt.compare_exchange_strong(last, cnow ? cnow : 1u))
+                    {
+                        size_t in_world = 0;
+                        for (uint64 const id : car_ids)
+                            if (GameObject* c = tmap->GetGameObjectBySpawnId(id); c && c->IsInWorld()) ++in_world;
+                        TC_LOG_INFO("playerbot.v2", "[xport_cars] map {}: {} tram cars known, {} in the world; {} sees {:.0f},{:.0f},{:.0f}",
+                            p->GetMapId(), car_ids.size(), in_world, p->GetName(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ());
+                    }
+                }
+                for (uint64 const spawn_id : car_ids)
+                {
+                    GameObject* car = tmap->GetGameObjectBySpawnId(spawn_id);
+                    if (!car || !car->IsInWorld()) continue;
+                    const float cdx = car->GetPositionX() - p->GetPositionX();
+                    const float cdy = car->GetPositionY() - p->GetPositionY();
+                    const float cdz = car->GetPositionZ() - p->GetPositionZ();
+                    if (cdx*cdx + cdy*cdy + cdz*cdz > kTransportScanSq) continue;
+                    bool const have = std::any_of(snap->world_objects.nearby_objects.begin(), snap->world_objects.nearby_objects.end(),
+                        [&](BotSnapshot::NearbyObject const& o) { return o.guid == car->GetGUID(); });
+                    if (have) continue;
+                    BotSnapshot::NearbyObject n{};
+                    n.guid    = car->GetGUID();
+                    n.entry   = car->GetEntry();
+                    n.go_type = car->GetGoType();
+                    n.x = car->GetPositionX();
+                    n.y = car->GetPositionY();
+                    n.z = car->GetPositionZ();
+                    snap->world_objects.nearby_objects.push_back(n);
+                }
+            }
         }
 
         // ---- Extended gathering-node scan (200y) ----
@@ -9204,15 +9312,15 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 static constexpr AvWsNode AV_WS_NODES[] = {
                     {   638.5f,  -31.5f,  46.0f, 1325, 1326, 1327, 1328, 0, "Stormpike Aid Station"    },
                     {   669.0f, -294.0f,  30.0f, 1333, 1335, 1334, 1336, 0, "Stormpike Graveyard"      },
-                    {    73.7f, -426.0f,  61.0f, 1302, 1304, 1301, 1303, 0, "Stonehearth Graveyard"    },
+                    {    77.8f, -404.7f,  46.9f, 1302, 1304, 1301, 1303, 0, "Stonehearth Graveyard"    },
                     {  -202.5f, -113.0f,  78.0f, 1341, 1343, 1342, 1344, 0, "Snowfall Graveyard"       },
                     {  -612.5f, -397.0f,  61.0f, 1346, 1348, 1347, 1349, 0, "Iceblood Graveyard"       },
                     { -1082.5f, -347.0f,  55.0f, 1337, 1339, 1338, 1340, 0, "Frostwolf Graveyard"      },
                     { -1402.0f, -307.0f,  89.0f, 1329, 1331, 1330, 1332, 0, "Frostwolf Relief Hut"     },
-                    {   556.0f,  -84.0f,  52.0f, 1361, 1375, 1370, 1378, 1, "Dun Baldar South Bunker"  },
-                    {   678.0f, -139.0f,  64.0f, 1362, 1374, 1371, 1379, 1, "Dun Baldar North Bunker"  },
+                    {   553.8f,  -78.7f,  51.9f, 1361, 1375, 1370, 1378, 1, "Dun Baldar South Bunker"  },
+                    {   674.0f, -143.1f,  63.7f, 1362, 1374, 1371, 1379, 1, "Dun Baldar North Bunker"  },
                     {   203.0f, -361.0f,  56.0f, 1363, 1376, 1372, 1380, 1, "Icewing Bunker"           },
-                    {  -154.0f, -446.0f,  45.0f, 1364, 1377, 1373, 1381, 1, "Stonehearth Bunker"       },
+                    {  -152.4f, -441.6f,  40.4f, 1364, 1377, 1373, 1381, 1, "Stonehearth Bunker"       },
                     {  -572.0f, -263.0f,  75.0f, 1368, 1390, 1385, 1395, 2, "Iceblood Tower"           },
                     {  -768.0f, -363.0f,  91.0f, 1367, 1389, 1384, 1394, 2, "Tower Point"              },
                     { -1303.0f, -317.0f, 114.0f, 1366, 1388, 1383, 1393, 2, "East Frostwolf Tower"     },
@@ -10605,6 +10713,17 @@ std::shared_ptr<BotSnapshot const> BotSnapshotBuilder::Build(Player* p, BotAI* b
                 snap->craft_orders.want_payment_copper = payment;
             }
         }
+    }
+
+    // Playerbot.World.Questing = 0: a bot of the world (no owner, no group) sees no quests, so nothing sends it to a giver, a hub or a quest
+    // objective; it grinds and roams (idle:grind_roam). A companion keeps its quests (CompanionQuest).
+    if (!Services::Config().world_questing() && snap->owner_guid.IsEmpty() && snap->owner_name.empty() && snap->group.group_guid.IsEmpty() && !snap->led_by_player)
+    {
+        uint16 const completed = snap->quest_log.completed_quest_count;
+        snap->quest_log.reset();
+        snap->quest_log.completed_quest_count = completed;
+        snap->quest_discovery.quest_offers.clear();
+        snap->quest_discovery.quest_turnins.clear();
     }
 
     return snap;

@@ -97,9 +97,10 @@ public:
         bool   callouts_enabled          = true;
         uint32 callout_key_cooldown_ms   = 60000;
         uint32 callout_group_cooldown_ms = 8000;
+        bool   callout_taunts            = false;   // a tank's taunt line at a loose mob (ike3 pool, many are villain quotes)
         bool   suggest_enabled           = true;
-        uint32 suggest_bot_cooldown_ms   = 1800000;
-        uint32 suggest_channel_cooldown_ms = 180000;
+        uint32 suggest_bot_cooldown_ms   = 900000;
+        uint32 suggest_channel_cooldown_ms = 90000;
         uint32 suggest_global_cooldown_ms  = 10000;
         uint32 global_max_per_minute     = 60;
     };

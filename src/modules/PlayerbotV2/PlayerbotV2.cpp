@@ -1,4 +1,4 @@
-// Playerbot V2 - Module entry implementation
+﻿// Playerbot V2 - Module entry implementation
 // All TrinityCore hook surfaces from PlayerbotV2.h are wired here. Some carry
 // dispatch (login/logout register the bot; OnDeath taps loot; DamageTaken /
 // HealReceived push event-bus entries; Whisper routes through the command
@@ -7,6 +7,7 @@
 
 #include "Util/SlowCall.h"
 #include "PlayerbotV2.h"
+#include "LfgBotFill.h"
 #include "Services.h"
 #include "Fleet/RaidSubgroupPlan.h"
 #include "Bot/BotRegistry.h"
@@ -19,6 +20,8 @@
 #include "Bot/World/ZonePicker.h"
 #include "PlayerbotMovement.h"
 #include "Session/BotSessionMgr.h"
+#include "Session/HumanLogin.h"
+#include "Fleet/BotAccountMgr.h"
 #include "Fleet/BotCharacterFactory.h"
 #include "Fleet/BotNamePool.h"
 #include "Fleet/BotPopulationManager.h"
@@ -46,8 +49,11 @@
 #include "Bot/BotArchetype.h"
 #include "Bot/BotRng.h"
 #include "Bot/BotCommandParser.h"
+#include "Bot/BotChatModel.h"
 #include "Bot/BotChatReactor.h"
+#include "Bot/ChannelChat.h"
 #include "Bot/GroupOrderText.h"
+#include "Bot/CcDeny.h"
 #include "Util.h"
 #include "Bot/AddonHint.h"
 #include "Bot/BotTextMgr.h"
@@ -60,6 +66,7 @@
 #include "SpellMgr.h"
 #include "Group/GroupSnapshotBuilder.h"
 #include "Group.h"
+#include "BotGroupRules.h"
 #include "GitRevision.h"
 #include <filesystem>
 #include <fstream>
@@ -73,6 +80,9 @@
 #include "Bot/BotCommandParser.h"
 #include "Threading/SnapshotPublisher.h"
 #include "Threading/TickScheduler.h"
+#include "Threading/ReactionWake.h"
+#include "Bot/ReactionTiming.h"
+#include "Combat/Apl/ApInterrupt.h"
 #include "Threading/SnapshotBuildPool.h"
 #include "Persistence/PlayerbotMigrationMgr.h"
 #include "Diagnostics/PerfCounters.h"
@@ -82,6 +92,7 @@
 #include "World/WorldMetadata.h"
 #include "Fleet/BotIdentityRegistry.h"
 #include "Fleet/OwnerRegistry.h"
+#include "Fleet/BotPool.h"
 #include "Bot/GroupControl.h"
 #include "CharacterCache.h"
 #include "Bot/BotAI.h"
@@ -118,6 +129,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 #include <array>
 #include <cctype>
 #include <string_view>
@@ -668,16 +680,28 @@ void GlobalStuckRescue(Player* p, BotAI* ai)
 // generated threat only. World thread (post-barrier publish pass).
 // Non-tank bots of such a group (not in a battleground, inside a dungeon or raid map)
 // get Playerbot.DpsThreatMultiplier instead (Karrz's VMaNGOS 0.8: DPS pull less); 1.0 = off.
+// On a raid map a tank gets Playerbot.Raid.TankThreatMultiplier instead, and with Playerbot.Raid.SureTaunt its taunts never miss:
+// a raid boss's threat drops (Onyxia's and Broodlord's Knock Away, the BWL drakes' Wing Buffet) halve the tank, and x3 left a halved
+// tank below the DPS (bwl_broodlord 256: the boss on DPS and healers from 25 s on, 40 deaths). The scenario squads have no owner;
+// Playerbot.Scenario.OwnerThreat gives them the same multipliers, so a scenario tests what a player's raid gets.
+struct TankThreatSettings
+{
+    float tank = 3.0f, raid_tank = 5.0f, dps = 1.0f;
+    bool sure_taunt = true, scenario_as_owned = true;
+};
+
 void UpdateTankThreatMultiplier(BotId id, Player* p, BotAI const* ai,
-                                BotSnapshot const& snap, float tank_mult, float dps_mult)
+                                BotSnapshot const& snap, TankThreatSettings const& cfg)
 {
     if (!p)
         return;
     float want = 1.0f;
+    bool sure_taunt = false;
     std::string duty = "none";
+    bool const owned = Services::Owners().GetOwner(id).account_id != 0 || (cfg.scenario_as_owned && Pool::IsScenarioBot(id));
     // Not in a battleground: no tank duty there, and the threat it multiplied would only be an NPC's (AV).
-    if ((tank_mult != 1.0f || dps_mult != 1.0f) && p->GetGroup() && !snap.bg.in_battleground &&
-        Services::Owners().GetOwner(id).account_id != 0)
+    if ((cfg.tank != 1.0f || cfg.raid_tank != 1.0f || cfg.dps != 1.0f || cfg.sure_taunt) && p->GetGroup() &&
+        !snap.bg.in_battleground && owned)
     {
         PveOrder const& po = snap.pve_order;
         bool tank = false;
@@ -693,16 +717,21 @@ void UpdateTankThreatMultiplier(BotId id, Player* p, BotAI const* ai,
             duty = tank ? "role-tank" : "none";
         }
         if (tank)
-            want = tank_mult;
-        else if (dps_mult != 1.0f && (snap.instance_ctx.is_in_dungeon || snap.instance_ctx.is_in_raid))
-            want = dps_mult;
+        {
+            want = snap.instance_ctx.is_in_raid ? cfg.raid_tank : cfg.tank;
+            sure_taunt = cfg.sure_taunt && snap.instance_ctx.is_in_raid;
+        }
+        else if (cfg.dps != 1.0f && (snap.instance_ctx.is_in_dungeon || snap.instance_ctx.is_in_raid))
+            want = cfg.dps;
     }
+    if (p->GetThreatManager().GetTauntNeverMisses() != sure_taunt)
+        p->GetThreatManager().SetTauntNeverMisses(sure_taunt);
     API api(p);
     if (api.threat_multiplier() == want)
         return;
     api.set_threat_multiplier(want);
-    TC_LOG_DEBUG("playerbot.v2", "[tank_threat] {} threat x{:.2f} (duty {})",
-                p->GetName(), want, duty);
+    TC_LOG_DEBUG("playerbot.v2", "[tank_threat] {} threat x{:.2f} (duty {}){}",
+                p->GetName(), want, duty, sure_taunt ? ", taunts never miss" : "");
 }
 
 // Bot cast pacing (Playerbot.Cast.*, OFF by default): when enabled, raid bots cast faster
@@ -725,6 +754,64 @@ void UpdateCastSpeed(Player* p, BotSnapshot const& snap, ConfigReader::CastPacin
     TC_LOG_DEBUG("playerbot.v2", "[cast_speed] {} context={} cast/gcd x{:.2f} (skill {:+d}%)",
                 p->GetName(), CastContextName(ctx), want,
                 cfg.enabled ? CastSkillOffsetPct(snap.guid, cfg.variance_pct) : 0);
+}
+
+// Reaction speed (Playerbot.Reaction.WakeOnGcd) and its measurement. A bot in combat whose global cooldown or cast ends between two
+// regular tick slots is woken on the world tick it ends in; the timing record notes, per bot, when each of the three reactions
+// became possible (GCD end, a kickable cast with the interrupt ready, a leave-hazard order) so the executor can log how long the
+// bot took. World thread (publish pass).
+void NoteReaction(BotId id, BotSnapshot const& snap, Ms now, bool wake_on_gcd)
+{
+    ReactionTiming& rt = ReactionTiming::Instance();
+    // The timing record covers bots grouped with a player or other bots (a dungeon / raid / companion group); the solo world bots
+    // fighting in the open world are most of the combat bots at any time and would drown the group's numbers. The wake is for both.
+    bool const grouped = !snap.group.group_guid.IsEmpty();
+    if (!snap.vitals.is_alive || !snap.vitals.in_combat)
+    {
+        rt.NoteKickPossible(id, false, snap.published_at_ms);
+        rt.NoteHazardOrder(id, false, snap.published_at_ms);
+        return;
+    }
+    int64 busy = snap.cooldowns.gcd_remaining.count();
+    if (snap.cast.is_casting)
+        busy = std::max<int64>(busy, snap.cast.current_cast_remaining.count());
+    if (busy > 0)
+    {
+        if (grouped)
+            rt.NoteGcdReady(id, snap.published_at_ms + uint32(busy), uint8(snap.group.my_role));
+        if (wake_on_gcd)
+            Services::Scheduler().wake_after_busy(id, busy, now);
+    }
+
+    if (!grouped)
+        return;
+    BotSnapshotView const view(snap);
+    Combat::Interrupt::Ability const ab = Combat::Interrupt::ClassicAbility(view);
+    bool kick = false;
+    if (ab.spell && Combat::Interrupt::Ready(view, ab))
+    {
+        for (NearbyUnit const& u : view.attackers())
+            if (Combat::Interrupt::Casting(u) && Combat::Interrupt::InRange(view, ab, u)) { kick = true; break; }
+    }
+    rt.NoteKickPossible(id, kick, snap.published_at_ms);
+
+    RaidOrder const& ro = snap.raid_order;
+    rt.NoteHazardOrder(id, ro.active && ro.move && ro.move_reason &&
+        (std::strcmp(ro.move_reason, "leave hazard") == 0 || std::strcmp(ro.move_reason, "leave cone") == 0), snap.published_at_ms);
+}
+
+void FlushReactionTiming()
+{
+    ReactionTiming& rt = ReactionTiming::Instance();
+    if (!rt.FlushDue(GameTime::GetGameTimeMS()))
+        return;
+    TC_LOG_INFO("playerbot.v2.react", "[react] gcd, grouped bots only (GCD end -> next cast sent) {} idle_gaps={} wakes={}", rt.gcd().line(), rt.gcd_idle(),
+                Services::Scheduler().wakes_total());
+    TC_LOG_INFO("playerbot.v2.react", "[react] gcd by role: tank {} | healer {} | dps {} (idle gaps {}/{}/{})", rt.gcd_role(0).line(), rt.gcd_role(1).line(),
+                rt.gcd_role(2).line(), rt.gcd_idle_role(0), rt.gcd_idle_role(1), rt.gcd_idle_role(2));
+    TC_LOG_INFO("playerbot.v2.react", "[react] kick (kickable cast + ready kick -> kick sent) {}", rt.kick().line());
+    TC_LOG_INFO("playerbot.v2.react", "[react] hazard (leave-hazard order published -> first step sent) {}", rt.hazard().line());
+    rt.ResetWindow();
 }
 
 // PvP reaction floor (Playerbot.Pacing.PvpReactionDelayMs, the owner's AiPlayerbot.PvpReactionDelay):
@@ -796,7 +883,9 @@ void Module::Init()
             p->IsInWater(),
             p->InBattleground() || p->GetMap()->IsDungeon() || p->GetMap()->IsBattlegroundOrArena(),
             ::Playerbot::V2::World::VanillaZoneLevelRange(p->GetZoneId(), lo, hi),
-            p->GetGroup() != nullptr,
+            // A follower; the leader of a bot party picks the party's route and keeps out of the canals like a solo bot (live 244: a
+            // bot leader walked its party into the Stormwind canal on a quest route).
+            p->GetGroup() != nullptr && p->GetGroup()->GetLeaderGUID() != p->GetGUID(),
             Services::Owners().GetOwner(p->GetGUID().GetCounter()).account_id != 0);
     };
 
@@ -1029,6 +1118,9 @@ void Module::Shutdown()
     for (int pass = 0; pass < 10 && Services::SessionMgr().active_count() > 0; ++pass)
         Services::SessionMgr().Update(0);
 
+    // Stop the chat model's worker thread (cancels a request in flight).
+    BotChatModel::Shutdown();
+
     // Stop threads first; then tear down state.
     Services::Shutdown();
 
@@ -1101,7 +1193,38 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             SendDueAddonHints();
         }
     }
+    {
+        // A raid of a player and companions that fits a party again goes back to one (BotGroupRules::RevertBotRaidToParty).
+        static std::chrono::milliseconds last_raid_check{0};
+        if (total - last_raid_check >= std::chrono::milliseconds(5000))
+        {
+            last_raid_check = total;
+            std::vector<Group*> to_party;
+            for (auto const& [guid, p] : ObjectAccessor::GetPlayers())
+            {
+                Group* g = p ? p->GetGroup() : nullptr;
+                if (!g || !g->isRaidGroup() || p->GetSession()->IsBot() || std::ranges::find(to_party, g) != to_party.end())
+                    continue;
+                bool any_bot = false, any_on_raid_map = false;
+                for (GroupReference const& ref : g->GetMembers())
+                {
+                    Player const* m = ref.GetSource();
+                    any_bot = any_bot || m->GetSession()->IsBot();
+                    any_on_raid_map = any_on_raid_map || (m->GetMap() && m->GetMap()->IsRaid());
+                }
+                if (BotGroupRules::RevertBotRaidToParty(true, g->isBGGroup() || g->isBFGroup() || g->isLFGGroup(), g->GetMembersCount(),
+                    MAX_GROUP_SIZE, any_bot, true, any_on_raid_map))
+                    to_party.push_back(g);
+            }
+            for (Group* g : to_party)
+            {
+                TC_LOG_INFO("playerbot.v2", "[raid_to_party] leader={} members={}", g->GetLeaderName(), g->GetMembersCount());
+                g->ConvertToGroup();
+            }
+        }
+    }
     ::Playerbot::Diagnostics::Scenario::Tick(std::uint32_t(diff.count()));   // bot scenario tests (.playerbot scenario)
+    BotChatModel::DeliverReplies(GameTime::GetGameTimeMS());               // Playerbot.ChatModel replies that came back
 
     // [cast_state] (playtest, WSG start room 2026-10-11: a healer stood with the casting animation on while casting nothing). Twice a
     // second, every bot in a battleground: a line when the spell it is casting changes (spell id, generic or channel, 0 = none), and a
@@ -1725,12 +1848,15 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         // build/group sub-buckets non-overlapping, as in the serial path).
         const uint32 group_ms_before = t_group_build_ms;
         // Companion tank threat multiplier (UpdateTankThreatMultiplier); 1.0 disables.
-        const float tank_threat_mult = std::clamp(
-            float(sConfigMgr->GetFloatDefault("Playerbot.TankThreatMultiplier", 3.0f, true)), 1.0f, 10.0f);
-        const float dps_threat_mult = std::clamp(
-            float(sConfigMgr->GetFloatDefault("Playerbot.DpsThreatMultiplier", 1.0f, true)), 0.3f, 1.5f);
+        TankThreatSettings threat_cfg;
+        threat_cfg.tank = std::clamp(float(sConfigMgr->GetFloatDefault("Playerbot.TankThreatMultiplier", 3.0f, true)), 1.0f, 10.0f);
+        threat_cfg.raid_tank = std::clamp(float(sConfigMgr->GetFloatDefault("Playerbot.Raid.TankThreatMultiplier", 5.0f, true)), 1.0f, 10.0f);
+        threat_cfg.dps = std::clamp(float(sConfigMgr->GetFloatDefault("Playerbot.DpsThreatMultiplier", 1.0f, true)), 0.3f, 1.5f);
+        threat_cfg.sure_taunt = sConfigMgr->GetBoolDefault("Playerbot.Raid.SureTaunt", true, true);
+        threat_cfg.scenario_as_owned = sConfigMgr->GetBoolDefault("Playerbot.Scenario.OwnerThreat", true, true);
         ConfigReader::CastPacing const cast_pacing_cfg = Services::Config().cast_pacing();
         uint32 const pvp_floor_ms = Services::Config().pacing().pvp_reaction_delay_ms;
+        bool const wake_on_gcd = sConfigMgr->GetBoolDefault("Playerbot.Reaction.WakeOnGcd", true, true);
         for (BuiltSlot& bs : build_order)
         {
             BotId          id   = bs.bot_id;
@@ -1885,6 +2011,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
                 }
             }
             sch.set_tier(id, tier, total);
+            NoteReaction(id, *snap, total, wake_on_gcd);
 
             // Build a fresh group snapshot when the bot is in a group; clear
             // the slot otherwise so a former groupmate doesn't see stale data.
@@ -1929,7 +2056,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
             }
             t_group_build_ms += getMSTimeDiff(group_t0, getMSTime());
 
-            UpdateTankThreatMultiplier(id, p, bs.ai, *snap, tank_threat_mult, dps_threat_mult);
+            UpdateTankThreatMultiplier(id, p, bs.ai, *snap, threat_cfg);
             UpdateCastSpeed(p, *snap, cast_pacing_cfg);
             UpdatePvpFloor(id, p, *snap, pvp_floor_ms, total);
 
@@ -1940,6 +2067,7 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         // the build sub-bucket so the existing TickPerf line still attributes
         // it to the snapshot phase. Subtract the group sub-span (already in
         // t_group_build_ms) so build/group stay non-overlapping.
+        FlushReactionTiming();
         const uint32 publish_span = getMSTimeDiff(publish_t0, getMSTime());
         const uint32 group_span   = t_group_build_ms - group_ms_before;
         t_snap_build_ms += (publish_span > group_span) ? (publish_span - group_span) : 0u;
@@ -1956,6 +2084,8 @@ void Module::OnWorldUpdate(std::chrono::milliseconds diff)
         FireDueBgPorts();
         FireDueLfgAccepts();
         TopUpPendingLfg(getMSTime());
+        Playerbot::V2::LfgTick(getMSTime());
+        Playerbot::V2::LfgBotGroupsTick(getMSTime());
         t_bgport_ms = getMSTimeDiff(t0, getMSTime());
     }
 
@@ -2514,6 +2644,34 @@ void Module::OnPlayerLogin(Player* p)
     if (!initialized_ || !p) return;
     const BotId id = p->GetGUID().GetCounter();
 
+    // A person logging into a marked character with the game client is never driven by the bot logic (Session/HumanLogin.h):
+    // an alt once summoned into the party stayed marked and the bot logic fought its player for control (Discord report, 2026-10-27).
+    {
+        WorldSession const* sess = p->GetSession();
+        bool const headless = !sess || sess->IsBot();
+        bool const marked = Services::Lifecycle().is_bot(id);
+        bool const on_pool = marked && !headless && Services::Accounts().is_pool_account(sess->GetAccountId());
+        HumanLoginAction const action = HumanClientAction(marked, headless, on_pool);
+        if (action != HumanLoginAction::None)
+        {
+            if (Services::Registry().has(id))
+            {
+                Services::Scheduler().unregister_bot(id);
+                Services::Snapshots().remove(id);
+                Services::Registry().unregister_bot(id);
+            }
+            if (action == HumanLoginAction::Release)
+            {
+                Services::Lifecycle().unmark_as_bot(id);
+                Services::Owners().ClearOwner(id);
+            }
+            else
+                Services::Lifecycle().unmark_as_bot_transient(id);
+            TC_LOG_INFO("playerbot.v2", "[human_login] {} logged in with the game client while marked as a bot: {}",
+                p->GetName(), action == HumanLoginAction::Release ? "unmarked and unbound" : "no bot logic this login (pool character)");
+        }
+    }
+
     // Real players are not driven by V2 but DO get owner-login greetings
     // from any of their currently-online bots. Bots queue a one-shot
     // WhisperIntent (executed on the next world-thread drain) so real
@@ -2786,11 +2944,19 @@ void Module::OnPlayerLogout(Player* p)
     {
         Services::Owners().NoteOwnerCharacterOffline(sess->GetAccountId(), id);
         g_addon_hints.Logout(id);
+        // Self-bot ends with the session: left marked, the character would be logged in as a bot with its group at the next login.
+        bool const marked = Services::Lifecycle().is_bot(id);
+        if (HumanClientAction(marked, false, marked && Services::Accounts().is_pool_account(sess->GetAccountId())) == HumanLoginAction::Release)
+        {
+            Services::Lifecycle().unmark_as_bot(id);
+            Services::Owners().ClearOwner(id);
+        }
     }
     if (!Services::Registry().has(id)) return;     // not one of ours
     // Speak queued chat (the `.bot dismiss` goodbye) while the bot is still in the world.
     BotChatter::FlushPendingChat(p);
     Services::Scheduler().unregister_bot(id);
+    ReactionTiming::Instance().Forget(id);
     Services::Snapshots().remove(id);
     Services::Registry().unregister_bot(id);
     // Clean per-bot entries in file-scope maps. These keys are uint64
@@ -3032,8 +3198,15 @@ void Module::OnDamageTaken(Unit* attacker, Unit* victim, int32 amount, uint32 sp
     uint32 const lethal_spell = spell_id ? spell_id : tl_damage_spell;
     tl_damage_spell = 0;
     if (!initialized_) return;
+    PveGroupCoordinator::NoteDamageDone(attacker, victim, amount);   // the [raid_dps] per-bot tally
+    // The bot's own hit (not its pet's) for the idle watchdog: "did anything land in the last 4 s".
+    if (attacker && attacker->IsPlayer() && victim && amount > 0 && !victim->IsPlayer())
+        if (BotAI* ai = Services::Registry().ai(attacker->GetGUID().GetCounter()))
+            ai->note_damage_done(GameTime::GetGameTimeMS());
     Diagnostics::Scenario::NoteDamage(attacker, victim, amount);   // a scenario's boss-pull statistics; one atomic load when none runs
-    Diagnostics::Parity::NoteDamage(attacker, victim, amount, spell_id);   // the damage_parity tally; one atomic load when none runs
+    // The core hands this hook spell 0; the spell is the one NoteDamageSpell stashed just before (0 = a melee swing). With 0 every spell and
+    // DoT tick was tallied as "white swing" and no per-spell row matched its outcome.
+    Diagnostics::Parity::NoteDamage(attacker, victim, amount, lethal_spell);   // the damage_parity tally; one atomic load when none runs
     // Killing blow on a player: remember the spell for the [bot_death] line (one compare per hit otherwise).
     if (victim && amount > 0 && victim->IsPlayer() && uint64(amount) >= victim->GetHealth())
     {
@@ -3063,6 +3236,12 @@ void Module::OnEnergize(Unit* target, uint32 spell_id, int32 gained, uint8 power
     Diagnostics::Parity::NoteEnergize(target, spell_id, gained, power);   // one atomic load when no economy leg measures
 }
 
+void Module::OnHealOutcome(Unit* healer, Unit* target, uint32 spell_id, uint32 raw, uint32 effective)
+{
+    if (!initialized_) return;
+    Diagnostics::Parity::NoteHeal(healer, target, spell_id, raw, effective);   // one atomic load when no support scorecard runs
+}
+
 void Module::OnHealReceived(Unit* /*healer*/, Unit* /*target*/, int32 /*amount*/, uint32 /*spell_id*/)
 {
     if (!initialized_) return;
@@ -3090,10 +3269,17 @@ void Module::OnAuraRemoved(Unit* /*target*/, Aura* /*aura*/)
     // outbound aura tables covers refresh-detection use cases.
 }
 
-void Module::OnGroupMemberJoined(Group* /*g*/, Player* /*p*/)
+void Module::OnGroupMemberJoined(Group* /*g*/, Player* p)
 {
     if (!initialized_) return;
-    // Intentionally a no-op. The world-tick rebuilds GroupSnapshot every tick
+    // A bot in a group rides when its leader does, so it has to hold the riding and mount spell its level allows. Companions get them in
+    // their upkeep; a world bot a player invited had them only from the gear pass, if that had come round. learn_riding_free is
+    // idempotent and level-gated (nothing below 40).
+    if (p && Services::Registry().has(p->GetGUID().GetCounter()))
+        if (uint32 const changed = ::Playerbot::API(p).learn_riding_free())
+            TC_LOG_INFO("playerbot.v2", "[mount] {} joined a group: riding and mount brought up to level {} ({} change(s))", p->GetName(),
+                        uint32(p->GetLevel()), changed);
+    // The rest is a no-op. The world-tick rebuilds GroupSnapshot every tick
     // for grouped bots, so newly-joined members appear in the next snapshot
     // without a hook-driven invalidation. If we ever cache snapshots across
     // ticks, this is the place to invalidate.
@@ -3130,6 +3316,12 @@ void Module::OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg
     BotChatReactor::ReactGuild(sender, guild_id, msg);
 }
 
+void Module::OnChannelChat(Player* sender, Channel* channel, std::string const& msg)
+{
+    if (!initialized_ || !sender || !channel || msg.empty()) return;
+    V2::ChannelChat::OnPlayerLine(sender, channel, msg);
+}
+
 void Module::OnSayChat(Player* sender, std::string const& msg)
 {
     // SC-P1a: a real player spoke in /say. Let the reactor pick at most one
@@ -3163,8 +3355,27 @@ void Module::OnItemLooted(Player* p, uint32 item_id)
 void Module::OnGroupMemberRemoved(Group* group, ObjectGuid member, uint8 method, ObjectGuid kicker)
 {
     // An owned companion the owner removes from the group (or that leaves it) keeps following its owner for as long as the owner binding
-    // stands (it kept following its owner after the uninvite). It is let go like a dismissal: a goodbye and a logout; the owner and the
+    // stands (2026-10-18: Veda followed her owner after the uninvite). It is let go like a dismissal: a goodbye and a logout; the owner and the
     // saved mark stay, so `.bot call` brings it back. Plain conversions, an owner going offline and map changes never reach this hook.
+    // A player leaves the group (or is removed): the world bots that were with him and have no owner are left in a group with no player in it.
+    // They leave it, hand in what they finished beside the giver and drop the rest (BotPopulationManager::DrainLedWorldBotReleases), rather than
+    // running to a quest giver and back for ever as a group of bots. Owned companions have their own release below.
+    if (initialized_ && group && member.IsPlayer() && !Services::Registry().has(member.GetCounter()) && !group->isBGGroup() && !group->isBFGroup() && !group->isLFGGroup())
+    {
+        std::vector<uint64> bots;
+        bool other_human = false;
+        for (GroupReference const& ref : group->GetMembers())
+        {
+            Player const* m = ref.GetSource();
+            if (!m || m->GetGUID() == member) continue;
+            if (Services::Registry().has(m->GetGUID().GetCounter())) bots.push_back(m->GetGUID().GetCounter());
+            else other_human = true;
+        }
+        if (!other_human)
+            for (uint64 const b : bots)
+                if (Services::Owners().GetOwner(b).account_id == 0 && !::Playerbot::Pool::IsScenarioBot(b))
+                    Services::Population().QueueLedWorldBotRelease(b);
+    }
     if (!initialized_ || !group || !member.IsPlayer() || !Services::Registry().has(member.GetCounter()))
         return;
     auto const owner = Services::Owners().GetOwner(member.GetCounter());
@@ -3182,7 +3393,8 @@ void Module::OnGroupMemberRemoved(Group* group, ObjectGuid member, uint8 method,
         owner_name = remover->GetName();
     else if (owner.player_guid)
         sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(owner.player_guid), owner_name);
-    TC_LOG_INFO("playerbot.v2", "[companion] {} released: removed from {}'s group", bot->GetName(), owner_name.empty() ? std::string("its owner") : owner_name);
+    TC_LOG_INFO("playerbot.v2", "[companion] {} released: removed from {}'s group (method {}, by {})", bot->GetName(), owner_name.empty() ? std::string("its owner") : owner_name,
+                uint32(method), by_owner ? "the owner" : remover ? remover->GetName() : std::string("no one"));
     Services::Population().QueueCompanionRelease(member.GetCounter());
 }
 
@@ -3244,6 +3456,10 @@ void Module::RouteGroupOrder(Player* sender, Group* group, std::string order)
 {
     uint32 const account = sender->GetSession() ? sender->GetSession()->GetAccountId() : 0;
     if (account == 0)
+        return;
+    // Typed crowd-control orders ("cc off", "no fear") that reach here: the add-on's transport, or a party "cc off" (always a group
+    // order) from a player who commands no bot in the group. The panel's "crowdcontrol on|off" is not one and goes on below.
+    if (BotCommandParser::ApplyCcOrder(sender, order, "group"))
         return;
     if (order.rfind("crowdcontrol ", 0) == 0 || order.rfind("crowd control ", 0) == 0 || order == "cc on" || order == "cc off")
     {
@@ -3480,7 +3696,7 @@ void Module::OnAddonWhisper(Player* sender, Player* receiver, std::string const&
     OnWhisperReceived(sender, receiver, text);
 }
 
-void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
+void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg, bool raid_chat)
 {
     // Squad-chat command surface. Only messages prefixed with `;` are
     // routed; every other party-chat line is ignored so we don't spam
@@ -3499,6 +3715,18 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
     BotChatReactor::React(sender, group, msg);
     if (msg.front() != ';')
     {
+        // The owner's crowd-control orders ("no fear", "@warlock no fear", "@mages no sheep", "off cc"): stored once for the
+        // sender, answered once, from a player who commands a bot in this group (anyone else's "no fear" stays chatter).
+        if (CcDeny::ParseOrder(msg))
+        {
+            bool commands_a_bot = false;
+            for (GroupReference const& itr : group->GetMembers())
+                if (Player const* m = itr.GetSource(); m && m != sender && Services::Registry().has(m->GetGUID().GetCounter()) &&
+                                                       BotCommandParser::ControlsForGroupOrder(sender, m))
+                { commands_a_bot = true; break; }
+            if (commands_a_bot && BotCommandParser::ApplyCcOrder(sender, msg, "party"))
+                return;
+        }
         // A bare group order ("follow", "stay", ...) in party or raid chat goes to every bot of the sender's in the
         // group. A line that starts with the name of a bot in the group, or with "all", is that bot's (every bot's)
         // order without the ';' ("Lentha use altar", "all use altar"). Other chatter stays ignored.
@@ -3506,6 +3734,8 @@ void Module::OnPartyChat(Player* sender, Group* group, std::string const& msg)
             RouteGroupOrder(sender, group, *order);
         else if (auto const addressed = AddressedGroupOrder(msg, [group](std::string_view name) { return GroupHasBotNamed(group, name); }))
             DispatchSquadLine(sender, group, *addressed, false);
+        else
+            BotChatReactor::ReactPartyModel(sender, group, msg, raid_chat);   // Playerbot.ChatModel (no-op when off)
         return;
     }
     const std::string body = msg.substr(1);

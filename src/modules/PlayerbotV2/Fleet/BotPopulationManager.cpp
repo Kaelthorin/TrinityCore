@@ -1,4 +1,6 @@
 #include "BotPool.h"
+#include "../Bot/Gear/WorldGearStart.h"
+#include "Creature.h"
 #include "../Util/SlowCall.h"
 #include "BotPopulationManager.h"
 #include "ClassicSpec.h"
@@ -33,6 +35,8 @@
 #include "../Diagnostics/PerfCounters.h"
 #include "../Bot/Gear/BotGearGenerator.h"   // weaponless re-gear hygiene (audit B15)
 #include "../Bot/Gear/OwnedGearPolicy.h"    // companion gear rules
+#include "../Bot/Gear/RaidEnchants.h"       // permanent enchants of a raid-ready bot
+#include "Bot/ResistGear.h"   // SwapResistGear: which slots and maps
 #include "BotItemScorer.h"   // EffectiveItemLevelForLevel — under-gear detection
 #include "Battleground.h"
 #include "Item.h"   // re-gear hygiene: StoreNewItem/EquipItem need the full type
@@ -62,6 +66,7 @@
 #include "RaceMask.h"
 #include "Random.h"
 #include <algorithm>
+#include <mutex>
 #include <unordered_set>
 #include <tuple>
 #include <array>
@@ -515,6 +520,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     { SLOW_CALL("DrainCompanionSetups"); DrainCompanionSetups(); }
     DrainBringChecks();
     DrainCompanionReleases();
+    DrainLedWorldBotReleases();
     WarnOversizedInstanceGroups(now_ms);
     // `.bot delete` companions waiting to leave the world.
     DrainCompanionDeletes();
@@ -556,6 +562,7 @@ void BotPopulationManager::OnWorldTick(uint32 now_ms)
     { SLOW_CALL("TopUpActiveBGs"); TopUpActiveBGs(now_ms); }
     { SLOW_CALL("ScrubWorldGear"); ScrubWorldGear(now_ms); }
     { SLOW_CALL("BgGroupHygiene"); BgGroupHygiene(now_ms); }
+    { SLOW_CALL("CompanionGroupHygiene"); CompanionGroupHygiene(now_ms); }
     { SLOW_CALL("SeedBgMatches"); SeedBgMatches(now_ms); }
     { SLOW_CALL("DriveBgStress"); DriveBgStress(now_ms); }
     { SLOW_CALL("DriveBgSoak"); DriveBgSoak(now_ms); }
@@ -905,6 +912,18 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
                 (!own_character && !Gear::IsBotWearableItemId(it->GetEntry())))
                 bad_slots[bad_count++] = s;
 
+    // A level 1-9 world bot whose unrenderable starter pieces were already taken off (before this fix, or by an earlier pass) is
+    // left with empty body slots: fill them too, so it is dressed on its next pass.
+    std::array<bool, EQUIPMENT_SLOT_END> fill_empty{};
+    if (!own_character && p->GetLevel() < ::Playerbot::Gear::kWorldGearMinLevel &&
+        ::Playerbot::Pool::UsesWorldGear(::Playerbot::Pool::RoleOf(p->GetGUID().GetCounter())))
+        for (uint8 s : { uint8(EQUIPMENT_SLOT_CHEST), uint8(EQUIPMENT_SLOT_LEGS), uint8(EQUIPMENT_SLOT_FEET) })
+            if (!p->GetItemByPos(INVENTORY_SLOT_BAG_0, s) && bad_count < bad_slots.size())
+            {
+                fill_empty[s] = true;
+                bad_slots[bad_count++] = s;
+            }
+
     BotId const id = p->GetGUID().GetCounter();
     if (bad_count == 0)
     {
@@ -941,6 +960,8 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
         ctx.bot_id = id;
         ctx.wearer = p;
         ctx.role = ::Playerbot::Pool::RoleOf(id);
+        // A level 1-9 world bot is not given gear, but when its starter pieces cannot be drawn only a replacement keeps it from going bare.
+        ctx.replace_unrenderable_starter = true;
         // The generator never returns an unrenderable item (index-time gate).
         for (auto const& g : Gear::GenerateGearFor(ctx))
             if (g.slot < EQUIPMENT_SLOT_END)
@@ -952,8 +973,8 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
     {
         uint8 const slot = bad_slots[i];
         Item* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-        if (!cur) continue;     // an earlier swap in this loop already moved it
-        uint32 const bad_entry = cur->GetEntry();
+        if (!cur && !fill_empty[slot]) continue;     // an earlier swap in this loop already moved it
+        uint32 const bad_entry = cur ? cur->GetEntry() : 0;
         char const* outcome = nullptr;
 
         // 1. Swap in the generated piece for this slot. CanEquipNewItem is
@@ -993,6 +1014,9 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
             }
         }
 
+        if (!outcome && !cur)
+            continue;   // an empty slot with no replacement stays empty
+
         // 2. No usable replacement: take it off into the bags, exactly like the
         //    client's auto-store (HandleAutoStoreBagItemOpcode).
         if (!outcome)
@@ -1018,10 +1042,13 @@ bool BotPopulationManager::HealUnrenderableGear(Player* p)
         if (outcome)
         {
             changed = true;
-            TC_LOG_INFO("playerbot.v2",
-                "[GearHeal] {} L{}: slot {} item {} has no ItemModifiedAppearance "
-                "(client cannot render) - {}",
-                p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry, outcome);
+            if (bad_entry)
+                TC_LOG_INFO("playerbot.v2",
+                    "[GearHeal] {} L{}: slot {} item {} has no ItemModifiedAppearance "
+                    "(client cannot render) - {}",
+                    p->GetName(), uint32(p->GetLevel()), uint32(slot), bad_entry, outcome);
+            else
+                TC_LOG_INFO("playerbot.v2", "[GearHeal] {} L{}: empty slot {} - {}", p->GetName(), uint32(p->GetLevel()), uint32(slot), outcome);
         }
         else
         {
@@ -1065,6 +1092,30 @@ void BotPopulationManager::RequestGearRefresh(BotId bot)
     std::lock_guard lk(gear_rush_mtx_);
     if (std::ranges::find(gear_rush_, bot) == gear_rush_.end())
         gear_rush_.push_back(bot);
+}
+
+namespace {
+
+// A bot made before the book-rank and class-skill-line passes existed (Shadow Bolt 25307, the rogue poisons, Fire Nova rank 1) never ran them:
+// the free trainer pass runs once per boot for each online bot, and is idempotent. The caller's sweep stops a frame after 6 ms, so a fleet of
+// hundreds spreads over frames on its own. (A time gate on the sweep's own clock let one bot through per sweep: the sweep passes one `now_ms`.)
+void TopUpSpellsOnce(Player* p)
+{
+    static std::mutex lock;
+    static std::unordered_set<uint64> toppedUp;
+    // Only registered bots reach this (the sweep walks the registry). A summoned alt (IsPlayersOwnCharacter) is such a bot too and gets its spells.
+    if (!p->IsInWorld() || !p->IsAlive() || p->GetLevel() < 5)
+        return;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (!toppedUp.insert(p->GetGUID().GetCounter()).second)
+            return;
+    }
+    ::Playerbot::API api(p);
+    uint32 const learned = api.learn_trainer_spells_free();
+    TC_LOG_INFO("playerbot.v2", "[SpellTopUp] {} (class {} level {}): {} spells from the free trainer pass", p->GetName(), uint32(p->GetClass()), uint32(p->GetLevel()), learned);
+}
+
 }
 
 void BotPopulationManager::RunGearBackfill(uint32 now_ms)
@@ -1115,6 +1166,7 @@ void BotPopulationManager::RunGearBackfill(uint32 now_ms)
         BotId const id = gear_scan_[gear_scan_pos_++];
         Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
         if (!p || !p->IsInWorld()) continue;
+        TopUpSpellsOnce(p);
         // Before the re-gear cap and gate: a well-geared companion still needs its new spells.
         CompanionUpkeep(id, p);
         if (gear_regear_count_ >= 25) continue;     // bound per sweep
@@ -1168,9 +1220,110 @@ void BotPopulationManager::GrantCompanionStarterPet(BotId id, Player* p)
         Services::Owners().MarkStarterPetGranted(id);
 }
 
+void BotPopulationManager::EnsureBotHunterPet(Player* p)
+{
+    if (!p || p->GetClass() != CLASS_HUNTER || p->GetLevel() < 10 || !p->IsInWorld())
+        return;
+    WorldSession const* session = p->GetSession();
+    if (!session || !session->IsBot())
+        return;
+    if (Services::Owners().GetOwner(p->GetGUID().GetCounter()).account_id != 0)
+        return;
+    // One try per bot while the answer is "not now" (mounted, in combat, on a transport); anything else is settled.
+    static std::mutex s_mutex;
+    static std::unordered_set<uint64> s_settled;
+    uint64 const guid = p->GetGUID().GetCounter();
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (s_settled.contains(guid))
+            return;
+    }
+    using PetResult = ::Playerbot::API::StarterPetResult;
+    uint32 const race_entry = World::StarterHunterPetEntry(p->GetRace(), p->GetTeam() == ALLIANCE);
+    uint32 entry = World::VariedHunterPetEntry(p->GetTeam() == ALLIANCE, guid, race_entry);
+    PetResult r = ::Playerbot::API(p).grant_starter_hunter_pet(entry);
+    if (r == PetResult::Unavailable && entry != race_entry)   // the varied beast is not tameable in this data: the race's own
+    {
+        entry = race_entry;
+        r = ::Playerbot::API(p).grant_starter_hunter_pet(entry);
+    }
+    if (r == PetResult::NotNow)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        s_settled.insert(guid);
+    }
+    if (r == PetResult::Tamed)
+        TC_LOG_INFO("playerbot.v2", "[hunter_pet] {} L{} had no pet: tamed entry {}", p->GetName(), uint32(p->GetLevel()), entry);
+    else if (r == PetResult::Unavailable)
+        TC_LOG_WARN("playerbot.v2", "[hunter_pet] {} L{} has no pet and entry {} is not a tameable beast in this data", p->GetName(), uint32(p->GetLevel()), entry);
+}
+
 void BotPopulationManager::QueueCompanionSetup(BotId bot, uint64 owner_guid_low, uint8 role)
 {
     pending_companions_[bot] = PendingCompanion{ owner_guid_low, role, getMSTime() };
+}
+
+void BotPopulationManager::DrainLedWorldBotReleases()
+{
+    if (pending_led_releases_.empty())
+        return;
+    std::vector<uint64> ids = std::move(pending_led_releases_);
+    pending_led_releases_.clear();
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (uint64 const id : ids)
+    {
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!bot || !bot->IsInWorld() || bot->InBattleground() || bot->InArena())
+            continue;
+        if (Group* g = bot->GetGroup())
+        {
+            bool has_human = false;
+            for (GroupReference const& ref : g->GetMembers())
+                if (Player const* m = ref.GetSource())
+                    if (m != bot && !Services::Lifecycle().is_bot(m->GetGUID().GetCounter())) { has_human = true; break; }
+            if (has_human || g->isBGGroup() || g->isBFGroup() || g->isLFGGroup())
+                continue;       // a player has it again (invited in the same moment), or it is not an ordinary group: leave it
+            g->RemoveMember(bot->GetGUID());
+        }
+        // Quests of the time with the player: a finished one is handed in at the giver beside the bot, once; anything else is dropped, so
+        // no quest rule has a reason to send the bot walking after it.
+        std::vector<uint32> done, open;
+        for (auto const& [qid, qs] : bot->getQuestStatusMap())
+        {
+            if (qs.Status == QUEST_STATUS_COMPLETE) done.push_back(qid);
+            else if (qs.Status == QUEST_STATUS_INCOMPLETE || qs.Status == QUEST_STATUS_FAILED) open.push_back(qid);
+        }
+        ::Playerbot::API api(bot);
+        uint32 handed = 0, dropped = 0;
+        if (!done.empty())
+        {
+            std::list<Creature*> near;
+            bot->GetCreatureListWithOptionsInGrid(near, 12.0f, {});
+            for (uint32 const qid : done)
+            {
+                bool turned = false;
+                for (Creature* c : near)
+                {
+                    for (uint32 const involved : sObjectMgr->GetCreatureQuestInvolvedRelations(c->GetEntry()))
+                        if (involved == qid)
+                        {
+                            turned = api.complete_quest(c->GetGUID(), qid, ::Playerbot::API::kRewardChoiceAuto) == ::Playerbot::Result::Ok;
+                            break;
+                        }
+                    if (turned) break;
+                }
+                if (turned) ++handed;
+                else if (bot->GetQuestStatus(qid) == QUEST_STATUS_COMPLETE) open.push_back(qid);
+            }
+        }
+        for (uint32 const qid : open)
+            if (api.abandon_quest(qid) == ::Playerbot::Result::Ok)
+                ++dropped;
+        TC_LOG_INFO("playerbot.v2", "[led_release] {} (bot {}) is no longer with a player: left its group, {} quest(s) handed in, {} dropped",
+                    bot->GetName(), id, handed, dropped);
+    }
 }
 
 void BotPopulationManager::DrainCompanionReleases()
@@ -1287,10 +1440,8 @@ Role BotPopulationManager::ApplyCompanionRole(Player* bot, Role requested, char 
         }
         if (role == Role::Dps)
         {
-            // A DPS spec it already has (Elemental, Fury) is kept; a tank or healer one gives way to the class default.
-            uint32 const current = ::Playerbot::Classic::EffectiveSpecId(bot);
-            spec = (current && !IsTankSpec(cls, uint16(current)) && !IsHealerSpec(cls, uint16(current)))
-                ? current : DpsSpecForClass(cls);
+            // A companion DPS plays its class's highest-damage spec; a spec the owner saved is applied below.
+            spec = DpsSpecForClass(cls);
         }
     }
 
@@ -1539,40 +1690,49 @@ void BotPopulationManager::FinishCompanionSetup(Player* bot, Player* owner, uint
 {
     BotId const id = bot->GetGUID().GetCounter();
     uint8 const old_level = bot->GetLevel();
-    if (owner->GetLevel() > old_level)
+    // A player's own alt (`.playerbot summon`) is only brought and grouped: its level, spells, talents and gear stay the
+    // player's (the same rule as CompanionUpkeep and the gear passes). Before this, `.bot summon all` / `.bot call` levelled it
+    // to the owner and reset its talents.
+    bool const own_character = IsPlayersOwnCharacter(bot);
+    uint32 spells = 0, weapon_skills = 0, riding = 0;
+    ::Playerbot::Result talents = ::Playerbot::Result::Ok;
+    if (!own_character)
     {
-        bot->GiveLevel(owner->GetLevel());
-        bot->InitTalentForLevel();
-        bot->SetXP(0);
-    }
-
-    ::Playerbot::API api(bot);
-    // A companion levelled here never walks to a trainer, so it would fight with its level 1 kit.
-    // Nor does it do its class quests: their abilities (Voidwalker, Bear Form, stances, totems...) and a hunter's pet.
-    api.learn_class_quest_spells_free();
-    uint32 const spells = api.learn_trainer_spells_free();
-    uint32 const weapon_skills = api.learn_weapon_skills_free();
-    // Riding at 40 and 60, so it mounts up with its owner.
-    uint32 const riding = api.learn_riding_free();
-
-    // The role the owner asked for (`.bot add <class> healer`), else the one stored with the companion (`.bot call`, a
-    // relog), else what its talents say; pinned as the bot logic role and the virtual spec, and stored. Before the talent step,
-    // which spends the points down the pinned spec's build.
-    ApplyCompanionRole(bot, Role(role_value), "setup");
-    ::Playerbot::Result const talents = bot->GetLevel() >= 10 ? api.apply_starter_talents() : ::Playerbot::Result::Ok;
-
-    // A new companion's starter kit, or an old companion's pre-variety set, is re-rolled once with the varied
-    // generator (OwnerRegistry::GearVaried); after that the re-gear pass keeps it up with its level.
-    if (!Services::Owners().GearVaried(id))
-    {
-        uint32 changed = 0;
-        if (RerollCompanionGear(bot, changed) == RerollResult::Done)
+        if (owner->GetLevel() > old_level)
         {
-            Services::Owners().MarkGearVaried(id);
-            TC_LOG_INFO("playerbot.v2", "[Companion] {} one-time varied gear re-roll: {} slot(s) changed", bot->GetName(), changed);
+            bot->GiveLevel(owner->GetLevel());
+            bot->InitTalentForLevel();
+            bot->SetXP(0);
         }
+
+        ::Playerbot::API api(bot);
+        // A companion levelled here never walks to a trainer, so it would fight with its level 1 kit.
+        // Nor does it do its class quests: their abilities (Voidwalker, Bear Form, stances, totems...) and a hunter's pet.
+        api.learn_class_quest_spells_free();
+        spells = api.learn_trainer_spells_free();
+        weapon_skills = api.learn_weapon_skills_free();
+        // Riding at 40 and 60, so it mounts up with its owner.
+        riding = api.learn_riding_free();
+
+        // The role the owner asked for (`.bot add <class> healer`), else the one stored with the companion (`.bot call`, a
+        // relog), else what its talents say; pinned as the bot logic role and the virtual spec, and stored. Before the talent step,
+        // which spends the points down the pinned spec's build.
+        ApplyCompanionRole(bot, Role(role_value), "setup");
+        talents = bot->GetLevel() >= 10 ? api.apply_starter_talents() : ::Playerbot::Result::Ok;
+
+        // A new companion's starter kit, or an old companion's pre-variety set, is re-rolled once with the varied
+        // generator (OwnerRegistry::GearVaried); after that the re-gear pass keeps it up with its level.
+        if (!Services::Owners().GearVaried(id))
+        {
+            uint32 changed = 0;
+            if (RerollCompanionGear(bot, changed) == RerollResult::Done)
+            {
+                Services::Owners().MarkGearVaried(id);
+                TC_LOG_INFO("playerbot.v2", "[Companion] {} one-time varied gear re-roll: {} slot(s) changed", bot->GetName(), changed);
+            }
+        }
+        RegearNow(bot);
     }
-    RegearNow(bot);
 
     // Its own place in a ring around the owner, so companions don't stand inside each other.
     FormationOffset slot_offset{ 5.0f, 0.0f };
@@ -1637,7 +1797,7 @@ void BotPopulationManager::FinishCompanionSetup(Player* bot, Player* owner, uint
         {
             float x, y, z;
             // The owner is the searcher: the ground height is read on the OWNER's map. With the bot as searcher a bot standing on another
-            // continent had the owner's x,y looked up on its own map and landed 350 y under the owner (a new character in Coldridge).
+            // continent had the owner's x,y looked up on its own map and landed 350 y under the owner (Daedas, Coldridge, 2026-10-18).
             owner->GetNearPoint(nullptr, x, y, z, slot_offset.distance, owner->GetOrientation() + slot_offset.angle_radians);
             TransferAbortReason const door = Fleet::PrepareInstanceEntry(bot, owner->GetMapId());
             if (door != TRANSFER_ABORT_NONE)
@@ -1809,6 +1969,42 @@ void BotPopulationManager::SetGearModeOverride(BotId bot, int mode)
         s_gear_override[bot] = mode;
 }
 
+static std::unordered_map<BotId, uint8> s_gear_resist_override;   // under s_gear_override_lock
+
+void BotPopulationManager::SetGearResistOverride(BotId bot, uint8 school)
+{
+    std::lock_guard<std::mutex> lock(s_gear_override_lock);
+    if (!school)
+        s_gear_resist_override.erase(bot);
+    else
+        s_gear_resist_override[bot] = school;
+}
+
+static uint8 CompanionResistSchool(Player const* bot)
+{
+    std::lock_guard<std::mutex> lock(s_gear_override_lock);
+    auto const it = s_gear_resist_override.find(bot->GetGUID().GetCounter());
+    return it != s_gear_resist_override.end() ? it->second : 0;
+}
+
+static std::unordered_map<BotId, uint32> s_gear_wear_override;   // under s_gear_override_lock
+
+void BotPopulationManager::SetGearWearOverride(BotId bot, uint32 entry)
+{
+    std::lock_guard<std::mutex> lock(s_gear_override_lock);
+    if (!entry)
+        s_gear_wear_override.erase(bot);
+    else
+        s_gear_wear_override[bot] = entry;
+}
+
+static uint32 CompanionWearEntry(Player const* bot)
+{
+    std::lock_guard<std::mutex> lock(s_gear_override_lock);
+    auto const it = s_gear_wear_override.find(bot->GetGUID().GetCounter());
+    return it != s_gear_wear_override.end() ? it->second : 0;
+}
+
 static Gear::Owned::GearMode CompanionGearMode(Player const* bot)
 {
     {
@@ -1866,6 +2062,8 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
     if (!ctx.world_bot())
     {
         ctx.gear_mode = CompanionGearMode(p);
+        ctx.resist_school = CompanionResistSchool(p);
+        ctx.wear_entry = CompanionWearEntry(p);
         // "best" ignores what the owner wears; the tier modes carry their own ceiling in the generator.
         if (ctx.gear_mode == Gear::Owned::GearMode::Match)
             ctx.ilvl_cap = OwnerGearCap(p);
@@ -1940,7 +2138,11 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
                     continue;
                 // A world bot's one-time re-roll: whatever it wears that differs from its own per-slot pick goes.
                 // A piece of the tier set the owner asked for goes on over whatever is worn, even a better scoring piece.
-                bool const tier_pick = Gear::IsTierSetPick(cls, ctx.gear_mode, g.item_entry);
+                bool const tier_pick = Gear::IsTierSetPick(cls, ctx.gear_mode, g.item_entry, ctx.spec);
+                // A resistance piece the generator chose for the fight the bot gears for (GearGenerationContext::resist_school) goes on the
+                // same way: by the role's stats it scores below the tier piece it replaces.
+                bool const resist_pick = ctx.resist_school && !ctx.world_bot() && ::Playerbot::Gear::ResistPoints(gtpl, ctx.resist_school, lvl) > 0;
+                bool const wear_pick = ctx.wear_entry && !ctx.world_bot() && g.item_entry == ctx.wear_entry;
                 // An off hand that is not a weapon on a class that must have one (rogue, non-protection warrior, hunter, enhancement shaman) goes for any weapon pick.
                 bool const dead_offhand = ::Playerbot::Gear::OffhandMustBeWeapon(cls, ctx.spec) && g.slot == EQUIPMENT_SLOT_OFFHAND && cur->GetTemplate() &&
                                           cur->GetTemplate()->GetClass() != ITEM_CLASS_WEAPON && gtpl->GetClass() == ITEM_CLASS_WEAPON;
@@ -1953,7 +2155,8 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
                      (g.slot == EQUIPMENT_SLOT_OFFHAND && gtpl->GetInventoryType() == INVTYPE_SHIELD && cur->GetTemplate()->GetInventoryType() != INVTYPE_SHIELD));
                 bool const vary_swap = vary_ok && cur_score > 0 && !off_for_2h && cur->GetTemplate() &&
                                        gtpl->GetQuality() >= cur->GetTemplate()->GetQuality() && float(pick_score) >= float(cur_score) * kVaryFloor;
-                bool const better = shield_fix || vary_swap || tier_pick || worn_pvp || dead_offhand || worn_over || (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
+                bool const better = shield_fix || vary_swap || tier_pick || resist_pick || wear_pick || worn_pvp || dead_offhand || worn_over ||
+                                    (reroll_all && ctx.world_bot()) || (cur_score <= 0 ? pick_score > cur_score
                                                                 : float(pick_score) >= float(cur_score) * Gear::kRaidUpgradeRatio);
                 if (!better)
                     continue;
@@ -1961,8 +2164,39 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
             if (off_for_2h && (p->CanUseItem(gtpl) != EQUIP_ERR_OK || !stow(EQUIPMENT_SLOT_OFFHAND)))
                 continue;
             uint16 eq_dest = 0;
-            if (p->CanEquipNewItem(g.slot, eq_dest, g.item_entry, /*swap*/ cur != nullptr) != EQUIP_ERR_OK)
+            InventoryResult eq_result = p->CanEquipNewItem(g.slot, eq_dest, g.item_entry, /*swap*/ cur != nullptr);
+            // A player cannot change gear while a cast or channel runs (Player::CanEquipItem returns CLIENT_LOCKED_OUT, error 40). A caster that
+            // re-cast between the leg's CombatStop and this regear refused every pick (damage_parity 175 warlock: T3 leg with 0 tier pieces, 282 dps
+            // against 498 with them): a player stops the cast to dress, so does the bot.
+            if (eq_result == EQUIP_ERR_CLIENT_LOCKED_OUT && (p->GetCurrentSpell(CURRENT_GENERIC_SPELL) || p->GetCurrentSpell(CURRENT_CHANNELED_SPELL)))
             {
+                p->InterruptNonMeleeSpells(false);
+                eq_result = p->CanEquipNewItem(g.slot, eq_dest, g.item_entry, /*swap*/ cur != nullptr);
+            }
+            if (eq_result != EQUIP_ERR_OK)
+            {
+                // damage_parity 147: the shaman's t1 leg picked 16 pieces, wore 13, and fought without a main hand.
+                TC_LOG_INFO("playerbot.v2", "[gear] {} pick {} for slot {} refused by CanEquipNewItem: error {}", p->GetName(), g.item_entry, uint32(g.slot), uint32(eq_result));
+                // ITEM_MAX_COUNT: a unique pick the bot already owns (damage_parity 150 shaman, error 17 on the main hand every regear: the copy sat in
+                // the bags from an earlier leg, so a new one is refused for ever). Wear the copy it owns.
+                if (eq_result == EQUIP_ERR_ITEM_MAX_COUNT)
+                {
+                    Item* owned = p->GetItemByEntry(g.item_entry);
+                    if (owned && !owned->IsEquipped())
+                    {
+                        uint16 const src = (uint16(owned->GetBagSlot()) << 8) | owned->GetSlot();
+                        uint16 const dst = (uint16(INVENTORY_SLOT_BAG_0) << 8) | g.slot;
+                        p->SwapItem(src, dst);
+                        if (p->GetItemByPos(INVENTORY_SLOT_BAG_0, g.slot) == owned)
+                        {
+                            ++changed;
+                            TC_LOG_INFO("playerbot.v2", "[gear] {} wears the pick {} it already owned in slot {}", p->GetName(), g.item_entry, uint32(g.slot));
+                            continue;
+                        }
+                        TC_LOG_INFO("playerbot.v2", "[gear] {} owns the pick {} but the swap into slot {} was refused (can equip: {})", p->GetName(), g.item_entry, uint32(g.slot),
+                                    uint32(p->CanEquipItem(g.slot, eq_dest, owned, true)));
+                    }
+                }
                 refused_any = true;
                 continue;
             }
@@ -1998,6 +2232,11 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
     if (changed)
         p->AutoUnequipOffhandIfNeed();
 
+    // The role's permanent enchants on whatever is worn without one (a piece that just went on, or one the bot never had enchanted).
+    // World bots too: a bot has no enchanter to find (Playerbot.Gear.RaidEnchants).
+    if (Services::Config().gear_raid_enchants())
+        ::Playerbot::Gear::ApplyRaidEnchants(p, ctx.spec);
+
     uint32 sum = 0, cnt = 0;
     for (uint8 s = EQUIPMENT_SLOT_START; s < EQUIPMENT_SLOT_END; ++s)
     {
@@ -2012,6 +2251,126 @@ static uint32 RaidRegearPass(Player* p, bool& refused_any, bool only_over_cap = 
     TC_LOG_INFO("playerbot.v2", "[gear] {} {} mode={} avg_ilvl={} upgraded={} picks={} cap={}", p->GetName(),
                 ::Playerbot::Gear::RaidRoleName(::Playerbot::Gear::RaidRoleForBot(cls, ctx.spec)), Gear::Owned::ModeName(ctx.gear_mode), cnt ? sum / cnt : 0u, changed,
                 picks.size(), ctx.world_bot() ? Gear::LiveWorldIlvlCap() : (ctx.ilvl_cap > 0 ? ctx.ilvl_cap : Gear::LiveRaidIlvlCap()));
+    return changed;
+}
+
+// ---- Raid resistance gear (Playerbot.Raid.ResistGear) ----
+// What a bot swapped: per slot the piece it wore before and the free copy it wears now, by item guid. In memory only: a bot that logs out
+// wearing the copies keeps them (its own pieces are in the bags) until the next regear.
+namespace {
+struct ResistSwapPiece { uint8 slot; ObjectGuid own; ObjectGuid copy; };
+struct ResistSwapState { uint8 school = 0; std::vector<ResistSwapPiece> pieces; };
+std::mutex s_resist_swap_lock;
+std::unordered_map<BotId, ResistSwapState> s_resist_swap;
+
+// The bot's own pieces back on, the copies deleted. A slot whose copy is no longer worn (a regear or the owner changed it) only loses the copy.
+uint32 RestoreOwnGear(Player* p, ResistSwapState const& st)
+{
+    uint32 changed = 0;
+    for (ResistSwapPiece const& pc : st.pieces)
+    {
+        Item* copy = p->GetItemByGuid(pc.copy);
+        Item* own = p->GetItemByGuid(pc.own);
+        if (!copy)
+            continue;
+        if (own && copy->IsEquipped() && copy->GetSlot() == pc.slot && !own->IsEquipped())
+        {
+            uint16 const src = (uint16(own->GetBagSlot()) << 8) | own->GetSlot();
+            uint16 const dst = (uint16(INVENTORY_SLOT_BAG_0) << 8) | pc.slot;
+            p->SwapItem(src, dst);
+            if (p->GetItemByPos(INVENTORY_SLOT_BAG_0, pc.slot) == own)
+                ++changed;
+        }
+        if (Item* left = p->GetItemByGuid(pc.copy); left && !left->IsEquipped())
+            p->DestroyItem(left->GetBagSlot(), left->GetSlot(), true);
+    }
+    if (changed)
+        p->AutoUnequipOffhandIfNeed();
+    return changed;
+}
+} // namespace
+
+uint32 BotPopulationManager::SwapResistGear(Player* p, uint8 school)
+{
+    if (!p || !p->IsInWorld() || !p->IsAlive() || p->IsInCombat())
+        return 0;
+    BotId const id = p->GetGUID().GetCounter();
+    if (!Services::Lifecycle().is_bot(id) || Services::Owners().GetOwner(id).account_id == 0 || IsPlayersOwnCharacter(p))
+        return 0;
+    Map const* map = p->GetMap();
+    // Wearing it again is allowed anywhere (a bot that left the raid wearing the copies still gets its own back).
+    if (school && (!map || !map->IsRaid() || !Classic::ResistSwapMap(map->GetId())))
+        return 0;
+
+    std::lock_guard<std::mutex> lock(s_resist_swap_lock);
+    uint32 changed = 0;
+    if (auto const it = s_resist_swap.find(id); it != s_resist_swap.end())
+    {
+        if (it->second.school == school)
+            return 0;
+        changed += RestoreOwnGear(p, it->second);
+        TC_LOG_INFO("playerbot.v2", "[resist_gear] {} own gear back ({} slot(s))", p->GetName(), changed);
+        s_resist_swap.erase(it);
+    }
+    if (!school)
+        return changed;
+
+    uint8 const lvl = p->GetLevel();
+    Gear::GearGenerationContext ctx;
+    ctx.level  = lvl;
+    ctx.cls    = p->GetClass();
+    ctx.race   = p->GetRace();
+    ctx.spec   = uint16(::Playerbot::Classic::EffectiveSpecId(p));
+    ctx.bot_id = id;
+    ctx.wearer = p;
+    ctx.role = ::Playerbot::Pool::RoleOf(id);
+    ctx.gear_mode = CompanionGearMode(p);
+    ctx.resist_school = school;
+    if (ctx.gear_mode == Gear::Owned::GearMode::Match)
+        ctx.ilvl_cap = OwnerGearCap(p);
+    bool const tank = ::Playerbot::Gear::RaidRoleForBot(ctx.cls, ctx.spec) == ::Playerbot::Gear::RaidRole::Tank;
+
+    ResistSwapState st;
+    st.school = school;
+    for (Gear::GearItem const& g : Gear::GenerateGearFor(ctx))
+    {
+        if (!Classic::ResistSwapSlot(g.slot, tank))
+            continue;
+        ItemTemplate const* gtpl = sObjectMgr->GetItemTemplate(g.item_entry);
+        if (!gtpl)
+            continue;
+        int32 const points = ::Playerbot::Gear::ResistPoints(gtpl, school, lvl);
+        Item* cur = p->GetItemByPos(INVENTORY_SLOT_BAG_0, g.slot);
+        // Only where it adds resistance; an empty slot keeps what the bot has decided on (nothing to put back).
+        if (points <= 0 || !cur || !cur->GetTemplate() || ::Playerbot::Gear::ResistPoints(cur->GetTemplate(), school, lvl) >= points)
+            continue;
+        uint16 eq_dest = 0;
+        ItemPosCountVec dest;
+        // The replaced piece goes to the bag slot the copy came from: no free slot, no swap (nothing is ever destroyed here).
+        if (p->CanEquipNewItem(g.slot, eq_dest, g.item_entry, /*swap*/ true) != EQUIP_ERR_OK ||
+            p->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, g.item_entry, 1) != EQUIP_ERR_OK)
+            continue;
+        Item* copy = p->StoreNewItem(dest, g.item_entry, true);
+        if (!copy)
+            continue;
+        ObjectGuid const own = cur->GetGUID();
+        uint16 const src = (uint16(copy->GetBagSlot()) << 8) | copy->GetSlot();
+        uint16 const dst = (uint16(INVENTORY_SLOT_BAG_0) << 8) | g.slot;
+        p->SwapItem(src, dst);
+        if (p->GetItemByPos(INVENTORY_SLOT_BAG_0, g.slot) == copy)
+        {
+            st.pieces.push_back({ g.slot, own, copy->GetGUID() });
+            ++changed;
+        }
+        else
+            p->DestroyItem(copy->GetBagSlot(), copy->GetSlot(), true);   // refused after all: no copy left behind
+    }
+    if (changed)
+        p->AutoUnequipOffhandIfNeed();
+    TC_LOG_INFO("playerbot.v2", "[resist_gear] {} wears {} resistance in {} slot(s){}", p->GetName(), school, uint32(st.pieces.size()),
+                tank ? " (tank: armor pieces kept)" : "");
+    if (!st.pieces.empty())
+        s_resist_swap[id] = std::move(st);
     return changed;
 }
 
@@ -2169,6 +2528,57 @@ BotPopulationManager::RerollResult BotPopulationManager::RerollCompanionGear(Pla
 // the battleground greyed out his Release Spirit ("a member of your group is in combat"). A pool / JIT bot has no business in a human's
 // regular group while it is in a battleground: its battleground group is the BG group, and an earlier group (the "original group" a
 // battleground restores on leaving, or one it never left) is dropped here. Owned companions keep their owner's group. Every 10 s.
+void BotPopulationManager::CompanionGroupHygiene(uint32 now_ms)
+{
+    constexpr uint32 kIntervalMs = 2u * 1000u;
+    if (last_companion_group_hygiene_ms_ && (now_ms - last_companion_group_hygiene_ms_) < kIntervalMs)
+        return;
+    last_companion_group_hygiene_ms_ = now_ms;
+
+    // Two passes: deciding while removing lets the first removals shrink the group to two members, which the core disbands, taking the last
+    // companion out of its group before it is looked at (playtest 10-19: three bots, the owner left, the last one kept following).
+    std::vector<std::pair<BotId, uint32>> release;   // bot id, owner account
+    Services::Registry().for_each([&](BotId id, BotRegistryEntry const&)
+    {
+        OwnerBinding const ob = Services::Owners().GetOwner(id);
+        if (ob.account_id == 0)
+            return;
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(id));
+        if (!p || !p->IsInWorld() || p->InBattleground() || p->InArena())
+            return;
+        Group* g = p->GetGroup();
+        if (!g || g->isBGGroup() || g->isBFGroup() || g->isLFGGroup())
+            return;
+        // The owner is in the group when a member is the bound character, or, for an account-wide binding, any character of the owning account
+        // (offline members count: the slots are read, not the online references). Not a bot: a companion's own account may be the owner's.
+        bool owner_in = false;
+        for (auto const& slot : g->GetMemberSlots())
+        {
+            if (slot.guid == p->GetGUID() || Services::Lifecycle().is_bot(slot.guid.GetCounter()))
+                continue;
+            if (ob.player_guid != 0 ? slot.guid.GetCounter() == ob.player_guid
+                                    : sCharacterCache->GetCharacterAccountIdByGuid(slot.guid) == ob.account_id)
+            { owner_in = true; break; }
+        }
+        if (owner_in)
+            return;
+        TC_LOG_INFO("playerbot.v2", "[companion_release] {} (bot {}) is in a group of {} that its owner (account {}) is not in: leaving it and being let go like an uninvite",
+                    p->GetName(), id, g->GetMembersCount(), ob.account_id);
+        release.emplace_back(id, ob.account_id);
+    });
+    for (auto const& r : release)
+    {
+        Player* p = ObjectAccessor::FindConnectedPlayer(ObjectGuid::Create<HighGuid::Player>(r.first));
+        if (!p)
+            continue;
+        if (Group* g = p->GetGroup())
+            g->RemoveMember(p->GetGUID());
+        p->StopMoving();
+        // Then the same as an uninvite (Module::OnGroupMemberRemoved): goodbye and logout next tick; owner and saved mark stay.
+        QueueCompanionRelease(r.first);
+    }
+}
+
 void BotPopulationManager::BgGroupHygiene(uint32 now_ms)
 {
     constexpr uint32 kHygieneIntervalMs = 10u * 1000u;
@@ -2340,6 +2750,10 @@ void BotPopulationManager::BackfillOne(BotId id, Player* p, uint32 now_ms, uint3
     }
     // Owned, below the cap: the best green or blue for the level by role weights (Gear::OwnedLevelGearActive).
     bool const owned_lv = companion && Gear::OwnedLevelGearActive(lvl, bot_role);
+
+    // Raid enchants a bot was given below the cap (older builds enchanted levelling bots too) come off again.
+    if (!is_altbot && lvl < MaxPlayerLevel() && p->IsAlive() && !p->IsInCombat())
+        ::Playerbot::Gear::StripRaidEnchants(p);
 
     // Level-cap bots: raid-ready gear (Playerbot.Behavior.RaidGear). Role stat weights decide, an occupied slot is only
     // upgraded when the pick scores 10% higher; the under-gear tests below (average item level against the level) are
@@ -3171,6 +3585,7 @@ BotPopulationManager::FilterOfflineCandidates(std::vector<OfflineCandidate> cons
     {
         OfflineCandidate const& c = rows[i];
         if (c.alliance != alliance) continue;
+        if (Pool::IsScenarioBot(c.char_guid)) continue;   // a scenario test character is never part of the world population
         out.push_back(c);
         if (out.size() >= cap) break;
     }
@@ -3217,7 +3632,9 @@ uint64 BotPopulationManager::SpawnNew(uint8 level, bool alliance, uint8 race_hin
         // through LoginExisting (distribution_level 0): counting them here
         // stopped a small ambient world short of its target (10 companions
         // + TotalTarget 20 -> cap 22 -> only 12 world bots ever spawned).
-        const uint32 spawn_cap = uint32(float(total_target) * 1.10f);
+        // Playerbot.Population.SpawnCapFactor: a pool that does not fit the level / faction buckets (only Horde, too few level 60s)
+        // can only be completed by creating more characters
+        const uint32 spawn_cap = uint32(float(total_target) * cfg.population_spawn_cap_factor());
         const uint32 marked    = pool_marked_count_;
         if (marked >= spawn_cap)
         {
@@ -3455,6 +3872,10 @@ void BotPopulationManager::ProtectFromKick(uint64 guid_low, uint32 duration_ms)
 
 bool BotPopulationManager::IsKickProtected(uint64 guid_low, uint32 now_ms) const
 {
+    // A scenario bot is held for the whole run, not for a lease: the damage_parity runs last longer than the ten minutes it was staged
+    // with, and the logout that came as that lease ran out ended every one of them at about 11 minutes.
+    if (Pool::IsScenarioBot(guid_low))
+        return true;
     auto it = kick_protect_until_ms_.find(guid_low);
     return it != kick_protect_until_ms_.end() && int32(it->second - now_ms) > 0;
 }
@@ -3463,7 +3884,8 @@ bool BotPopulationManager::IsAmbientBot(BotId id, Player const* p) const
 {
     auto it = pipeline_row_cache_.find(uint64(id));
     // A battleground JIT bot (jit tag still set) belongs to the queue filler, not to the world spawner.
-    return it != pipeline_row_cache_.end() && it->second.dist_level > 0 && it->second.jit_tag.empty()
+    // A scenario bot is a test subject, not a resident: the world pool never recycles it, walks it away or places it.
+    return it != pipeline_row_cache_.end() && it->second.dist_level > 0 && it->second.jit_tag.empty() && !Pool::IsScenarioBot(uint64(id))
         && !IsPlayerOwnedAlt(id, p) && !(p && IsSoakAnchor(p->GetName()));   // a soak anchor stands in for a player, it is not a resident
 }
 
@@ -4078,6 +4500,17 @@ void BotPopulationManager::DriveSetupPipelines()
                             p->ActivateTalentGroup(spec_entry);
                     }
                 }
+                else if (p->GetClass() == CLASS_SHAMAN && ::Playerbot::Classic::IsSingleSpecClass(CLASS_SHAMAN))
+                {
+                    // A shaman taken for a damage place (a raid's totem shaman, BotQueueFiller) plays Enhancement, not the
+                    // Restoration its role roll may have given it.
+                    uint32 const dps_spec = DpsSpecForClass(CLASS_SHAMAN);
+                    if (dps_spec && uint32(::Playerbot::Classic::EffectiveSpecId(p)) != dps_spec)
+                    {
+                        ::Playerbot::Classic::SetSpecOverride(p, dps_spec);
+                        ::Playerbot::API(p).apply_classic_talents();
+                    }
+                }
 
                 // A reused JIT character logs in where it was last saved: dead (ghost), mid-fight in a hostile zone, hurt. WSG test
                 // 2026-10-08: such bots carried on with world life and were only invited ~80 s later, once alive and idle. A bot taken
@@ -4336,6 +4769,20 @@ void BotPopulationManager::DriveBgSoak(uint32 now_ms)
         st.first_in_bg_ms = now_ms;
     if (bg)
         st.last_status = uint8(bg->GetStatus());
+    // Who won, once per soak, when the match is over (AV 270 ended on reinforcements and the soak log had no word of the winner).
+    // AV: the reinforcements left (world states 3127 / 3128); the classic AV script's own [av_end] line in Server.log has the cause
+    // and the end honor.
+    if (bg && bg->GetStatus() == STATUS_WAIT_LEAVE && !st.end_logged)
+    {
+        st.end_logged = true;
+        PvPTeamId const w = bg->GetWinner();
+        Map const* m = bg->GetBgMap();
+        bool const av = m && m->GetId() == 30;
+        TC_LOG_INFO("playerbot.v2", "[bgsoak] match over bg_type={} winner={} after={}s reinforcements alliance={} horde={}", st.bg_type,
+                    w == PVP_TEAM_ALLIANCE ? "Alliance" : w == PVP_TEAM_HORDE ? "Horde" : "none",
+                    uint32(std::chrono::duration_cast<Seconds>(bg->GetInProgressDuration()).count()),
+                    av ? m->GetWorldStateValue(3127) : -1, av ? m->GetWorldStateValue(3128) : -1);
+    }
 
     if (int32(now_ms - st.last_log_ms) >= 60000)
     {
@@ -4859,7 +5306,7 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                 req.instance_id = uint32(bg->GetTypeID());
                 req.requesting_player = nullptr;
                 req.online_only = !allow_jit;
-                req.max_total_bots = uint8(Battleground::TopUpRequest(alli, max_per_team));
+                req.max_total_bots = uint8(Battleground::TopUpAfterInFlight(alli, max_per_team, BotQueueFiller::JitInFlight(uint32(bg->GetTypeID()), true)));
                 req.single_faction = true;
                 if (target_level_for_bracket > 0)
                     req.target_level_override = target_level_for_bracket;
@@ -4868,7 +5315,8 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                     req.bracket_min_level = bracket_min;
                     req.bracket_max_level = bracket_max;
                 }
-                filler.Fill(req);
+                if (req.max_total_bots)
+                    filler.Fill(req);
             }
             if (horde < max_per_team && (horde_free_tc > 0 || alli < max_per_team))
             {
@@ -4879,7 +5327,7 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                 req.instance_id = uint32(bg->GetTypeID());
                 req.requesting_player = nullptr;
                 req.online_only = !allow_jit;
-                req.max_total_bots = uint8(Battleground::TopUpRequest(horde, max_per_team));
+                req.max_total_bots = uint8(Battleground::TopUpAfterInFlight(horde, max_per_team, BotQueueFiller::JitInFlight(uint32(bg->GetTypeID()), false)));
                 req.single_faction = true;
                 if (target_level_for_bracket > 0)
                     req.target_level_override = target_level_for_bracket;
@@ -4888,7 +5336,8 @@ void BotPopulationManager::TopUpActiveBGs(uint32 now_ms)
                     req.bracket_min_level = bracket_min;
                     req.bracket_max_level = bracket_max;
                 }
-                filler.Fill(req);
+                if (req.max_total_bots)
+                    filler.Fill(req);
             }
             // Diagnostic: surface the team-balance state alongside the
             // top-up activity so an imbalanced BG is visible in the log.

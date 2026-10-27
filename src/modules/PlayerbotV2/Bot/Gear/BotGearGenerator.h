@@ -60,6 +60,17 @@ struct GearGenerationContext
     // What the owner asked for (Owned::GearMode, already reduced by Owned::EffectiveMode): at the cap T1 / T2 / T3 put the class tier set on
     // and raise the ceiling to that tier for the other slots; Best ignores the owner's own gear level. Ignored for world bots.
     Owned::GearMode gear_mode = Owned::GearMode::Match;
+    // A fight the bot gears resistance for (a SpellSchools value; 0 = none): at the cap, in a tier or best-in-slot mode, every armour and
+    // jewellery slot takes the piece with the most resistance to that school under the mode's item level (Gear::ResistPoints), the tier
+    // set filling the rest, as a vanilla raid dressed for Princess Huhuran. Weapons, trinkets and the ranged slot keep their picks.
+    // Ignored for world bots.
+    uint8  resist_school = 0;
+    // A piece worn for the fight whatever it scores (an item entry; 0 = none): the Onyxia Scale Cloak, whose aura is what the drakes' Shadow
+    // Flame checks. It goes on over the pick, the tier piece or the resistance piece in its slot. Ignored for world bots.
+    uint32 wear_entry = 0;
+    // Generate even for a world bot under level 10 (WorldGearStart.h). Set only to replace a starter piece the client cannot draw, so
+    // the bot is not left bare; the caller then uses just the slots it needs.
+    bool   replace_unrenderable_starter = false;
     bool   world_bot() const { return ::Playerbot::Pool::UsesWorldGear(role); }
 };
 
@@ -79,7 +90,13 @@ int32 OwnedSlotScore(ItemTemplate const* tpl, uint8 cls, uint16 spec, uint8 leve
 // The item entries of a class's tier set (ItemSet.db2, found by name, see Owned::TierSetName), tier 1..3; empty when the data has none.
 std::vector<uint32> const& TierSetPieces(uint8 cls, int32 tier);
 // Whether `entry` is a piece of the tier set the mode names for the class.
-bool IsTierSetPick(uint8 cls, Owned::GearMode mode, uint32 entry);
+bool TierSetIsHealerSet(uint8 cls, uint16 spec);
+bool IsTierSetPick(uint8 cls, Owned::GearMode mode, uint32 entry, uint16 spec = 0);
+
+struct SourcedGearPick { uint8 slot; uint32 entry; };
+// The Naxxramas gear list of a class and spec when the tier mode wears a sourced best-in-slot list instead of the tier set (warrior dps in the
+// Tier 3 mode); empty otherwise.
+std::vector<SourcedGearPick> const& SourcedTierGear(uint8 cls, uint16 spec, Owned::GearMode mode);
 
 // Variety: a pick may be any candidate of the best's quality whose effective item level is within this many points of
 // the best's (and that scores about as well), chosen by bot_id and slot. Two items of one quality this close are

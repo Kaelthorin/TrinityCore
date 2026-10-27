@@ -2,6 +2,8 @@
 #include "../Bot/ThreatLimits.h"
 #include "Config.h"
 #include "Log.h"
+#include "StringConvert.h"
+#include "Util.h"
 #include <algorithm>
 
 namespace Playerbot {
@@ -65,6 +67,7 @@ void ConfigReader::apply_from_loaded_config()
     pop_horde_pct_  = static_cast<uint8>(c.GetIntDefault("Playerbot.Population.HordePct", 50, true));
     pop_shape_      = c.GetStringDefault("Playerbot.Population.Shape",     "MaxHeavy", true);
     pop_max_heavy_factor_ = float(c.GetFloatDefault("Playerbot.Population.MaxHeavyFactor", 0.40f, true));
+    pop_spawn_cap_factor_ = std::max(1.0f, float(c.GetFloatDefault("Playerbot.Population.SpawnCapFactor", 1.10f, true)));
 
     accept_invites_       = c.GetStringDefault("Playerbot.Interact.AutoAcceptInvites", "friends_or_higher", true);
     auto_leader_handover_ = c.GetBoolDefault  ("Playerbot.Interact.AutoLeaderHandover", true, true);
@@ -102,7 +105,7 @@ void ConfigReader::apply_from_loaded_config()
     session_rhythm_max_logouts_per_cycle_ = static_cast<uint32>(
         c.GetIntDefault("PlayerbotV2.SessionRhythm.MaxLogoutsPerCycle", 25, true));
 
-    guilds_enabled_                          = c.GetBoolDefault("PlayerbotV2.Guilds.Enabled", false, true);
+    guilds_enabled_                          = c.GetBoolDefault("PlayerbotV2.Guilds.Enabled", true, true);
     guilds_target_count_per_faction_         = static_cast<uint8>(c.GetIntDefault("PlayerbotV2.Guilds.TargetCountPerFaction", 6, true));
     guilds_max_members_per_guild_            = static_cast<uint16>(c.GetIntDefault("PlayerbotV2.Guilds.MaxMembersPerGuild", 75, true));
     guilds_events_enabled_                   = c.GetBoolDefault("PlayerbotV2.Guilds.EventsEnabled", true, true);
@@ -149,8 +152,21 @@ void ConfigReader::apply_from_loaded_config()
     threat_hold_enabled_    = c.GetBoolDefault("PlayerbotV2.Threat.HoldEnabled", true, true);
     raid_dps_wait_attack_   = c.GetBoolDefault("Playerbot.Raid.DpsWaitForAttack", true, true);
     raid_provide_consumables_ = c.GetBoolDefault("Playerbot.Raid.ProvideConsumables", true, true);
+    raid_consumables_in_dungeons_ = c.GetBoolDefault("Playerbot.Raid.ConsumablesInDungeons", true, true);
+    raid_resist_gear_         = c.GetBoolDefault("Playerbot.Raid.ResistGear", false, true);
     consumables_pve_          = c.GetBoolDefault("Playerbot.Consumables.PvE", true, true);
     consumables_pvp_          = c.GetBoolDefault("Playerbot.Consumables.PvP", false, true);
+    {
+        static constexpr char const* kSwitch[kAlwaysSwitchCount] = { "Supplies", "Repair", "WorldBuffs", "Consumables" };
+        static constexpr char const* kPlace[kAlwaysPlaceCount]   = { "Raid", "World", "Battleground" };
+        for (uint8 w = 0; w < kAlwaysSwitchCount; ++w)
+            for (uint8 p = 0; p < kAlwaysPlaceCount; ++p)
+            {
+                // Supplies and Repair on everywhere; world buffs and consumables on in raids and dungeons only.
+                bool const def = w == uint8(AlwaysSwitch::Supplies) || w == uint8(AlwaysSwitch::Repair) || p == uint8(AlwaysPlace::Raid);
+                always_[w][p] = c.GetBoolDefault(std::string("Playerbot.AlwaysBuffs.") + kSwitch[w] + "." + kPlace[p], def, true);
+            }
+    }
     raid_dps_wait_timeout_ms_ = uint32(std::clamp<int64>(int64(c.GetIntDefault("Playerbot.Raid.DpsWaitTimeoutMs", int(kRaidDpsWaitTimeoutMaxMs), true)), 1000, int64(kRaidDpsWaitTimeoutMaxMs)));
     threat_hold_open_world_ = c.GetBoolDefault("PlayerbotV2.Threat.HoldInOpenWorld", false, true);
     threat_max_ratio_ = std::clamp(float(c.GetFloatDefault("PlayerbotV2.Threat.MaxRatio", 0.9f, true)), 0.3f, 1.2f);
@@ -167,6 +183,7 @@ void ConfigReader::apply_from_loaded_config()
     bhv_tank_ranged_weapon_   = c.GetBoolDefault("Playerbot.Behavior.TankRangedWeapon", true, true);
     bhv_ammo_supply_          = c.GetBoolDefault("Playerbot.Behavior.AmmoSupply", true, true);
     bhv_raid_gear_            = c.GetBoolDefault("Playerbot.Behavior.RaidGear", true, true);
+    gear_raid_enchants_       = c.GetBoolDefault("Playerbot.Gear.RaidEnchants", true, true);
     bhv_accept_owner_trade_   = c.GetBoolDefault("Playerbot.Behavior.AcceptOwnerTrade", true, true);
     bhv_formation_            = c.GetBoolDefault("Playerbot.Behavior.Formation", true, true);
     bhv_distance_order_       = c.GetBoolDefault("Playerbot.Behavior.DistanceOrder", true, true);
@@ -185,9 +202,83 @@ void ConfigReader::apply_from_loaded_config()
     bhv_warrior_stance_dance_ = c.GetBoolDefault("Playerbot.Behavior.WarriorStanceDance", true, true);
     bhv_bot_whisperable_      = c.GetBoolDefault("Playerbot.Behavior.BotWhisperable", true, true);
     chatter_conversation_     = c.GetBoolDefault("Playerbot.Chatter.Conversation", true, true);
+    {
+        ChatModelConfig& m = chat_model_;
+        m.enable            = c.GetBoolDefault("Playerbot.ChatModel.Enable", false, true);
+        m.whispers          = c.GetBoolDefault("Playerbot.ChatModel.Whispers", true, true);
+        m.party             = c.GetBoolDefault("Playerbot.ChatModel.Party", true, true);
+        m.say_reply         = c.GetBoolDefault("Playerbot.ChatModel.Say", true, true);
+        m.host              = c.GetStringDefault("Playerbot.ChatModel.Host", "127.0.0.1", true);
+        m.port              = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.Port", 11434, true), 1, 65535));
+        m.model             = c.GetStringDefault("Playerbot.ChatModel.Model", "llama3.2:3b", true);
+        m.timeout_ms        = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.TimeoutMs", 45000, true), 1000, 120000));
+        m.max_tokens        = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxTokens", 60, true), 10, 400));
+        m.temperature       = std::clamp(float(c.GetFloatDefault("Playerbot.ChatModel.Temperature", 0.8f, true)), 0.0f, 2.0f);
+        m.keep_alive        = c.GetStringDefault("Playerbot.ChatModel.KeepAlive", "30m", true);
+        m.context_length    = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.ContextLength", 2048, true), 512, 32768));
+        m.party_chance      = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.PartyChance", 100, true), 0, 100));
+        m.second_reply_chance = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.SecondReplyChance", 35, true), 0, 100));
+        m.quiet_chance      = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.QuietChance", 30, true), 0, 100));
+        m.say_chance        = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.SayChance", 100, true), 0, 100));
+        m.say_per_minute    = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.SayPerMinute", 10, true), 0, 600));
+        m.date_in_prompt    = c.GetBoolDefault("Playerbot.ChatModel.DateInPrompt", true, true);
+        m.bot_cooldown_ms   = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.BotCooldownMs", 3000, true), 0, 600000));
+        m.group_cooldown_ms = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.GroupCooldownMs", 0, true), 0, 600000));
+        m.max_per_minute    = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxPerMinute", 30, true), 1, 600));
+        m.max_queue         = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxQueue", 6, true), 1, 64));
+        m.max_wait_ms       = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxWaitMs", 60000, true), 2000, 300000));
+        m.history_lines     = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.HistoryLines", 8, true), 0, 20));
+        m.history_minutes   = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.HistoryMinutes", 10, true), 1, 240));
+        m.language          = c.GetStringDefault("Playerbot.ChatModel.Language", "auto", true);
+        m.extra_prompt      = c.GetStringDefault("Playerbot.ChatModel.ExtraPrompt", "", true);
+    }
+    chatter_channel_replies_  = c.GetBoolDefault("Playerbot.Chatter.ChannelReplies.Enable", true, true);
+    chatter_channel_question_pct_ = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.Chatter.ChannelReplies.QuestionPct", 60, true), 0, 100));
+    chatter_channel_greet_pct_    = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.Chatter.ChannelReplies.GreetPct", 40, true), 0, 100));
+    chatter_lfg_channel_      = c.GetBoolDefault("Playerbot.Chatter.LfgChannel", true, true);
     bhv_world_bot_say_reply_  = c.GetBoolDefault("Playerbot.Behavior.WorldBotSayReply", true, true);
     bhv_instance_group_cap_   = c.GetBoolDefault("Playerbot.Behavior.InstanceGroupCap", true, true);
     bhv_open_world_group_cap_ = std::clamp<int32>(c.GetIntDefault("Playerbot.Behavior.OpenWorldGroupCap", 40, true), 1, 40);
+    lfg_enable_               = c.GetBoolDefault("Playerbot.Lfg.Enable", true, true);
+    lfg_instant_fill_         = c.GetBoolDefault("Playerbot.Lfg.InstantFillIfNobody", false, true);
+    lfg_trickle_              = c.GetBoolDefault("Playerbot.Lfg.Trickle", true, true);
+    lfg_level_range_          = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.LevelRange", 5, true), 0, 80));
+    lfg_bot_fill_seconds_     = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotFillSeconds", 180, true), 0, 3600));
+    lfg_categories_.clear();
+    std::string const lfgCategories = c.GetStringDefault("Playerbot.Lfg.Categories", "", true);
+    for (std::string_view token : Trinity::Tokenize(lfgCategories, ',', false))
+        if (Optional<uint32> id = Trinity::StringTo<uint32>(token))
+            lfg_categories_.push_back(*id);
+    lfg_activity_maps_.clear();
+    std::string const lfgActivityMaps = c.GetStringDefault("Playerbot.Lfg.ActivityMaps",
+        "203776:43,204032:289,204288:389,204544:36,204800:33,205056:48,205312:34,205568:90,205824:47,206080:189,206336:129,206592:70,206848:209,207104:349,207360:109,207616:230,207872:229,208128:429,208384:429,208640:429,208896:329,211712:189,211968:189,212224:189,214272:229:10,214016:309,214528:249,214784:409,215040:469,215296:533,215552:509,215808:531", true);
+    for (std::string_view token : Trinity::Tokenize(lfgActivityMaps, ',', false))
+    {
+        // "activity:map" or "activity:map:size"
+        std::vector<std::string_view> const parts = Trinity::Tokenize(token, ':', true);
+        if (parts.size() != 2 && parts.size() != 3)
+            continue;
+        Optional<uint32> activity = Trinity::StringTo<uint32>(parts[0]);
+        Optional<uint32> map = Trinity::StringTo<uint32>(parts[1]);
+        Optional<uint32> size = parts.size() == 3 ? Trinity::StringTo<uint32>(parts[2]) : Optional<uint32>(0u);
+        if (activity && map && size)
+            lfg_activity_maps_.push_back(LfgActivityMap{ *activity, *map, *size });
+    }
+    lfg_bot_groups_max_       = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.Max", 25, true), 0, 40));
+    lfg_bot_groups_max_bots_  = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MaxBots", 150, true), 0, 400));
+    lfg_bot_groups_category_  = uint32(std::max<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.Category", 2, true), 0));
+    lfg_bot_groups_min_seconds_ = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MinMinutes", 5, true), 1, 120)) * 60;
+    lfg_bot_groups_max_seconds_ = std::max(lfg_bot_groups_min_seconds_,
+        uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.MaxMinutes", 20, true), 1, 240)) * 60);
+    lfg_bot_groups_interval_seconds_ = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.Lfg.BotGroups.IntervalSeconds", 30, true), 10, 3600));
+    // one entry per vanilla dungeon of the Group Finder: activity id x 256 : map : level min : level max
+    static char const* const kDefaultListedActivities =
+        "203776:43:15:24,204032:289:58:60,204288:389:13:18,204544:36:17:26,204800:33:20:30,205056:48:24:32,"
+        "205312:34:24:32,205568:90:29:38,205824:47:29:38,206080:189:30:38,206336:129:37:46,206592:70:41:51,"
+        "206848:209:44:54,207104:349:46:55,207360:109:50:60,207616:230:52:60,207872:229:55:60,208128:429:54:60,"
+        "208384:429:56:60,208640:429:56:60,208896:329:58:60,211712:189:36:44,211968:189:38:46,212224:189:33:41,"
+        "214272:229:59:60:10";
+    lfg_bot_groups_activities_ = V2::ParseListedActivities(c.GetStringDefault("Playerbot.Lfg.BotGroups.Activities", kDefaultListedActivities, true));
     bhv_bg_human_priority_    = c.GetBoolDefault("Playerbot.Behavior.BgHumanPriority", true, true);
     bhv_tank_markers_         = c.GetBoolDefault("Playerbot.Behavior.TankMarkers", true, true);
     bhv_mark_cc_              = c.GetBoolDefault("Playerbot.Behavior.MarkCc", true, true);
@@ -214,6 +305,35 @@ void ConfigReader::apply_from_loaded_config()
     bhv_party_banter_         = c.GetBoolDefault("Playerbot.Behavior.PartyBanter", true, true);
     bhv_social_emotes_        = c.GetBoolDefault("Playerbot.Behavior.SocialEmotes", true, true);
     bhv_polite_world_bots_    = c.GetBoolDefault("Playerbot.Behavior.PoliteWorldBots", true, true);
+    world_questing_           = c.GetBoolDefault("Playerbot.World.Questing", false, true);
+    kindness_enable_          = c.GetBoolDefault("Playerbot.World.Kindness.Enable", true, true);
+    kindness_buff_cd_ms_      = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Kindness.BuffCooldownSec", 900, true), 60, 86400)) * 1000u;
+    kindness_help_hp_pct_     = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Kindness.HelpHpPct", 40, true), 5, 90));
+    share_mobs_enable_        = c.GetBoolDefault("Playerbot.World.ShareMobs.Enable", true, true);
+    share_mobs_camp_radius_   = std::clamp(float(c.GetFloatDefault("Playerbot.World.ShareMobs.CampRadius", 35.0f, true)), 10.0f, 100.0f);
+    share_mobs_quest_radius_  = std::clamp(float(c.GetFloatDefault("Playerbot.World.ShareMobs.QuestRadius", 120.0f, true)), 0.0f, 400.0f);
+    parties_enable_           = c.GetBoolDefault("Playerbot.World.Parties.Enable", true, true);
+    parties_pct_              = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Parties.Pct", 30, true), 0, 100));
+    parties_max_size_         = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Parties.MaxSize", 3, true), 2, 3));
+    parties_life_ms_          = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Parties.LifeMin", 15, true), 1, 240)) * 60000u;
+    gate_duels_enable_        = c.GetBoolDefault("Playerbot.World.GateDuels.Enable", true, true);
+    gate_duels_pairs_         = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.GateDuels.PairsPerGate", 3, true), 1, 3));
+    gate_duels_small_pairs_   = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.GateDuels.SmallCityPairs", 1, true), 0, 3));
+    gate_duels_radius_        = std::clamp(float(c.GetFloatDefault("Playerbot.World.GateDuels.Radius", 80.0f, true)), 30.0f, 200.0f);
+    gate_duels_challenge_     = c.GetBoolDefault("Playerbot.World.GateDuels.ChallengePlayers", true, true);
+    gate_duels_challenge_cd_ms_ = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.GateDuels.ChallengeCooldownSec", 600, true), 30, 86400)) * 1000u;
+    {
+        GatheringConfig& g = gathering_;
+        g.enable           = c.GetBoolDefault("Playerbot.World.Gathering.Enable", true, true);
+        g.bots_per_gate    = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.BotsPerGate", 8, true), 3, 12));
+        g.radius           = std::clamp(float(c.GetFloatDefault("Playerbot.World.Gathering.Radius", 90.0f, true)), 30.0f, 200.0f);
+        g.all_cities       = c.GetBoolDefault("Playerbot.World.Gathering.AllCities", false, true);
+        g.stay_ms          = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.StayMin", 10, true), 2, 120)) * 60000u;
+        g.talk_gap_ms      = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.TalkGapSec", 40, true), 10, 1800)) * 1000u;
+        g.campfire         = c.GetBoolDefault("Playerbot.World.Gathering.Campfire", true, true);
+        g.use_chat_model   = c.GetBoolDefault("Playerbot.World.Gathering.UseChatModel", true, true);
+        g.model_per_minute = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.ChatModelPerMinute", 4, true), 1, 60));
+    }
     bhv_quest_accept_         = c.GetBoolDefault("Playerbot.Behavior.QuestAccept", true, true);
     bhv_quest_share_          = c.GetBoolDefault("Playerbot.Behavior.QuestShare", true, true);
     bhv_quest_turn_in_        = c.GetBoolDefault("Playerbot.Behavior.QuestTurnIn", true, true);
@@ -236,7 +356,7 @@ void ConfigReader::apply_from_loaded_config()
         cast_pacing_ = p;
         Pacing q;
         q.decision_delay_ms     = pct("Playerbot.Pacing.DecisionDelayMs",     600, 100, 5000);
-        q.pvp_reaction_delay_ms = pct("Playerbot.Pacing.PvpReactionDelayMs", 700, 0, 3000);
+        q.pvp_reaction_delay_ms = pct("Playerbot.Pacing.PvpReactionDelayMs", 630, 0, 3000);
         pacing_ = q;
         BgAutoJoin j;
         j.enabled          = c.GetBoolDefault("Playerbot.Bg.AutoJoin", false, true);

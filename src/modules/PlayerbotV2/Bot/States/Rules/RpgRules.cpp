@@ -45,6 +45,8 @@
 #include "Services.h"
 #include "Util/ConfigReader.h"
 #include "Bot/States/MaintainHelpers.h"   // ChunkedWalkToward, DriveTravelPlanTo
+#include "Bot/TownErrandConfig.h"
+#include "Bot/World/ZonePicker.h"
 #include "Travel/RegionMapper.h"
 #include "Travel/TownNpcIndex.h"
 #include "ItemTemplate.h"
@@ -289,7 +291,6 @@ bool Arrive(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, NearbyU
     if (s.is_mounted())
         emit.dismount();
 
-    bool sit = false;
     if (live)
     {
         st.npc = live->guid;
@@ -310,12 +311,7 @@ bool Arrive(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, NearbyU
             emit.repair_all(live->guid);
             ai.note_action_retry(BotAI::ActionKind::Repair, low, now_ms);
         }
-        // A rest at the inn now and then (ike3 rpg stay).
-        sit = (st.npc_flags & UNIT_NPC_FLAG_INNKEEPER) && ai.rng().chance_pct(35);
     }
-    if (sit)
-        emit.sit();
-    else
     {
         // Talk, bow, wave, exclaim, ask, laugh, point: all vanilla one-shot emotes.
         static constexpr uint32 kTalkEmotes[] = {
@@ -373,6 +369,8 @@ bool Approach(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, uint3
 bool VisitGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
 {
     if (!WorldBotFree(s, ai, now_ms)) return false;
+    // In a capital the town errands (idle:town_errand) take the bot across the city; these visits hop between the NPCs within 60 y.
+    if (::Playerbot::V2::TownErrand::Cfg().errands && ::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id())) return false;
     auto const& st = ai.rpg();
     // A live trip owns the bot's movement; one abandoned long ago (quest work
     // took over) no longer does.

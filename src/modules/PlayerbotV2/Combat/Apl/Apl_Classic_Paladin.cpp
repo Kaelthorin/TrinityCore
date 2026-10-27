@@ -57,6 +57,7 @@ constexpr uint32 SEAL_OF_WISDOM      = 20166;
 constexpr uint32 SEAL_OF_CRUSADER    = 21082;
 constexpr uint32 JUDGEMENT           = 20271;
 constexpr uint32 HAMMER_OF_WRATH     = 24275;
+constexpr uint32 HOLY_STRIKE         = 678;     // Forever's Retribution strike (rank 1; the cast resolves the highest rank): weapon damage plus Holy
 constexpr uint32 DIVINE_FAVOR        = 20216;   // Holy talent
 
 constexpr uint8 POWER_MANA = 0;
@@ -139,12 +140,14 @@ bool HasAnySeal(ApPredicateContext const& ctx)
 uint32 RaidJudgementSeal(ApPredicateContext const& ctx)
 {
     auto const* members = ctx.group.members();
-    if (!members || members->size() <= 5 || ctx.bot.my_role() == Role::Tank)
+    // A Retribution paladin keeps Seal of Command: the 213 scorecard's ret judged Wisdom (slot 0 or 1 of two paladins), a seal with no damage, and
+    // 85% of its damage was the white swing at 362 dps. The judgement seals are the healer and tank-side paladins' job.
+    if (!members || members->size() <= 5 || ctx.bot.my_role() == Role::Tank || ctx.bot.spec() == SPEC_RET)
         return 0;
     thread_local std::vector<ObjectGuid> pals;
     pals.clear();
     for (auto const& m : *members)
-        if (m.cls == CLASS_PALADIN && m.is_bot && m.online && m.is_alive && m.map_id == ctx.bot.map_id() && m.role != Role::Tank)
+        if (m.cls == CLASS_PALADIN && m.is_bot && m.online && m.is_alive && m.map_id == ctx.bot.map_id() && m.role != Role::Tank && m.spec != SPEC_RET)
             pals.push_back(m.guid);
     std::sort(pals.begin(), pals.end());
     auto const it = std::find(pals.begin(), pals.end(), ctx.bot.raw().guid);
@@ -242,7 +245,7 @@ void DoSeal(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DpsSeal
 
 bool ShouldJudgement(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && HasAnySeal(ctx) && Ready(ctx, JUDGEMENT) && DistToVictim(ctx) <= 9.f;
+    return HasLiveTarget(ctx) && HasAnySeal(ctx) && (Ready(ctx, JUDGEMENT) && ctx.bot.victim_in_spell_range(JUDGEMENT));
 }
 void DoJudgement(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(JUDGEMENT, ctx.bot.victim()); }
 
@@ -251,13 +254,13 @@ bool ShouldHammerOfJustice(ApPredicateContext const& ctx)
     // Stun an enemy that is casting (nothing better to interrupt with in 1.12).
     NearbyUnit const* v = ctx.bot.victim_info();
     return HasLiveTarget(ctx) && v && v->is_casting && v->is_interruptible && !(v->is_dungeon_boss || v->is_boss_rank)
-        && (Ready(ctx, HAMMER_OF_JUSTICE) && ctx.bot.victim_in_spell_range(HAMMER_OF_JUSTICE)) && DistToVictim(ctx) <= 9.f;
+        && (Ready(ctx, HAMMER_OF_JUSTICE) && ctx.bot.victim_in_spell_range(HAMMER_OF_JUSTICE));
 }
 void DoHammerOfJustice(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HAMMER_OF_JUSTICE, ctx.bot.victim()); }
 
 // ======================= Healer =======================
 
-// Lay on Hands (1 h cooldown, drains all mana) is reserved for a tank at
+// Lay on Hands (20 min cooldown, drains all mana) is reserved for a tank at
 // critical health (the owner's "party member critical tank health", 20%) and
 // for the paladin itself; anyone else gets Flash of Light. Forbearance from
 // any paladin (member debuff list) blocks it.
@@ -297,9 +300,36 @@ bool ShouldDivineFavor(ApPredicateContext const& ctx)
 }
 void DoDivineFavor(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DIVINE_FAVOR); }
 
+// Whether the group member `who` is within the friendly range of `spell` (the bot itself always is). Holy Shock reaches 20 y, the heals 40 y: a
+// shock sent at a patient 30 y away fails out of range every tick and, being first in the rotation, starves the heals that would reach.
+bool FriendInSpellRange(ApPredicateContext const& ctx, ObjectGuid who, uint32 spell)
+{
+    if (who.IsEmpty() || who == ctx.bot.guid())
+        return true;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(ctx.bot.resolve_rank(spell) ? ctx.bot.resolve_rank(spell) : spell, DIFFICULTY_NONE);
+    float const range = si ? si->GetMaxRange(true) : 0.0f;
+    if (range <= 0.0f)
+        return true;
+    auto const* members = ctx.group.members();
+    if (!members)
+        return true;
+    float bx, by, bz;
+    ctx.bot.position(bx, by, bz);
+    for (auto const& m : *members)
+        if (m.guid == who)
+        {
+            float const dx = m.x - bx, dy = m.y - by, dz = m.z - bz;
+            return dx * dx + dy * dy + dz * dz <= range * range;
+        }
+    return true;
+}
+
 bool ShouldHolyShock(ApPredicateContext const& ctx)
 {
-    return Ready(ctx, HOLY_SHOCK) && LowestFriendOrSelf(ctx).hp_pct <= 55;
+    if (!Ready(ctx, HOLY_SHOCK))
+        return false;
+    HealTarget const t = LowestFriendOrSelf(ctx);
+    return t.hp_pct <= 55 && FriendInSpellRange(ctx, t.guid, HOLY_SHOCK);
 }
 void DoHolyShock(ApPredicateContext const& ctx, BotIntentEmitter& e)
 {
@@ -512,6 +542,14 @@ bool ShouldRetJudgement(ApPredicateContext const& ctx)
     return ManaPct(ctx) >= 5 && ShouldJudgement(ctx);
 }
 
+// Holy Strike (SpellName/spell descriptions of the client data, Sacred Arbiter and Improved Holy Strike talent texts): an instant strike on its
+// own cooldown, refreshing Judgement effects with Sacred Arbiter. Mana-hungry (215 at rank 8), so only with mana to spare.
+bool ShouldRetHolyStrike(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= 30 && (Ready(ctx, HOLY_STRIKE) && ctx.bot.victim_in_spell_range(HOLY_STRIKE));
+}
+void DoHolyStrike(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HOLY_STRIKE, ctx.bot.victim()); }
+
 bool ShouldRetHammerOfWrath(ApPredicateContext const& ctx)
 {
     return HasLiveTarget(ctx) && VictimHpPct(ctx) <= 20 && ManaPct(ctx) >= 10 && (Ready(ctx, HAMMER_OF_WRATH) && ctx.bot.victim_in_spell_range(HAMMER_OF_WRATH));
@@ -546,6 +584,7 @@ ApRule const kRetRules[] = {
     { ShouldRetHammerOfWrath,    DoHammerOfWrath,       "classic_pal_ret:hammer_of_wrath" },
     { ShouldRetSeal,             DoSeal,                "classic_pal_ret:seal" },
     { ShouldRetJudgement,        DoJudgement,           "classic_pal_ret:judgement" },
+    { ShouldRetHolyStrike,       DoHolyStrike,          "classic_pal_ret:holy_strike" },
     { ShouldRetConsecration,     DoConsecration,        "classic_pal_ret:consecration" },
     { ShouldResurrection,        DoResurrection,        "classic_pal_ret:redemption" },
     { HasLiveTarget,             DoAutoAttack,          "classic_pal_ret:auto_attack" },

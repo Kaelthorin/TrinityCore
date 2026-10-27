@@ -8,6 +8,7 @@
 
 #include "IdleWatch.h"
 #include "WalkOrder.h"
+#include "TownErrand.h"
 #include "Travel/ReachMemory.h"
 #include "BotTypes.h"
 #include "Util/AtomicSharedPtr.h"
@@ -465,6 +466,11 @@ public:
     uint32 pending_equip_upgrade_at_ms() const { return pending_equip_upgrade_at_ms_; }
     void   set_pending_equip_upgrade_at_ms(uint32 v) { pending_equip_upgrade_at_ms_ = v; }
 
+    // The resistance school (SpellSchools value) of the raid gear this bot was last ordered to wear, 0 = its own gear. While set, the
+    // equip-upgrade rule leaves the worn pieces alone (it would put the better scoring own piece straight back).
+    uint8  resist_gear_school() const { return resist_gear_school_; }
+    void   set_resist_gear_school(uint8 v) { resist_gear_school_ = v; }
+
     // Mailbox-open hesitation slot.
     uint32 pending_mail_open_at_ms() const { return pending_mail_open_at_ms_; }
     void   set_pending_mail_open_at_ms(uint32 v) { pending_mail_open_at_ms_ = v; }
@@ -532,6 +538,14 @@ public:
     // Toggled via /aoe whisper.
     bool       aoe_preference() const { return aoe_preference_; }
     void       set_aoe_preference(bool b) { aoe_preference_ = b; }
+    // Owner "aoe off" (AoeDeny.h): no spell that hits more than one enemy until "aoe on". Mirrored into the snapshot.
+    bool       aoe_denied() const { return aoe_denied_; }
+    void       set_aoe_denied(bool b) { aoe_denied_ = b; }
+
+    // The owner's spell picks for this bot ("prefer blessing might", "pet off", "stealth off"; OwnerPicks.h). Memory only: a relog
+    // clears them. Written by the whisper handler (world thread), mirrored into the snapshot and the group member summary.
+    OwnerPicks::Picks const& owner_picks() const { return owner_picks_; }
+    OwnerPicks::Picks&       owner_picks()       { return owner_picks_; }
 
     // Battle-rez dedup state. brez_target_ is the GUID of the dead member
     // we last fired Rebirth (Druid) / Raise Ally (DK) / Soulstone (Warlock)
@@ -2229,6 +2243,8 @@ public:
     uint32 last_wander_diag_ms() const { return last_wander_diag_ms_; }
     ::Playerbot::V2::IdleWatch& idle_watch() { return idle_watch_; }
     ::Playerbot::V2::WalkOrder& walk_order() { return walk_order_; }   // the spawner's arrive / leave request (WalkOrder.h)
+    ::Playerbot::V2::TownErrand::State& town_errand() { return town_errand_; }
+    ::Playerbot::V2::GoalProgress& goal_progress() { return goal_progress_; }   // idle:pursue_quest_goal, closing in on the goal (IdleWatch.h)   // idle:town_errand, a capital resident's next place (TownErrand.h)
     ::Playerbot::BgTactics::StallWatch& bg_stall() { return bg_stall_; }
     void   set_last_wander_diag_ms(uint32 ms) { last_wander_diag_ms_ = ms; }
 
@@ -2675,6 +2691,9 @@ public:
                                // object's guid_low (bit 41 set). Companion quest help
                                // (idle:companion_quest_*): 15s between attempts on the same quest / object.
         CompanionQuestShare = 56, // target = 0 (per bot). One auto-share pass per 90s.
+        BgFormHold      = 57,  // target = 0. A bot clicking a battleground flag / banner: no druid shapeshift cast
+                               // for 6s (the click leaves the form; the rotation shifted straight back in).
+        AlwaysBuff      = 58,  // target = kAlwaysBuffLockKey. idle:always_buff (Playerbot.AlwaysBuffs): 10s between passes.
     };
     static constexpr uint32 kActionRetryLockoutMs = 5u * 60u * 1000u;
     // Per-kind cooldown override — most actions use the 5 min default, but
@@ -2803,6 +2822,14 @@ public:
             case ActionKind::DruidFormEntered:
                 // A buff that can't land must not flip the form every tick.
                 return 10u * 1000u;
+            case ActionKind::BgFormHold:
+                // Past the 3 s BgUseGo retry, so the second click lands out of form.
+                return 6u * 1000u;
+            case ActionKind::AlwaysBuff:
+                // The gate fires only when an aura is out of step with where the bot stands, so a short pace is enough. It shared the
+                // potion's 5 min lockout once: a bot that got its gold floor in the world and joined a raid group a few seconds later
+                // could not take its flask for 5 minutes (support scorecard on 230: no flask on any of ten bots for the whole run).
+                return 10u * 1000u;
             case ActionKind::CompanionQuest:
                 // A refused accept / turn-in / click (bags full, out of range) retries at human pace.
                 return 15u * 1000u;
@@ -2899,6 +2926,7 @@ public:
             // without this the 6s / 10s leave / re-enter windows were no-ops.
             case ActionKind::DruidFormLeft:
             case ActionKind::DruidFormEntered:
+            case ActionKind::BgFormHold:
             case ActionKind::CompanionQuestShare:
                 return true;
             default:
@@ -3228,10 +3256,19 @@ public:
     {
         uint32 idle_since_ms = 0;
         uint32 logged_ms     = 0;
+        // Idle watchdog ([idle_reposition]): where the bot stood when the streak began or the watchdog last fired, and when. A bot that has
+        // moved on from there is walking somewhere; one still within a few yards of it after 3 s is stuck and is sent to a spot.
+        float  anchor_x      = 0.f;
+        float  anchor_y      = 0.f;
+        uint32 anchor_ms     = 0;
     };
     CombatIdleState& combat_idle() { return combat_idle_; }
+    // Game time of the last damage this bot itself dealt (world thread writes from the damage hook, the bot worker reads); 0 = none yet.
+    void   note_damage_done(uint32 now_ms) { last_damage_done_ms_.store(now_ms ? now_ms : 1u, std::memory_order_relaxed); }
+    uint32 last_damage_done_ms() const { return last_damage_done_ms_.load(std::memory_order_relaxed); }
 private:
     CombatIdleState combat_idle_;
+    std::atomic<uint32> last_damage_done_ms_{0};
 
     // [cast_fail] window (world thread only; see note_cast_outcome).
     struct CastFailWindow
@@ -3394,6 +3431,7 @@ private:
     // Slot resets when the rule isn't gating (in combat / dungeon /
     // BG), so a fresh upgrade after exit gets a fresh window.
     uint32         pending_equip_upgrade_at_ms_ = 0;
+    uint8          resist_gear_school_ = 0;
     // Mailbox-open hesitation: real humans click the mailbox, see the
     // list, hover one row, click "Take All". 1.5–4s before the first
     // take packet lands. Reset when the bot walks out of mailbox range.
@@ -3415,6 +3453,8 @@ private:
     ObjectGuid     last_trained_trainer_;
     uint8          last_train_level_ = 0;
     bool           aoe_preference_   = false;
+    bool           aoe_denied_       = false;
+    OwnerPicks::Picks owner_picks_;
     // Owner-squad-control state (Phase C of OWNER_SQUAD_CONTROL_PLAN.md).
     // The owner's orders to this bot, all in one place. Written by the chat handlers (world thread), read by the bot worker.
     struct OwnerOrders
@@ -3699,6 +3739,9 @@ public:
     void   set_cached_spellmap_size(size_t v) { cached_spellmap_size_ = v; }
     std::vector<uint32> const& cached_known_spells() const { return cached_known_spells_; }
     std::vector<uint32>& mutable_cached_known_spells() { return cached_known_spells_; }
+    // The known spells' range modifiers (SpellbookState::range_bonus), rebuilt with the known-spell cache: talents change both.
+    std::vector<std::pair<uint32, float>> const& cached_range_bonus() const { return cached_range_bonus_; }
+    std::vector<std::pair<uint32, float>>& mutable_cached_range_bonus() { return cached_range_bonus_; }
 
     // Best-mount-spell cache (perf 0.2). The Builder used to walk the whole
     // SpellMap, fetch SpellInfo, and iterate every effect's ApplyAuraName to
@@ -3785,6 +3828,7 @@ private:
     std::vector<uint32>                       cached_recipes_;
     std::vector<Playerbot::SelfTeleportSpell> cached_self_teleports_;
     std::vector<uint32>                       cached_known_spells_;
+    std::vector<std::pair<uint32, float>>     cached_range_bonus_;
     uint32 last_reputation_scan_ms_ = 0;
     uint32 last_skills_scan_ms_     = 0;
     uint32 last_spellcache_scan_ms_ = 0;
@@ -4122,6 +4166,8 @@ private:
     ::Playerbot::BgTactics::StallWatch bg_stall_;   // battleground stand-still watchdog (State_Idle bg_stall)
     ::Playerbot::V2::WalkOrder walk_order_;
     ::Playerbot::V2::IdleWatch idle_watch_;   // world-wide standing-still detector (DispatchIdle)
+    ::Playerbot::V2::TownErrand::State town_errand_;
+    ::Playerbot::V2::GoalProgress goal_progress_;   // idle:town_errand (Bot/States/Rules/AmbientRules.cpp)
     // Cached corpse → graveyard distance. Recomputing every snapshot tick
     // walks `WorldSafeLocsEntry` against `sConditionMgr` for every nearby
     // graveyard, evaluating per-graveyard team / faction / level conditions.
@@ -4362,6 +4408,14 @@ public:
     // yanking a ranged DPS that is merely between casts (briefly out of combat
     // but in range / actively repositioning); a genuinely stranded bot stays
     // out of combat for the whole window and trips it.
+    // Healer-sight clock (State_InCombat [tank_sight]): how long a 5-man tank's healer has been unable to see it from another
+    // floor, 0 while a healer sees it.
+    uint32 healer_sight_lost_ms(bool lost_now, uint32 now_ms)
+    {
+        if (!lost_now) { healer_sight_lost_since_ms_ = 0; return 0; }
+        if (healer_sight_lost_since_ms_ == 0) healer_sight_lost_since_ms_ = now_ms ? now_ms : 1u;
+        return now_ms - healer_sight_lost_since_ms_;
+    }
     uint32 combat_join_stuck_ms(bool stuck_now, uint32 now_ms)
     {
         // A gap of a second or two (the tank's victim blinking empty between swings, a cast starting, the bot flickering
@@ -4579,7 +4633,12 @@ public:
     void   set_travel_plan(std::vector<PlanLeg> legs, uint64 goal_key)
     { travel_plan_ = std::move(legs); travel_plan_leg_ = 0; travel_plan_goal_ = goal_key; }
     void   advance_travel_leg() { if (travel_plan_leg_ < travel_plan_.size()) ++travel_plan_leg_; }
-    void   clear_travel_plan() { travel_plan_.clear(); travel_plan_leg_ = 0; travel_plan_goal_ = 0; }
+    void   clear_travel_plan() { travel_plan_.clear(); travel_plan_leg_ = 0; travel_plan_goal_ = 0; transport_wait_since_ms_ = 0; }
+    // When the bot began waiting on a dock for a same-map ride (0 = not waiting) and when it last logged it.
+    uint32 transport_wait_since_ms() const { return transport_wait_since_ms_; }
+    void   set_transport_wait_since_ms(uint32 ms) { transport_wait_since_ms_ = ms; }
+    uint32 transport_wait_logged_ms() const { return transport_wait_logged_ms_; }
+    void   set_transport_wait_logged_ms(uint32 ms) { transport_wait_logged_ms_ = ms; }
     // Leg-skip rate-limit (harbor fix): when anchor-wedged on an unreachable
     // WALK leg, the bot advances to the next leg instead of replanning the same
     // bad route. The anchor-wedge cooldown returns "wedged" every tick for 30s,
@@ -4926,13 +4985,13 @@ public:
     { pet_summon_backoff_until_ms_ = 0; }
 
     // Last pet_guid we observed. Tick() compares against the live
-    // snapshot and emits a PetSetReactStateIntent{1} (defensive) on
+    // snapshot and emits a PetSetReactStateIntent{0} (passive) on
     // any empty→non-empty or guid-change transition — keeps every
-    // newly-summoned pet in defensive instead of the server default
-    // (aggressive for hunter pets, defensive for warlock pets, but
-    // we normalise to defensive across the board because aggressive
-    // mode actively hinders bot progress: pets pull mobs the group
-    // wasn't ready for, break CC, chase respawns out of LoS).
+    // newly-summoned pet passive instead of the server default
+    // (aggressive for hunter pets, defensive for warlock pets): a bot
+    // pet attacks only the target its bot orders it onto, so it never
+    // pulls mobs the group wasn't ready for, breaks CC, or chases
+    // respawns out of LoS).
     ObjectGuid last_known_pet_guid() const { return last_known_pet_guid_; }
     void       set_last_known_pet_guid(ObjectGuid g) { last_known_pet_guid_ = g; }
 private:
@@ -5158,6 +5217,8 @@ private:
     // L2/L3 cached travel plan (see PlanLeg + accessors above).
     std::vector<PlanLeg> travel_plan_{};
     size_t               travel_plan_leg_  = 0;
+    uint32               transport_wait_since_ms_ = 0;
+    uint32               transport_wait_logged_ms_ = 0;
     uint64               travel_plan_goal_ = 0;
     uint32               last_leg_skip_ms_ = 0;   // leg-skip rate-limit (see accessor)
     // Oscillation leash backing (see note_position_leash). Goal-agnostic, so it
@@ -5183,6 +5244,7 @@ private:
     // the time that best stopped improving. See regroup_stuck_ms above.
     uint32 regroup_stuck_since_ms_ = 0;
     float  regroup_stuck_best_     = 0.f;
+    uint32 healer_sight_lost_since_ms_ = 0;   // see healer_sight_lost_ms
     // Own-position frozen clock: the bot's last sampled pose + when it last
     // moved >3y from it. See frozen_ms above (rally-independent strand timer).
     uint32 frozen_since_ms_ = 0;
@@ -5250,24 +5312,11 @@ private:
         uint8  strikes = 0;
     };
     std::array<BadGoal, 6> bad_goals_{};
+    uint32 hub_walk_id_ = 0, hub_walk_since_ms_ = 0, hub_walk_seen_ms_ = 0;
+    float  hub_walk_x_ = 0.f, hub_walk_y_ = 0.f;
     uint32 anchor_seen_ms_ = 0, anchor_move_ms_ = 0;
     float  anchor_x_ = 0.f, anchor_y_ = 0.f;
 public:
-    // Whether the follow anchor (leader or owner) has moved in the last second, seen from successive ticks. A follower that waits for the
-    // full recall slack (13-15 yd for a caster) before it starts runs 2-4 s behind a leader who sets off; while he moves it starts at the
-    // follow distance instead.
-    bool anchor_moving(float x, float y, uint32 now_ms)
-    {
-        if (anchor_seen_ms_ == 0 || now_ms - anchor_seen_ms_ > 3000u)
-        {
-            anchor_x_ = x; anchor_y_ = y; anchor_seen_ms_ = now_ms; anchor_move_ms_ = 0;
-            return false;
-        }
-        const float dx = x - anchor_x_, dy = y - anchor_y_;
-        if (dx * dx + dy * dy > 1.0f) { anchor_move_ms_ = now_ms; anchor_x_ = x; anchor_y_ = y; }
-        anchor_seen_ms_ = now_ms;
-        return anchor_move_ms_ != 0 && now_ms - anchor_move_ms_ < 1000u;
-    }
     void   note_path_blocked(uint32 now_ms)
     {
         ++path_blocked_count_;
@@ -5431,6 +5480,38 @@ public:
         if (slot->strikes < 4) ++slot->strikes;
         slot->until_ms = now_ms + kBackoffMs[slot->strikes - 1];
         if (slot->until_ms == 0) slot->until_ms = 1;
+    }
+    // The hub walk (idle:travel_to_hub) that goes nowhere: the same hub asked for, the bot not 10 yd from where it started, for 40 s.
+    // The move is dropped inside the API (no motion, a failed path) and the rule kept choosing the same hub every tick, so the bot
+    // never reached its wander; the caller marks the hub tried and the goal bad when this says true.
+    bool hub_walk_stalled(uint32 hub_id, float bx, float by, uint32 now_ms)
+    {
+        constexpr uint32 kStallMs = 40000u, kGapMs = 5000u;
+        if (hub_walk_id_ != hub_id || hub_walk_seen_ms_ == 0 || now_ms - hub_walk_seen_ms_ > kGapMs)
+        {
+            hub_walk_id_ = hub_id; hub_walk_since_ms_ = now_ms; hub_walk_x_ = bx; hub_walk_y_ = by;
+        }
+        hub_walk_seen_ms_ = now_ms;
+        const float dx = bx - hub_walk_x_, dy = by - hub_walk_y_;
+        if (dx * dx + dy * dy >= 10.0f * 10.0f) { hub_walk_since_ms_ = now_ms; hub_walk_x_ = bx; hub_walk_y_ = by; return false; }
+        if (now_ms - hub_walk_since_ms_ < kStallMs) return false;
+        hub_walk_id_ = 0; hub_walk_seen_ms_ = 0;
+        return true;
+    }
+    // Whether the follow anchor (leader or owner) has moved in the last second, seen from successive ticks. A follower that waits for the
+    // full recall slack (13-15 yd for a caster) before it starts runs 2-4 s behind a leader who sets off; while he moves it starts at the
+    // follow distance instead.
+    bool anchor_moving(float x, float y, uint32 now_ms)
+    {
+        if (anchor_seen_ms_ == 0 || now_ms - anchor_seen_ms_ > 3000u)
+        {
+            anchor_x_ = x; anchor_y_ = y; anchor_seen_ms_ = now_ms; anchor_move_ms_ = 0;
+            return false;
+        }
+        const float dx = x - anchor_x_, dy = y - anchor_y_;
+        if (dx * dx + dy * dy > 1.0f) { anchor_move_ms_ = now_ms; anchor_x_ = x; anchor_y_ = y; }
+        anchor_seen_ms_ = now_ms;
+        return anchor_move_ms_ != 0 && now_ms - anchor_move_ms_ < 1000u;
     }
     bool quest_recently_shared(uint32 q) const
     {

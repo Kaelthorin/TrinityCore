@@ -112,8 +112,11 @@ uint32 ArmorSpell(ApPredicateContext const& ctx)
 // designated Felhunter warlocks (one per subgroup, at most two per raid, by
 // guid - Spell Lock interrupts) summon the Felhunter, the rest the Imp
 // (Interrupt::ClassicWarlockPet).
+// The owner's demon ("prefer demon voidwalker"; Bot/OwnerPicks.h) wins once its summon is known.
 uint32 PetSpell(ApPredicateContext const& ctx)
 {
+    if (uint32 const pin = ctx.bot.owner_pick(OwnerPicks::Demon); pin && ctx.bot.knows_spell(pin))
+        return pin;
     return Interrupt::ClassicWarlockPet(ctx.bot, &ctx.group);
 }
 
@@ -162,7 +165,9 @@ void DoDrainLife(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(DR
 
 bool ShouldLifeTap(ApPredicateContext const& ctx)
 {
-    return ManaPct(ctx) <= 25 && ctx.bot.hp_pct() >= 60 && Ready(ctx, LIFE_TAP);
+    // Taps before the nukes stop (the wand floor is 35 %): tapping at 25 % left the 25-35 % band to the wand, a warlock that shot instead of
+    // converting health into the mana for more bolts (parity t3: 47 s of 180 not casting, 6 mana refills).
+    return ManaPct(ctx) <= std::max<int32>(25, NukeManaFloor(ctx)) && ctx.bot.hp_pct() >= 60 && Ready(ctx, LIFE_TAP);
 }
 void DoLifeTap(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(LIFE_TAP); }
 
@@ -173,9 +178,34 @@ bool ShouldArmor(ApPredicateContext const& ctx)
 }
 void DoArmor(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(ArmorSpell(ctx)); }
 
+// Demonic Sacrifice (Demonology talent): in a raid the Imp is sacrificed for 18789 (client data: +15% damage done, shadow school 32), which
+// every spell of this rotation benefits from; the pet's own damage is far below that. The sacrificed demon stays gone, so the summon rule
+// must not bring it back while the buff is up. Solo and dungeon bots keep the demon (Voidwalker tank, Felhunter Spell Lock).
+constexpr uint32 DEMONIC_SACRIFICE = 18788;
+constexpr uint32 SACRIFICE_BUFFS[] = { 18789, 18790, 18791, 18792 };
+bool HasSacrificeBuff(ApPredicateContext const& ctx)
+{
+    for (uint32 b : SACRIFICE_BUFFS)
+        if (ctx.bot.has_aura(b)) return true;
+    return false;
+}
+bool ShouldDemonicSacrifice(ApPredicateContext const& ctx)
+{
+    // The Demonology (Destruction/Ruin) build is the sacrifice build wherever it plays: in a raid any build with the talent sacrifices, and a
+    // spec 266 warlock does it solo and in dungeons too (175 demonology: the Imp stayed out, 24 dps, without the +15 % Shadow that is the point of the build).
+    // Out of combat in a raid; a spec 266 warlock also in combat, so a lost buff is made again (180 demonology: the Imp was summoned at the start of a leg
+    // and the fight began before the sacrifice rule's out-of-combat window).
+    // Not with a demon the owner picked ("prefer demon imp"): the owner wants it out.
+    return !ctx.bot.owner_pick(OwnerPicks::Demon)
+        && (ctx.bot.spec() == 266 || (ctx.bot.is_in_raid() && !ctx.bot.in_combat())) && ctx.bot.has_pet() && ctx.bot.raw().pet.pet_family == CREATURE_FAMILY_IMP
+        && !HasSacrificeBuff(ctx) && Ready(ctx, DEMONIC_SACRIFICE) && ctx.bot.current_cast_spell_id() == 0;
+}
+void DoDemonicSacrifice(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(DEMONIC_SACRIFICE); }
+
 bool ShouldSummonPet(ApPredicateContext const& ctx)
 {
-    if (ctx.bot.in_combat() || ctx.bot.current_cast_spell_id() != 0) return false;
+    if (ctx.bot.in_combat() || ctx.bot.current_cast_spell_id() != 0 || ctx.bot.owner_pet_off()) return false;
+    if (ctx.bot.knows_spell(DEMONIC_SACRIFICE) && HasSacrificeBuff(ctx) && !ctx.bot.owner_pick(OwnerPicks::Demon)) return false;
     uint32 const want = PetSpell(ctx);
     if (!want || !Ready(ctx, want)) return false;
     // Out of combat with the wrong demon out (joined a raid with the
@@ -233,7 +263,7 @@ bool ShouldRaidCurse(ApPredicateContext const& ctx)
         return false;
     if (po.curse_target == ctx.bot.victim())
     {
-        if (!HasLiveTarget(ctx) || ctx.bot.has_aura(po.curse_spell, ctx.bot.victim()))
+        if (!HasLiveTarget(ctx) || !ctx.bot.victim_in_spell_range(po.curse_spell) || ctx.bot.has_aura(po.curse_spell, ctx.bot.victim()))
             return false;
         return po.curse_spell == CURSE_OF_AGONY || !VictimCurseFromOther(ctx, po.curse_spell);
     }
@@ -253,8 +283,9 @@ void DoCorruption(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(C
 
 bool ShouldCurseOfAgony(ApPredicateContext const& ctx)
 {
-    // Raid: the plan's curse (ShouldRaidCurse) is this warlock's only curse.
-    return !InRaid(ctx) && DotWorthwhile(ctx) && (Ready(ctx, CURSE_OF_AGONY) && ctx.bot.victim_in_spell_range(CURSE_OF_AGONY)) && !ctx.bot.has_aura(CURSE_OF_AGONY, ctx.bot.victim());
+    // Forever's spell 980 is Bane of Agony ("Only one Bane per Warlock"): a bane, not a curse, so it stands beside the plan's curse in a raid
+    // (the client data has no Curse of Agony a warlock learns; 14868 is a creature spell).
+    return DotWorthwhile(ctx) && (Ready(ctx, CURSE_OF_AGONY) && ctx.bot.victim_in_spell_range(CURSE_OF_AGONY)) && !ctx.bot.has_aura(CURSE_OF_AGONY, ctx.bot.victim());
 }
 void DoCurseOfAgony(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(CURSE_OF_AGONY, ctx.bot.victim()); }
 
@@ -266,8 +297,8 @@ void DoImmolate(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(IMM
 
 bool ShouldSiphonLife(ApPredicateContext const& ctx)
 {
-    // Raid: dots capped at Corruption + Immolate (+ the plan's curse).
-    return !InRaid(ctx) && DotWorthwhile(ctx) && (Ready(ctx, SIPHON_LIFE) && ctx.bot.victim_in_spell_range(SIPHON_LIFE)) && !ctx.bot.has_aura(SIPHON_LIFE, ctx.bot.victim());
+    // Raid: a destruction or demonology warlock keeps its dots to Corruption + Immolate (+ the plan's curse); an affliction warlock spent its points on Siphon Life.
+    return (!InRaid(ctx) || ctx.bot.spec() == 265) && DotWorthwhile(ctx) && (Ready(ctx, SIPHON_LIFE) && ctx.bot.victim_in_spell_range(SIPHON_LIFE)) && !ctx.bot.has_aura(SIPHON_LIFE, ctx.bot.victim());
 }
 void DoSiphonLife(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SIPHON_LIFE, ctx.bot.victim()); }
 
@@ -317,7 +348,7 @@ void DoShadowBolt(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(S
 // / Searing Pain (the fire filler, Shadow Bolt's mana gate).
 bool ShouldSearingPain(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && Ready(ctx, SEARING_PAIN);
+    return HasLiveTarget(ctx) && ManaPct(ctx) >= NukeManaFloor(ctx) && (Ready(ctx, SEARING_PAIN) && ctx.bot.victim_in_spell_range(SEARING_PAIN));
 }
 
 SchoolHint::SchoolChoice const kSchoolChoices[] = {
@@ -335,7 +366,10 @@ void DoSchoolNuke(ApPredicateContext const& ctx, BotIntentEmitter& e) { SchoolHi
 
 bool ShouldWand(ApPredicateContext const& ctx)
 {
-    return HasLiveTarget(ctx) && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0;
+    return HasLiveTarget(ctx) && ctx.bot.raw().consumables.wand_school_mask != 0 && (Ready(ctx, SHOOT_WAND) && ctx.bot.victim_in_spell_range(SHOOT_WAND)) && ctx.bot.current_cast_spell_id() == 0
+        // Only when the nukes have stopped (OOM, Life Tap not possible): during the global cooldown after an instant the Shadow Bolt is not ready, and
+        // with no mana test this rule started the wand there (167 affliction: 99 of 180 s not casting).
+        && ManaPct(ctx) < NukeManaFloor(ctx);
 }
 void DoWand(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(SHOOT_WAND, ctx.bot.victim()); }
 
@@ -361,6 +395,7 @@ ApRule const kWarlockRules[] = {
     { ShouldLifeTap,        DoLifeTap,        "classic_warlock:life_tap" },
     { ShouldArmor,          DoArmor,          "classic_warlock:armor" },
     { ShouldSummonPet,      DoSummonPet,      "classic_warlock:summon_pet" },
+    { ShouldDemonicSacrifice, DoDemonicSacrifice, "classic_warlock:demonic_sacrifice" },
     { ShouldRaidCurse,      DoRaidCurse,      "classic_warlock:raid_curse" },
     { ShouldShadowTrance,   DoShadowBolt,     "classic_warlock:shadow_trance" },
     { ShouldSchoolNuke,     DoSchoolNuke,     "classic_warlock:school_nuke" },

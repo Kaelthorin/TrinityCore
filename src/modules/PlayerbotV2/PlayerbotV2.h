@@ -20,6 +20,7 @@ class Player;
 class Unit;
 class Aura;
 class Group;
+class Channel;
 struct Position;
 
 namespace Playerbot { class SnapshotBuildPool; struct GroupSnapshot; }
@@ -54,13 +55,15 @@ public:
     void NoteDamageSpell(uint32 spell_id);
     void OnHitOutcome(Unit* attacker, Unit* victim, uint32 spell_id, uint8 outcome, uint32 damage);
     void OnEnergize(Unit* target, uint32 spell_id, int32 gained, uint8 power);
+    void OnHealOutcome(Unit* healer, Unit* target, uint32 spell_id, uint32 raw, uint32 effective);
     void OnHealReceived(Unit* healer, Unit* target, int32 amount, uint32 spell_id);
     void OnAuraApplied(Unit* target, Aura* aura);
     void OnAuraRemoved(Unit* target, Aura* aura);
     void OnGroupMemberJoined(Group* g, Player* p);
     void OnGroupMemberLeft(Group* g, Player* p);
     void OnWhisperReceived(Player* sender, Player* receiver, std::string const& msg);
-    void OnPartyChat(Player* sender, Group* group, std::string const& msg);
+    // raid_chat: the line was said in raid chat (a chat-model answer goes back to raid chat; party chat stays in the subgroup).
+    void OnPartyChat(Player* sender, Group* group, std::string const& msg, bool raid_chat = false);
     // A bot order sent by the ForeverBots panel as an addon message (fixed prefix, party/raid): same parser as party chat.
     void OnAddonOrder(Player* sender, Group* group, std::string const& prefix, std::string const& text);
     void OnAddonWhisper(Player* sender, Player* receiver, std::string const& prefix, std::string const& text);
@@ -84,6 +87,8 @@ public:
     // SC-P1a: /say and /yell social reactions. Route to BotChatReactor's
     // range-gated say/yell paths so a single nearby bot can answer.
     void OnSayChat(Player* sender, std::string const& msg);
+    // A real player wrote in General, Trade or LookingForGroup: world bots may answer (Bot/ChannelChat.h).
+    void OnChannelChat(Player* sender, Channel* channel, std::string const& msg);
     void OnYellChat(Player* sender, std::string const& msg);
     // SC-P2c: reciprocate a nearby player's text emote (/wave, /salute, ...).
     void OnTextEmote(Player* sender, uint32 emote_id, uint32 text_emote_id, ObjectGuid target);

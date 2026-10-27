@@ -1,6 +1,7 @@
 #include "BotGearGenerator.h"
 #include "BotItemScorer.h"
 #include "OwnedGearPolicy.h"
+#include "BisPools.h"
 #include "WorldGearStart.h"
 #include "Bot/ClassTables.h"   // MaxPlayerLevel()
 #include "ObjectMgr.h"
@@ -9,6 +10,7 @@
 #include "Player.h"
 #include "PlayerbotAPI.h"  // IsItemRenderableInSlot — the renderability gate
 #include "Log.h"
+#include "World.h"
 #include "Config.h"
 #include "../BotSnapshot.h"          // PlanEquipOrder
 #include "../../Services.h"          // Services::Config(): Playerbot.Behavior.TankRangedWeapon
@@ -22,6 +24,7 @@
 #include <cctype>
 #include <limits>
 #include <mutex>
+#include <cstring>
 #include <string_view>
 #include <string>
 #include <tuple>
@@ -125,6 +128,21 @@ constexpr std::array<uint8, 17> kSlots = {
     EQUIPMENT_SLOT_OFFHAND,
     EQUIPMENT_SLOT_RANGED,      // Classic 1.60: bows, guns, crossbows, thrown and wands have their own slot (Player::FindEquipSlot)
 };
+
+// The slots resistance gear goes in (GearGenerationContext::resist_school): armour and jewellery. Weapons, trinkets and the ranged slot
+// keep their role picks, as a raider dressing for Huhuran kept its weapons.
+constexpr bool ResistGearSlot(uint8 slot)
+{
+    switch (slot)
+    {
+        case EQUIPMENT_SLOT_HEAD: case EQUIPMENT_SLOT_NECK: case EQUIPMENT_SLOT_SHOULDERS: case EQUIPMENT_SLOT_CHEST: case EQUIPMENT_SLOT_WAIST:
+        case EQUIPMENT_SLOT_LEGS: case EQUIPMENT_SLOT_FEET: case EQUIPMENT_SLOT_WRISTS: case EQUIPMENT_SLOT_HANDS: case EQUIPMENT_SLOT_FINGER1:
+        case EQUIPMENT_SLOT_FINGER2: case EQUIPMENT_SLOT_BACK:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // Preferred armor tier comes from BotItemScorer - ONE definition shared with
 // the scorer that ranks these pools. Keeping a second copy here is what let the
@@ -239,6 +257,38 @@ bool IsBotWearableItemId(uint32 entry)
     return !tpl || tpl->ExtendedData->RequiredPVPRank <= 0;
 }
 
+// A whole word "Test" or "Deprecated" in the name, any case: developer items that ship in the item data. The same holds for the placeholders
+// the client data carries for unfinished items: "[PH]" / "PH]" / "[DNT]" markers, "Nax PH ..." and the "90 Epic Warrior Cloak" stand-ins
+// (item level 90, above every raid cap but not real gear; found decoding ItemSparse.db2, 224 names).
+static bool IsTestItemName(std::string const& name)
+{
+    std::string lower;
+    lower.reserve(name.size());
+    for (char c : name) lower.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+    if (lower.find("ph]") != std::string::npos || lower.find("dnt]") != std::string::npos || lower.find(" ph ") != std::string::npos)
+        return true;
+    {
+        size_t digits = 0;
+        while (digits < lower.size() && std::isdigit(static_cast<unsigned char>(lower[digits]))) ++digits;
+        if (digits > 0 && lower.compare(digits, 1, " ") == 0)
+            for (char const* tier : { "epic ", "green ", "rare ", "blue ", "purple " })
+                if (lower.compare(digits + 1, std::strlen(tier), tier) == 0)
+                    return true;
+    }
+    for (char const* word : { "test", "deprecated" })
+    {
+        for (size_t pos = lower.find(word); pos != std::string::npos; pos = lower.find(word, pos + 1))
+        {
+            size_t const end = pos + std::strlen(word);
+            bool const start_ok = pos == 0 || !std::isalpha(static_cast<unsigned char>(lower[pos - 1]));
+            bool const end_ok = end >= lower.size() || !std::isalpha(static_cast<unsigned char>(lower[end]));
+            if (start_ok && end_ok)
+                return true;
+        }
+    }
+    return false;
+}
+
 void Initialize()
 {
     if (g_initialized) return;
@@ -278,6 +328,8 @@ void Initialize()
         // rejects them outright with EQUIP_ERR_CANT_EQUIP_EVER.
         if (tpl.HasFlag(ITEM_FLAG2_INTERNAL_ITEM)) continue;
         if (!IsBotWearableItemId(entry)) continue;
+        // A developer test item ("Fast Test Thrown", item 5559) is not gear: bots wore it as their thrown weapon (PC 20 Oct).
+        if (IsTestItemName(tpl.GetName(DEFAULT_LOCALE))) continue;
         // Skip items with too-high required level for our brackets
         if (tpl.GetBaseRequiredLevel() > MaxPlayerLevel()) continue;
         // Skip items with no required level set BUT high ilvl (raid drops typically)
@@ -678,13 +730,21 @@ uint32 PickThrownWeapon(Player const* wearer)
     if (!g_initialized || !wearer || wearer->GetClass() >= MAX_CLASSES) return 0;
     uint8 const level = wearer->GetLevel();
     ItemTemplate const* best = nullptr;
-    // A thrown weapon whose display is the generic 1.60 one is drawn by the client as a white box with blue dots:
+    // A thrown weapon whose display is the generic 1.60 one is drawn by the client as a white box with blue dots (UBRS, 20 Oct):
     // a weapon with its own display goes first, whatever its level.
     auto key = [&](ItemTemplate const* t)
     {
         return std::tuple<bool, uint32, uint32, int32, uint32>(Player::HasDrawableAmmoDisplay(t), t->GetBaseRequiredLevel(), uint32(t->GetQuality()),
             ::Playerbot::Gear::EffectiveItemLevelForLevel(t, level), ~t->GetId());
     };
+    static std::once_flag thrown_log_once;
+    std::call_once(thrown_log_once, [&]
+    {
+        for (ItemTemplate const* tpl : g_pools[wearer->GetClass()].slots[EQUIPMENT_SLOT_RANGED])
+            if (tpl->GetClass() == ITEM_CLASS_WEAPON && tpl->GetSubClass() == ITEM_SUBCLASS_WEAPON_THROWN)
+                TC_LOG_INFO("playerbot.v2", "[thrown_display] item {} required level {} display {} drawable {}", tpl->GetId(), tpl->GetBaseRequiredLevel(),
+                    Player::GetAmmoDisplayId(tpl), int(Player::HasDrawableAmmoDisplay(tpl)));
+    });
     for (ItemTemplate const* tpl : g_pools[wearer->GetClass()].slots[EQUIPMENT_SLOT_RANGED])
     {
         if (tpl->GetClass() != ITEM_CLASS_WEAPON || tpl->GetSubClass() != ITEM_SUBCLASS_WEAPON_THROWN) continue;
@@ -704,7 +764,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
     std::vector<GearItem> out;
     if (!g_initialized || ctx.cls < 1 || ctx.cls >= MAX_CLASSES) return out;
     // A world bot below level 10 keeps its starting outfit (WorldGearStart.h).
-    if (!::Playerbot::Gear::GeneratesGear(ctx.world_bot(), ctx.level)) return out;
+    if (!::Playerbot::Gear::GeneratesGear(ctx.world_bot(), ctx.level, ctx.replace_unrenderable_starter)) return out;
 
     uint16 const target_ilvl = TargetIlvlForLevel(ctx.level);
     auto const& pool = g_pools[ctx.cls];
@@ -729,6 +789,11 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
     // Tier modes (an owner's "gear t3"): the tier set below, and the other slots up to that tier's item level.
     bool const tier_mode = raid && !ctx.world_bot() && Owned::IsTierMode(ctx.gear_mode);
     bool const bis_mode = raid && !ctx.world_bot() && ctx.gear_mode == Owned::GearMode::Bis;
+    // Resistance gear for a fight (ctx.resist_school): a piece with the school's resistance outranks any stat fit in the armour and
+    // jewellery slots, more resistance first; the slots it fills are kept from the tier set below.
+    bool const resist_mode = raid && !ctx.world_bot() && ctx.resist_school != 0;
+    constexpr int32 kResistPick = 10000000;
+    std::array<bool, EQUIPMENT_SLOT_END> resist_held{};
     int32 const raid_cap = ctx.world_bot() ? WorldIlvlCap()
                          : tier_mode      ? CapForTier(float(Owned::TierNumber(ctx.gear_mode)))
                          : bis_mode       ? CapForTier(3.0f)
@@ -787,7 +852,10 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
         // below the pre-raid rares, so a roster does not wear one set.
         bool const world_mix = raid && ctx.world_bot() && ctx.bot_id;
         bool const pvp_slot = world_mix && WorldPvpSetBot(ctx.bot_id) && PvpSetSlot(slot);
-        for (int pass = raid ? 0 : 1; pass < 2 && (!best || world_mix); ++pass)
+        bool const resist_slot = resist_mode && ResistGearSlot(slot);
+        // A resistance slot runs the plain pass too when the raid-prep pass found no piece with the school's resistance: a green of it
+        // beats a blue without, as the raiders of the day wore them.
+        for (int pass = raid ? 0 : 1; pass < 2 && (!best || world_mix || (resist_slot && best_score < kResistPick)); ++pass)
         for (auto const* tpl : candidates)
         {
             if (tpl->GetBaseRequiredLevel() > ctx.level) continue;
@@ -855,6 +923,9 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
                 // nothing better can.
                 bool const prep = tpl->GetQuality() >= ITEM_QUALITY_RARE && tpl->GetBaseRequiredLevel() >= int32(kRaidMinRequiredLevel);
                 combined = fit + (prep ? 1000000 : 0) + (pvp_piece ? 100000 : 0);
+                if (resist_slot)
+                    if (int32 const points = ::Playerbot::Gear::ResistPoints(tpl, ctx.resist_school, ctx.level); points > 0)
+                        combined += kResistPick + points * 20000;   // the stat fit only decides between pieces of equal resistance
             }
             else if (owned_lv)
             {
@@ -878,6 +949,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
 
         // Raid-ready variety: any of the best few (same tier, within a few percent of the best score) by the bot's guid and
         // the slot. Stable for a given bot, so regear never churns.
+        bool const resist_pick = resist_slot && best && best_score >= kResistPick;
         if (world_mix && best && scored.size() > 1)
         {
             uint64 h = ctx.bot_id * 0x9E3779B97F4A7C15ull ^ (uint64(slot) + 11) * 0xA24BAED4963EE407ull;
@@ -907,6 +979,8 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             else if (options.size() == 1)
                 best = options[0];
         }
+        else if (resist_pick)
+            resist_held[slot] = true;   // the most resistance, no variety roll among the pieces
         else if ((raid || owned_lv) && best && ctx.bot_id && !bis_mode)
         {
             bool const best_prep = best_score >= 500000;
@@ -956,8 +1030,46 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
         // empty slot, but only when the item may actually be worn twice - for a
         // unique-equipped piece the second equip would be refused and we would
         // have produced a pick that can never land.
-        if (!best && twin && !twin->HasFlag(ITEM_FLAG_UNIQUE_EQUIPPABLE))
+        if (!best && twin && !twin->HasFlag(ITEM_FLAG_UNIQUE_EQUIPPABLE) && twin->GetMaxCount() != 1)
             best = twin;
+
+        // A tier leg whose main hand stays empty fights with fists (damage_parity 147 shaman, t1: no weapon, 107 dps): say which filter emptied the pool.
+        if (!best && tier_mode && slot == EQUIPMENT_SLOT_MAINHAND)
+        {
+            uint32 n_level = 0, n_skill = 0, n_wear = 0, n_ilvl = 0, n_fit = 0;
+            for (auto const* tpl : candidates)
+            {
+                if (tpl->GetBaseRequiredLevel() > ctx.level) { ++n_level; continue; }
+                if (ctx.wearer && ctx.wearer->CanUseItem(tpl) != EQUIP_ERR_OK) { ++n_wear; continue; }
+                if (ctx.wearer && tpl->GetSkill() && !ctx.wearer->GetSkillValue(tpl->GetSkill())) { ++n_skill; continue; }
+                if (::Playerbot::Gear::IsPvpItem(tpl) || ::Playerbot::Gear::EffectiveItemLevelForLevel(tpl, ctx.level) > raid_cap) { ++n_ilvl; continue; }
+                if (::Playerbot::Gear::ScoreItemRaid(tpl, ctx.cls, ctx.spec, ctx.level, slot) <= -100000) ++n_fit;
+            }
+            TC_LOG_INFO("playerbot.v2", "[gear_gen] class {} spec {} level {}: no main hand under item level {}: {} candidates, {} above the level, {} refused by CanUseItem, {} without the skill, {} over the cap or PvP, {} refused by the stat weights",
+                        uint32(ctx.cls), uint32(ctx.spec), uint32(ctx.level), raid_cap, candidates.size(), n_level, n_wear, n_skill, n_ilvl, n_fit);
+        }
+
+        // A tier leg's off hand that is not a raid-prep weapon (fury t1 wore Left-Handed Blades, item level 35, while one-handers of item level 76 exist):
+        // count the prep weapons of the pool by the filter that removed each, so the next run names the cause.
+        if (tier_mode && slot == EQUIPMENT_SLOT_OFFHAND && ctx.cls == CLASS_WARRIOR && (!best || best->GetQuality() < ITEM_QUALITY_RARE ||
+            best->GetBaseRequiredLevel() < int32(kRaidMinRequiredLevel)))
+        {
+            uint32 n_prep = 0, n_level = 0, n_wear = 0, n_skill = 0, n_cap = 0, n_fit = 0, n_dual = 0, n_ok = 0;
+            for (auto const* tpl : candidates)
+            {
+                if (tpl->GetClass() != ITEM_CLASS_WEAPON || tpl->GetQuality() < ITEM_QUALITY_RARE || tpl->GetBaseRequiredLevel() < int32(kRaidMinRequiredLevel)) continue;
+                ++n_prep;
+                if (tpl->GetBaseRequiredLevel() > ctx.level) { ++n_level; continue; }
+                if (ctx.wearer && ctx.wearer->CanUseItem(tpl) != EQUIP_ERR_OK) { ++n_wear; continue; }
+                if (ctx.wearer && tpl->GetSkill() && !ctx.wearer->GetSkillValue(tpl->GetSkill())) { ++n_skill; continue; }
+                if (::Playerbot::Gear::IsPvpItem(tpl) || ::Playerbot::Gear::EffectiveItemLevelForLevel(tpl, ctx.level) > raid_cap) { ++n_cap; continue; }
+                if (!can_dual_wield) { ++n_dual; continue; }
+                if (::Playerbot::Gear::ScoreItemRaid(tpl, ctx.cls, ctx.spec, ctx.level, slot) <= -100000) { ++n_fit; continue; }
+                ++n_ok;
+            }
+            TC_LOG_INFO("playerbot.v2", "[gear_gen] class {} spec {} level {}: off hand pick {} is not a prep weapon; pool has {} prep weapons ({} above the level, {} refused by CanUseItem, {} without the skill, {} over the cap or PvP, {} with no dual wield, {} refused by the stat weights, {} usable)",
+                        uint32(ctx.cls), uint32(ctx.spec), uint32(ctx.level), best ? best->GetId() : 0u, n_prep, n_level, n_wear, n_skill, n_cap, n_dual, n_fit, n_ok);
+        }
 
         if (best)
         {
@@ -973,7 +1085,40 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
     {
         // The class tier set goes on over the raid picks: the slots it covers are its own, the rest keep the picks made under the tier's
         // item level ceiling above.
-        for (uint32 const entry : TierSetPieces(ctx.cls, Owned::TierNumber(ctx.gear_mode)))
+        // A class and spec with a sourced list (warrior dps, Tier 3) wears that list, slot by slot, instead of the tier set.
+        auto const& sourced = SourcedTierGear(ctx.cls, ctx.spec, ctx.gear_mode);
+        uint32 sourced_slots = 0;
+        for (SourcedGearPick const& pick : sourced)
+        {
+            ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(pick.entry);
+            if (!tpl || resist_held[pick.slot] || (ctx.wearer && ctx.wearer->CanUseItem(tpl) != EQUIP_ERR_OK))
+            {
+                TC_LOG_INFO("playerbot.v2", "[gear] bot {} sourced pick {} for slot {} skipped: {}", ctx.bot_id, pick.entry, uint32(pick.slot),
+                            !tpl ? "no such item in the item data" : resist_held[pick.slot] ? "slot held by resistance gear"
+                                 : fmt::format("CanUseItem error {}", uint32(ctx.wearer->CanUseItem(tpl))));
+                continue;
+            }
+            if (ctx.race)
+            {
+                if (!tpl->GetAllowableRace().HasRace(ctx.race)) continue;
+                uint32 const team = ::Player::TeamForRace(ctx.race);
+                if (tpl->HasFlag(ITEM_FLAG2_FACTION_HORDE) && team != HORDE) continue;
+                if (tpl->HasFlag(ITEM_FLAG2_FACTION_ALLIANCE) && team != ALLIANCE) continue;
+            }
+            sourced_slots |= 1u << pick.slot;
+            auto it = std::ranges::find(out, pick.slot, &GearItem::slot);
+            if (it != out.end())
+                it->item_entry = pick.entry;
+            else
+                out.push_back({ pick.slot, pick.entry });
+        }
+        // A two-hander in the main hand leaves no off hand.
+        if (!sourced.empty())
+            if (auto mh = std::ranges::find(out, uint8(EQUIPMENT_SLOT_MAINHAND), &GearItem::slot); mh != out.end())
+                if (ItemTemplate const* mtpl = sObjectMgr->GetItemTemplate(mh->item_entry); mtpl && mtpl->GetInventoryType() == INVTYPE_2HWEAPON)
+                    std::erase_if(out, [](GearItem const& g) { return g.slot == EQUIPMENT_SLOT_OFFHAND; });
+        // The tier set fills the slots the sourced list did not set (a sourced entry the item data lacks leaves its slot to the set).
+        for (uint32 const entry : !TierSetIsHealerSet(ctx.cls, ctx.spec) ? TierSetPieces(ctx.cls, Owned::TierNumber(ctx.gear_mode)) : std::vector<uint32>{})
         {
             ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(entry);
             if (!tpl)
@@ -984,7 +1129,7 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             for (uint8 s : { uint8(EQUIPMENT_SLOT_HEAD), uint8(EQUIPMENT_SLOT_SHOULDERS), uint8(EQUIPMENT_SLOT_CHEST), uint8(EQUIPMENT_SLOT_WAIST),
                              uint8(EQUIPMENT_SLOT_LEGS), uint8(EQUIPMENT_SLOT_FEET), uint8(EQUIPMENT_SLOT_WRISTS), uint8(EQUIPMENT_SLOT_HANDS) })
                 if (InventoryTypeFitsSlot(s, tpl->GetInventoryType())) { slot = s; break; }
-            if (slot == 255)
+            if (slot == 255 || resist_held[slot] || (sourced_slots & (1u << slot)))
                 continue;
             if (ctx.wearer && ctx.wearer->CanUseItem(tpl) != EQUIP_ERR_OK)
                 continue;
@@ -1001,6 +1146,151 @@ std::vector<GearItem> GenerateGearFor(GearGenerationContext const& ctx)
             else
                 out.push_back({ slot, entry });
         }
+    }
+    // Best-in-slot candidates of the tier for the slots no tier set covers (BisPools.h): neck, back, rings, trinkets. A candidate goes on only when
+    // the role-weighted raid score beats what the pick above holds there, under the tier's item level ceiling; unknown names are skipped.
+    if (tier_mode)
+    {
+        int const tier = int(Owned::TierNumber(ctx.gear_mode));
+        auto const role = ::Playerbot::Gear::Loadout::Role(uint8(::Playerbot::Gear::RaidRoleForBot(ctx.cls, ctx.spec)));
+        auto const resolve = [](std::string_view name) -> uint32
+        {
+            static std::mutex lock;
+            static std::unordered_map<std::string, uint32> cache;
+            std::lock_guard g(lock);
+            std::string const key(name);
+            if (auto it = cache.find(key); it != cache.end())
+                return it->second;
+            uint32 found = 0;
+            LocaleConstant const loc = sWorld->GetDefaultDbcLocale();
+            for (auto const& [id, tpl] : sObjectMgr->GetItemTemplateStore())
+            {
+                char const* n = tpl.GetName(loc);
+                if (n && name == n && (!found || tpl.GetBaseItemLevel() > sObjectMgr->GetItemTemplate(found)->GetBaseItemLevel()))
+                    found = id;
+            }
+            if (!found)
+                TC_LOG_INFO("playerbot.v2", "[bis] unresolved: no item named \"{}\" in the item data", name);
+            cache.emplace(key, found);
+            return found;
+        };
+        auto const score_of = [&](uint8 slot) -> int32
+        {
+            auto it = std::ranges::find(out, slot, &GearItem::slot);
+            ItemTemplate const* t = it != out.end() ? sObjectMgr->GetItemTemplate(it->item_entry) : nullptr;
+            return t ? ::Playerbot::Gear::ScoreItemRaid(t, ctx.cls, ctx.spec, ctx.level, slot) : 0;
+        };
+        struct KindSlots { ::Playerbot::Gear::Bis::Kind kind; std::array<uint8, 2> slots; };
+        for (KindSlots const& ks : { KindSlots{ ::Playerbot::Gear::Bis::Kind::Neck, { EQUIPMENT_SLOT_NECK, 255 } }, KindSlots{ ::Playerbot::Gear::Bis::Kind::Back, { EQUIPMENT_SLOT_BACK, 255 } },
+                                     KindSlots{ ::Playerbot::Gear::Bis::Kind::Ring, { EQUIPMENT_SLOT_FINGER1, EQUIPMENT_SLOT_FINGER2 } },
+                                     KindSlots{ ::Playerbot::Gear::Bis::Kind::Trinket, { EQUIPMENT_SLOT_TRINKET1, EQUIPMENT_SLOT_TRINKET2 } },
+                                     KindSlots{ ::Playerbot::Gear::Bis::Kind::Offhand, { EQUIPMENT_SLOT_OFFHAND, 255 } },
+                                     KindSlots{ ::Playerbot::Gear::Bis::Kind::Ranged, { EQUIPMENT_SLOT_RANGED, 255 } } })
+        {
+            // No off hand next to a two-hand weapon.
+            if (ks.kind == ::Playerbot::Gear::Bis::Kind::Offhand)
+            {
+                auto mh = std::ranges::find(out, uint8(EQUIPMENT_SLOT_MAINHAND), &GearItem::slot);
+                ItemTemplate const* mt = mh != out.end() ? sObjectMgr->GetItemTemplate(mh->item_entry) : nullptr;
+                if (mt && mt->GetInventoryType() == INVTYPE_2HWEAPON)
+                    continue;
+            }
+            std::vector<uint32> taken;
+            for (uint8 const slot : ks.slots)
+            {
+                if (slot == 255 || resist_held[slot])
+                    continue;
+                ItemTemplate const* best = nullptr;
+                // A ring or trinket is unique: what the paired slot holds is not a candidate here (damage_parity 164: the same Band of Unnatural
+                // Forces and Slayer's Crest were picked for both slots, and the second copy was refused with error 17).
+                std::vector<uint32> in_pair = taken;
+                for (uint8 const other : ks.slots)
+                    if (other != 255 && other != slot)
+                        if (auto held = std::ranges::find(out, other, &GearItem::slot); held != out.end())
+                            in_pair.push_back(held->item_entry);
+                auto cur_pick = std::ranges::find(out, slot, &GearItem::slot);
+                bool const cur_dup = cur_pick != out.end() && std::ranges::find(in_pair, cur_pick->item_entry) != in_pair.end();
+                int32 best_score = cur_dup ? std::numeric_limits<int32>::min() : score_of(slot);
+                // The weapon slots log what the slot holds and why each pool candidate was refused or what it scored (174 kept item 4696 in the off
+                // hand with three pool pieces on offer, and nothing said why).
+                bool const log_slot = ks.kind == ::Playerbot::Gear::Bis::Kind::Offhand || ks.kind == ::Playerbot::Gear::Bis::Kind::Ranged;
+                int32 const held_score = best_score;
+                uint32 const held_item = cur_pick != out.end() ? cur_pick->item_entry : 0;
+                auto const note = [&](std::string_view name, uint32 entry, std::string const& what)
+                {
+                    if (log_slot)
+                        TC_LOG_INFO("playerbot.v2", "[bis] slot {} holds item {} (score {}): candidate \"{}\" ({}) {}", uint32(slot), held_item, held_score, name, entry, what);
+                };
+                for (::Playerbot::Gear::Bis::PoolEntry const& e : ::Playerbot::Gear::Bis::PoolFor(role))
+                {
+                    if (e.kind != ks.kind || !::Playerbot::Gear::Bis::InTier(e, tier))
+                        continue;
+                    uint32 const entry = resolve(e.name);
+                    ItemTemplate const* tpl = entry ? sObjectMgr->GetItemTemplate(entry) : nullptr;
+                    if (!tpl || std::ranges::find(in_pair, entry) != in_pair.end() || !InventoryTypeFitsSlot(slot, tpl->GetInventoryType()))
+                    {
+                        note(e.name, entry, !tpl ? "refused: no item template" : "refused: taken or does not fit the slot");
+                        continue;
+                    }
+                    if (::Playerbot::Gear::EffectiveItemLevelForLevel(tpl, ctx.level) > raid_cap || ::Playerbot::Gear::IsPvpItem(tpl))
+                    {
+                        note(e.name, entry, "refused: over the item level cap or a PvP item");
+                        continue;
+                    }
+                    if (ctx.wearer && ctx.wearer->CanUseItem(tpl) != EQUIP_ERR_OK)
+                    {
+                        note(e.name, entry, "refused: the wearer cannot use it");
+                        continue;
+                    }
+                    if (ctx.race)
+                    {
+                        if (!tpl->GetAllowableRace().HasRace(ctx.race)) continue;
+                        uint32 const team = ::Player::TeamForRace(ctx.race);
+                        if (tpl->HasFlag(ITEM_FLAG2_FACTION_HORDE) && team != HORDE) continue;
+                        if (tpl->HasFlag(ITEM_FLAG2_FACTION_ALLIANCE) && team != ALLIANCE) continue;
+                    }
+                    int32 const sc = ::Playerbot::Gear::ScoreItemRaid(tpl, ctx.cls, ctx.spec, ctx.level, slot);
+                    note(e.name, entry, fmt::format("scores {}", sc));
+                    if (sc > best_score)
+                    {
+                        best = tpl;
+                        best_score = sc;
+                    }
+                }
+                if (!best)
+                {
+                    if (cur_dup)
+                        out.erase(cur_pick);   // a second copy of a unique piece cannot be worn: the slot goes without a pick
+                    continue;
+                }
+                taken.push_back(best->GetId());
+                if (auto it = std::ranges::find(out, slot, &GearItem::slot); it != out.end())
+                    it->item_entry = best->GetId();
+                else
+                    out.push_back({ slot, best->GetId() });
+            }
+        }
+    }
+    // A piece the raid wears for the fight whatever it scores (ctx.wear_entry: the Onyxia Scale Cloak against Shadow Flame): over the pick,
+    // the tier piece or the resistance piece in its slot.
+    if (raid && !ctx.world_bot() && ctx.wear_entry)
+    {
+        ItemTemplate const* tpl = sObjectMgr->GetItemTemplate(ctx.wear_entry);
+        uint8 slot = 255;
+        if (tpl)
+            for (uint8 s : kSlots)
+                if (InventoryTypeFitsSlot(s, tpl->GetInventoryType())) { slot = s; break; }
+        if (tpl && slot != 255 && (!ctx.wearer || ctx.wearer->CanUseItem(tpl) == EQUIP_ERR_OK))
+        {
+            auto it = std::ranges::find(out, slot, &GearItem::slot);
+            if (it != out.end())
+                it->item_entry = ctx.wear_entry;
+            else
+                out.push_back({ slot, ctx.wear_entry });
+        }
+        else
+            TC_LOG_INFO("playerbot.v2", "[gear] bot {} cannot wear the fight's piece {}: {}", ctx.bot_id, ctx.wear_entry,
+                        !tpl ? "no such item" : slot == 255 ? "no equipment slot takes it" : "CanUseItem refuses it");
     }
     return out;
 }
@@ -1051,10 +1341,57 @@ std::vector<uint32> const& TierSetPieces(uint8 cls, int32 tier)
     return cls >= 1 && cls < 12 && tier >= 1 && tier <= 3 ? cache[cls][tier] : empty;
 }
 
-bool IsTierSetPick(uint8 cls, Owned::GearMode mode, uint32 entry)
+// Phase 6 (Naxxramas) best in slot for a dps warrior, Icy Veins "Warrior DPS Season of Mastery Phase 6 Gear":
+// https://www.icy-veins.com/wow-classic/warrior-dps-season-of-mastery-phase-6-gear (one list for fury and arms). The page names Lionheart Helm,
+// Stormrage's Talisman of Seething, Conqueror's Spaulders, Shroud of Dominion, Plated Abomination Ribcage, Wristguards of Vengeance,
+// Gauntlets of Annihilation, Girdle of the Mentor, Legplates of Carnage, Chromatic Boots, Band of Unnatural Forces, Don Julio's Band,
+// Drake Fang Talisman, Slayer's Crest (Diamond Flask and Kiss of the Spider are the other trinkets it lists), Soulstring; weapons: The Hungering
+// Cold and Gressil, Dawn of Ruin for dual wield (fury), Might of Menethil for two-hand (arms).
+// The client item data (ItemSparse.db2, decoded) holds only the entries below. Plated Abomination Ribcage (23000), Wristguards of Vengeance
+// (22936), Girdle of the Mentor (23219), Legplates of Carnage (23068), Chromatic Boots (19387), Shroud of Dominion (23045), Soulstring (22811),
+// The Hungering Cold (23577), Gressil, Dawn of Ruin (23054) and Might of Menethil (22798) do not exist in it. Those slots are left out here:
+// the Dreadnaught set (items 22416 to 22423, all present) fills chest, wrists, waist, legs and feet, and back, ranged and weapons keep
+// the role-scored pick (BisPools, ScoreItemRaid) under the item level ceiling.
+std::vector<SourcedGearPick> const& SourcedTierGear(uint8 cls, uint16 spec, Owned::GearMode mode)
+{
+    static std::vector<SourcedGearPick> const none;
+    static std::vector<SourcedGearPick> const common = {
+        { EQUIPMENT_SLOT_HEAD, 12640 }, { EQUIPMENT_SLOT_NECK, 23053 }, { EQUIPMENT_SLOT_SHOULDERS, 21330 }, { EQUIPMENT_SLOT_HANDS, 21581 },
+        { EQUIPMENT_SLOT_FINGER1, 23038 }, { EQUIPMENT_SLOT_FINGER2, 19325 }, { EQUIPMENT_SLOT_TRINKET1, 19406 }, { EQUIPMENT_SLOT_TRINKET2, 23041 } };
+    // Fury dual wields. The weapons of the list are not in the client data; the one-handers that are and carry the most attack power are Ancient
+    // Qiraji Ripper 21650 (sword, 2.8 s, 91 attack power, 64 crit rating) and Death's Sting 21126 (dagger, 1.8 s, 158 attack power). The off hand
+    // they replace was Left-Handed Blades 15909, item level 35 (itemsparse-decoded.tsv).
+    static std::vector<SourcedGearPick> const fury = [] { auto v = common; v.push_back({ EQUIPMENT_SLOT_MAINHAND, 21650 }); v.push_back({ EQUIPMENT_SLOT_OFFHAND, 21126 }); return v; }();
+    if (cls != CLASS_WARRIOR || mode != Owned::GearMode::T3 || spec == 73)
+        return none;
+    return spec == 71 ? common : fury;
+}
+
+// The hybrids' tier sets (Cenarion / Stormrage / Dreamwalker, Lawbringer / Judgement / Redemption, Prophecy / Transcendence / Faith, Earthfury /
+// Ten Storms / Earthshatterer) are built for the healer. A damage spec of those classes (balance and cat druid, retribution paladin, shadow priest,
+// elemental and enhancement shaman) wears the picks of its own role under the tier's item level ceiling instead: damage_parity 147 gave a balance
+// druid 168 spell power at Tier 3 against 268 at Tier 1.
+bool TierSetIsHealerSet(uint8 cls, uint16 spec)
+{
+    switch (cls)
+    {
+        case CLASS_DRUID:   return spec == 102 || spec == 103;
+        case CLASS_PALADIN: return spec == 70;
+        case CLASS_PRIEST:  return spec == 258;
+        case CLASS_SHAMAN:  return spec == 262 || spec == 263;
+        default:            return false;
+    }
+}
+
+bool IsTierSetPick(uint8 cls, Owned::GearMode mode, uint32 entry, uint16 spec)
 {
     if (!Owned::IsTierMode(mode))
         return false;
+    if (TierSetIsHealerSet(cls, spec))
+        return false;
+    for (SourcedGearPick const& pick : SourcedTierGear(cls, spec, mode))
+        if (pick.entry == entry)
+            return true;
     auto const& pieces = TierSetPieces(cls, Owned::TierNumber(mode));
     return std::ranges::find(pieces, entry) != pieces.end();
 }

@@ -1,6 +1,7 @@
 // BotTextMgr / BotChatter - see header.
 
 #include "BotTextMgr.h"
+#include "ChannelTalk.h"
 
 #include "BotAI.h"
 #include "BotIntent.h"
@@ -60,9 +61,10 @@ void BotTextMgr::Load()
     speech_.callouts_enabled            = sConfigMgr->GetBoolDefault("Playerbot.Chatter.Callouts.Enabled", true, true);
     speech_.callout_key_cooldown_ms     = ms("Playerbot.Chatter.Callouts.KeyCooldownMs", 60000);
     speech_.callout_group_cooldown_ms   = ms("Playerbot.Chatter.Callouts.GroupCooldownMs", 8000);
+    speech_.callout_taunts              = sConfigMgr->GetBoolDefault("Playerbot.Chatter.Callouts.Taunts", false, true);
     speech_.suggest_enabled             = sConfigMgr->GetBoolDefault("Playerbot.Chatter.Suggest.Enabled", true, true);
-    speech_.suggest_bot_cooldown_ms     = std::max<uint32>(60000, ms("Playerbot.Chatter.Suggest.BotCooldownMs", 1800000));
-    speech_.suggest_channel_cooldown_ms = ms("Playerbot.Chatter.Suggest.ChannelCooldownMs", 180000);
+    speech_.suggest_bot_cooldown_ms     = std::max<uint32>(60000, ms("Playerbot.Chatter.Suggest.BotCooldownMs", 900000));
+    speech_.suggest_channel_cooldown_ms = ms("Playerbot.Chatter.Suggest.ChannelCooldownMs", 90000);
     speech_.suggest_global_cooldown_ms  = ms("Playerbot.Chatter.Suggest.GlobalCooldownMs", 10000);
     speech_.global_max_per_minute       = ms("Playerbot.Chatter.GlobalMaxPerMinute", 60);
 
@@ -164,6 +166,9 @@ BotTextMgr::Line BotTextMgr::Pick(std::string_view key, TextPlaceholders const& 
     out.text = row->text;
     out.yell = row->say_type == 1;
     Fill(out.text, ph);
+    // A placeholder the caller did not fill ("<subzone>" from a line meant for another kind of speech) is never said.
+    if (V2::ChannelTalk::HasUnfilledPlaceholder(out.text))
+        out.text.clear();
     return out;
 }
 
@@ -772,7 +777,7 @@ void Callouts(BotAI& ai, BotSnapshotView const& s, BotIntentEmitter& em, uint32 
         else if (hp_worse && hp_band == 1)                { kind = CK_LowHealth;      key = "low health"; }
         else if (mana_worse)                              { kind = CK_LowMana;        key = "low mana"; }
         else if (ammo_worse && ammo_band == 1)            { kind = CK_LowAmmo;        key = "low ammo"; }
-        else if (taunt_target && !st.taunt_said)          { kind = CK_Taunt;          key = "taunt"; st.taunt_said = true; }
+        else if (taunt_target && !st.taunt_said && cfg.callout_taunts) { kind = CK_Taunt; key = "taunt"; st.taunt_said = true; }
         else if (big_pull && !st.aoe_said)                { kind = CK_Aoe;            key = "aoe"; st.aoe_said = true; }
 
         st.primed    = true;

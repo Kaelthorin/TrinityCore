@@ -45,6 +45,13 @@ namespace Playerbot::Raid {
         // so a non-tank carrier must leave the raid. A tank carrier stays on the boss (carrierRun default NonTank) and the off tank taunts.
         r.tankSwap.push_back({ 13020, 23620, 1 });                                // tank carrier dies in 20s (5%/s): off tank taunts (boss_vaelastrasz.cpp:47,372-381)
         r.carrierRun.push_back({ 23620, 20.0f, Who::NonTank });                   // Burning Adrenaline (boss_vaelastrasz.cpp:44)
+        // Vaelastrasz's Flame Breath (fire) and Firemaw's Flame Buffet (fire, 23341) are fire school (vMaNGOS spell data): Greater Fire Protection.
+        r.resistPotion.push_back({ 13020, 13457, Who::Anyone });
+        r.resistPotion.push_back({ 11983, 13457, Who::Anyone });
+        // Shadow Flame 22539 (Ebonroc, Flamegor, Nefarian: 3937 + 1125 a hit) is shadow school: Greater Shadow Protection.
+        r.resistPotion.push_back({ 14601, 13459, Who::Anyone });
+        r.resistPotion.push_back({ 11981, 13459, Who::Anyone });
+        r.resistPotion.push_back({ 11583, 13459, Who::Anyone });
         r.avoidCarrier.push_back({ 23620, 15.0f, Who::NonTank });                 // everybody but tanks keeps off the carrier (explosion 23478 :45)
         // Cleave 19983 chains to everybody close to the main tank (boss_vaelastrasz.cpp:49-51: nobody within ~10 yd of the tank).
         r.spread.push_back({ 13020, 10.0f, Who::Ranged });                        // Cleave chain (boss_vaelastrasz.cpp:51)
@@ -62,8 +69,11 @@ namespace Playerbot::Raid {
         // Blast Wave keep-away for ranged/healers: see RegisterBlackwingMovement (avoidEnemy, boss_broodlord_lashlayer.cpp:172).
         // No tank swap: Mortal Strike is cast only every 20-30s (:178-182) and the script gives no aura/stack condition, so a swap would
         // only thrash against Knock Away's -50% threat (:105-106); the tanks keep the boss. Knock Away can still drop the tank
-        // below a DPS on his list: a tank taunts him back at once.
+        // below a DPS on his list: a tank taunts him back at once. The taunt alone does not hold him: it levels the tank with the top of
+        // the list and the next Knock Away halves him again (bwl_broodlord 2026-10-20: 25 retaunts in 80 s, a non-tank as his target in
+        // every fight line). Non-tank damage holds at half the tank's threat, so the halving leaves the tank level, never under.
         r.retaunt.push_back(12017);
+        r.threatDrop.push_back({ 12017, 50.0f });
 
         // ---------------------------------------------------------------------------------------------------------------
         // FIREMAW (11983) / EBONROC (14601) / FLAMEGOR (11981)

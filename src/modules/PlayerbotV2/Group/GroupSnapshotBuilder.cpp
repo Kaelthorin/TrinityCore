@@ -5,7 +5,9 @@
 #include "../Bot/ClassTables.h"  // canonical IsTankSpec / IsHealerSpec
 #include "../Services.h"                    // Lifecycle() accessor
 #include "../Fleet/BotIdentityRegistry.h"   // is_bot definition (Services.h fwd-declares)
+#include "../Threading/SnapshotPublisher.h"  // a bot paladin's owner picks
 #include "Player.h"
+#include "Pet.h"
 #include "Group.h"
 #include "GameTime.h"
 #include "Unit.h"
@@ -304,6 +306,24 @@ std::shared_ptr<GroupSnapshot const> GroupSnapshotBuilder::Build(Player* p, Snap
             m.is_alive     = mp->IsAlive();
             m.rez_pending  = mp->IsResurrectRequested();
             m.is_ghost     = mp->HasPlayerFlag(PLAYER_FLAGS_GHOST);
+            // A bot paladin's owner picks, from its last snapshot (one tick old at most), so the other paladins plan around them.
+            if (m.is_bot && m.cls == CLASS_PALADIN)
+                if (auto const bs = Services::Snapshots().latest(slot.guid.GetCounter()))
+                {
+                    m.owner_blessing = bs->owner_picks[OwnerPicks::Blessing];
+                    m.owner_aura     = bs->owner_picks[OwnerPicks::Aura];
+                }
+            // The member's pet, for the healers (ClassicHeal::PickPatient pet case).
+            if (Pet* pet = mp->GetPet(); pet && pet->IsInWorld())
+            {
+                m.pet_guid   = pet->GetGUID();
+                m.pet_alive  = pet->IsAlive();
+                m.pet_hp     = static_cast<int32>(pet->GetHealth());
+                m.pet_max_hp = static_cast<int32>(pet->GetMaxHealth());
+                m.pet_x      = pet->GetPositionX();
+                m.pet_y      = pet->GetPositionY();
+                m.pet_z      = pet->GetPositionZ();
+            }
             if (Unit* v = mp->GetVictim())
                 m.victim   = v->GetGUID();
             // Fallback to the SELECTED target when there's no melee victim yet.

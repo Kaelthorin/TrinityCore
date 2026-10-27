@@ -5,7 +5,7 @@
 //   - idle:pvp_help_callout   : bot in low-HP open-world PvP attack -> /say
 //                                "help! pvp <zone>" with a 5-min lockout.
 //   - idle:yell_lfg           : solo level-60+ bot in a rested area (city/inn)
-//                                /yells a role-flavored LFG line every ~45 min.
+//                                /yells a role-flavored LFG line every ~22 min.
 //   - idle:ambient_emote      : Roleplay-personality bot in a rested area emits
 //                                a flavor /wave / /cheer / /salute targeted at
 //                                a random groupmate (or untargeted solo).
@@ -28,6 +28,19 @@
 #include "Travel/QuestHubDatabase.h"
 #include "Travel/TownNpcIndex.h"
 #include "Bot/TownLife.h"
+#include "Bot/TownErrand.h"
+#include "Bot/TownErrandConfig.h"
+#include "Bot/ClassicUpkeep.h"
+#include "SharedDefines.h"
+#include "Fleet/GateDuels.h"
+#include "Fleet/Gathering.h"
+#include "Fleet/StrangerBoard.h"
+#include "Random.h"
+#include "Bot/ClassicUpkeep.h"
+#include "Bot/ShareMobs.h"
+#include "Bot/ChannelTalk.h"
+#include "Bot/ChannelChat.h"
+#include "Bot/PartyLink.h"
 #include "Bot/BotRegistry.h"
 #include "Fleet/OwnerRegistry.h"
 #include "Util.h"
@@ -205,9 +218,9 @@ bool YellLfgGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,u
     if (ai.personality().verbosity == Verbosity::Silent) return false;
     if (s.is_moving() || s.in_combat() || s.is_casting()) return false;
     if (s.raw().movement.is_mounted) return false;
-    constexpr uint32 kYellThrottleMs = 45u * 60u * 1000u;
+    constexpr uint32 kYellThrottleMs = 22u * 60u * 1000u;   // one call per bot per 22 minutes (the realm-wide 20 s faction slot still holds)
     const uint32 yell_now_ms = s.published_at_ms();
-    // Below level 60 only a share of the bots call at a time (a different set every 45 minutes).
+    // Below level 60 only a share of the bots call at a time (a different set every 22 minutes).
     if (s.level() < 60 && (!TownLifeEnabled() || !V2::TownLife::TakesPart(s.bot_id(), 3u, yell_now_ms, 15u, kYellThrottleMs))) return false;
 
     if (ai.last_yell_lfg_ms() == 0)
@@ -226,42 +239,33 @@ bool YellLfgGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,u
 bool YellLfgFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,BotIntentEmitter& emit, uint32)
 {
     const uint32 yell_now_ms = s.published_at_ms();
-    constexpr char const* kTankYells[] = {
-        "Tank LFG, msg me!",
-        "Looking for a group, can tank.",
-        "Tank here, any dungeon, whisper me.",
-    };
-    constexpr char const* kHealerYells[] = {
-        "Healer LFG.",
-        "Looking for a group to heal, whisper me.",
-        "Healer available, msg me for runs.",
-    };
-    constexpr char const* kDpsYells[] = {
-        "DPS LFG.",
-        "Looking for any group.",
-        "Hi! Anyone running a dungeon tonight?",
-        "lfg, can do most stuff.",
-    };
-    constexpr uint32 kTankSize = sizeof(kTankYells) / sizeof(kTankYells[0]);
-    constexpr uint32 kHealerSize = sizeof(kHealerYells) / sizeof(kHealerYells[0]);
-    constexpr uint32 kDpsSize = sizeof(kDpsYells) / sizeof(kDpsYells[0]);
     const Role role = ai.effective_role(s);
-    char const* phrase = nullptr;
-    const uint32 sel_seed = (s.bot_id() ^ (yell_now_ms / (45u * 60u * 1000u)));
-    if (role == Role::Tank)
-        phrase = kTankYells[sel_seed % kTankSize];
-    else if (role == Role::Healer)
-        phrase = kHealerYells[sel_seed % kHealerSize];
-    else
-        phrase = kDpsYells[sel_seed % kDpsSize];
+    uint8 const role_bit = role == Role::Tank ? V2::ChannelTalk::kTank : role == Role::Healer ? V2::ChannelTalk::kHealer : V2::ChannelTalk::kDps;
+    const uint32 sel_seed = (s.bot_id() ^ (yell_now_ms / (22u * 60u * 1000u)));
     // A bot of a dungeon's level names the dungeon.
-    std::string line = phrase;
-    if (s.level() < 60)
-        if (char const* dungeon = V2::TownLife::LfgDungeonFor(s.level(), sel_seed))
+    char const* dungeon = s.level() < 60 ? V2::TownLife::LfgDungeonFor(s.level(), sel_seed) : nullptr;
+    // Playerbot.Chatter.LfgChannel: the call goes to the LookingForGroup channel (or the zone's General), like a player's, with many
+    // shapes and never a line that went out a moment ago; one call per faction per 20 s realm-wide. 0 = the old /yell in town.
+    if (Services::Config().chatter_lfg_channel())
+    {
+        uint32 const lfg = V2::ChannelChat::LfgChannelId();
+        uint32 const channel = (lfg && urand(0, 99) < 60) ? lfg : 1u;
+        std::string line;
+        for (uint32 attempt = 0; attempt < 4 && line.empty(); ++attempt)
         {
-            char const* rolename = role == Role::Tank ? "tank" : role == Role::Healer ? "healer" : "dps";
-            line = std::string("LFG ") + dungeon + ", " + rolename + " here. Whisper me!";
+            line = V2::ChannelTalk::LfgCallLine(role_bit, dungeon, s.level(), urand(0, 0xFFFFFF));
+            if (!V2::ChannelChat::LfgCallSlot(s.is_alliance(), line, yell_now_ms))
+                line.clear();
         }
+        ai.set_last_yell_lfg_ms(yell_now_ms);   // a refused slot waits for the bot's next turn as well
+        if (line.empty())
+            return false;
+        V2::TownLife::Counters().lfg_calls.fetch_add(1, std::memory_order_relaxed);
+        emit.emit(ChatIntent{ ChannelChatIntent{ uint8(channel), std::move(line) } });
+        ai.set_last_rule_fired("idle:yell_lfg");
+        return true;
+    }
+    std::string line = V2::ChannelTalk::LfgCallLine(role_bit, dungeon, s.level(), sel_seed);
     V2::TownLife::Counters().lfg_calls.fetch_add(1, std::memory_order_relaxed);
     emit.yell_world(line);
     ai.set_last_yell_lfg_ms(yell_now_ms);
@@ -270,89 +274,20 @@ bool YellLfgFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,B
 }
 
 // ---------- idle:ambient_sit ----------
-// Side-effect "sit when resting" — SetStandStateIntent is idempotent
-// server-side so re-emitting on an already-sitting bot is a no-op. Fire
-// returns FALSE so subsequent registry rules still run (the legacy code
-// did this unconditionally as a side effect before any return).
-//
-// Requires sustained idle: 10 seconds of standing still without combat
-// or casting. Without this gate the bot sat on EVERY tiny pause during
-// movement — between path segments, after each enemy kill before
-// re-engaging, while a snapshot tick computed the next destination,
-// etc. Looked frankly broken from the observer's perspective.
-// Verified 2026-05-20: user reported "all bots sit on every tiny stop
-// during movement". 10s threshold matches the standard MMO "out of
-// combat → rest" feel without flooding sit animations.
-bool AmbientSitGate(BotSnapshotView const& s, BotAI& ai,
-                    GroupSnapshotView const&, uint32)
+// No longer sits: a bot sits only while it eats or drinks (idle:ooc_eat_food), never to wait or regenerate. The rule stays because its
+// gate keeps ai.last_moving_ms() current, which the fidget, look-around and wander-pause rules read as "has stood still a while".
+bool AmbientSitGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
 {
-    // Common safety gates first — these hold regardless of WHERE the bot
-    // is allowed to sit.
-    if (s.in_combat() || s.is_casting()) return false;
-    if (s.raw().movement.is_mounted) return false;
-    // Don't sit while anything hostile is in pull range. Even in a
-    // hub guards / event mobs / world-PvP attackers can be 40y away.
-    if (s.enemies_within(40.0f) > 0) return false;
-
-    const uint32 now_ms = s.published_at_ms();
     if (s.is_moving())
-    {
-        ai.set_last_moving_ms(now_ms);
-        return false;
-    }
-    // is_moving == false. last_moving_ms == 0 means "never moved since
-    // boot" — those bots just spawned, give them a beat before sitting.
-    const uint32 last_move = ai.last_moving_ms();
-    if (last_move == 0)
-    {
-        ai.set_last_moving_ms(now_ms);
-        return false;
-    }
-    const uint32 idle_ms = now_ms - last_move;
-
-    // I-P3g: broadened sit locations. The original gate was hub-only
-    // (operator-annotated city/village footprint, kind 3/4) — but real
-    // players also rest while parked at a flight master, waiting on a
-    // quest giver, or just standing still in a quiet safe spot after a
-    // while. Three tiers, each with conservative thresholds:
-    //
-    //   1. City / village footprint  — 30s standstill (settled in a hub).
-    //   2. Parked at a flight master or quest giver anywhere — 30s. These
-    //      are natural "I'm waiting here" spots (queuing a taxi, reading
-    //      quest text), so the same hub threshold reads naturally.
-    //   3. Anywhere else that is safe — 90s standstill. Much longer so a
-    //      bot pausing mid-route to recompute a path / scan objectives
-    //      doesn't flop down by the roadside; only a genuinely settled
-    //      bot reaches 90s of continuous standstill.
-    constexpr uint32 kHubIdleMs    = 30u * 1000u;
-    constexpr uint32 kAnywhereIdleMs = 90u * 1000u;
-
-    if (s.in_city() || s.in_village())
-        return idle_ms >= kHubIdleMs;
-
-    if (s.nearest_npc_with_flag(uint32(UNIT_NPC_FLAG_FLIGHTMASTER) |
-                                uint32(UNIT_NPC_FLAG_QUESTGIVER)) != nullptr)
-        return idle_ms >= kHubIdleMs;
-
-    return idle_ms >= kAnywhereIdleMs;
+        ai.set_last_moving_ms(s.published_at_ms());
+    else if (ai.last_moving_ms() == 0)
+        ai.set_last_moving_ms(s.published_at_ms());   // just spawned: count the standstill from now
+    return false;
 }
 
-bool AmbientSitFire(BotSnapshotView const& s, BotAI& ai,
-                    GroupSnapshotView const&,
-                    BotIntentEmitter& emit, uint32)
+bool AmbientSitFire(BotSnapshotView const&, BotAI&, GroupSnapshotView const&, BotIntentEmitter&, uint32)
 {
-    // Edge-paced: one SIT per 60s settled window. The original per-tick
-    // re-emit ("idempotent server-side") still executed ~6 intents/sec per
-    // settled bot — the TOP intent in /diag fleet-wide (Uraimus, Dolanaar
-    // inn, 2026-06-11) — and Unit::SetStandState re-sends the stand-state
-    // self-packet on every call.
-    const uint32 sit_now_ms = s.published_at_ms();
-    if (!ai.action_recently_tried(BotAI::ActionKind::AmbientSit, 0, sit_now_ms))
-    {
-        emit.emit(SetStandStateIntent{1});
-        ai.note_action_retry(BotAI::ActionKind::AmbientSit, 0, sit_now_ms);
-    }
-    return false;   // intentional: side effect only, don't claim the tick
+    return false;
 }
 
 // ---------- idle:look_at_npc ----------
@@ -596,8 +531,6 @@ bool FidgetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         emit.perform_emote(11 /*LAUGH*/, ObjectGuid::Empty);
     else if (pick < 16)
         emit.perform_emote(23 /*FLEX*/, ObjectGuid::Empty);
-    else if (pick < 18)
-        emit.emit(SetStandStateIntent{1});                        // sit down for a bit
     else
         emit.perform_emote(10 /*DANCE*/, ObjectGuid::Empty);
     ai.set_last_rule_fired("idle:fidget");
@@ -718,10 +651,12 @@ bool LeaveHotspotFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView con
 // ---------- idle:leave_water ----------
 // A solo bot that ends up swimming inside a capital (a canal, a harbour) walks to the nearest hub to get out; capitals
 // are the only place this applies, a swim in the open world is a river crossing and is left to the router.
-bool LeaveWaterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
+bool LeaveWaterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
     if (!s.is_alive() || s.in_combat() || s.is_casting() || !s.is_swimming()) return false;
-    if (s.in_group() || s.is_in_dungeon() || s.in_battleground()) return false;
+    // A group led by a bot gets out too, every member on its own: its leader is swimming as well, and following it kept the whole
+    // party in the canal (live 244: four bots 490 s+ in the Stormwind canal behind their bot leader).
+    if ((s.in_group() && !g.leader_is_bot()) || s.is_in_dungeon() || s.in_battleground()) return false;
     if (ai.in_post_rescue_grace(now_ms) || ai.in_charter_grace(now_ms)) return false;
     uint8 lo = 0, hi = 0;
     return !::Playerbot::V2::World::VanillaZoneLevelRange(s.zone_id(), lo, hi);
@@ -729,6 +664,14 @@ bool LeaveWaterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
 
 bool LeaveWaterFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
 {
+    // The nearest dry footing first (the builder's water_escape point, a bank or a stair): this rule outranks idle:water_escape, and a
+    // walk to a hub across the canal kept the bot swimming.
+    if (s.water_escape_valid())
+    {
+        emit.move_to(s.water_escape_x(), s.water_escape_y(), s.water_escape_z(), /*run*/ true);
+        ai.set_last_rule_fired("idle:leave_water");
+        return true;
+    }
     auto const* hub = Services::Hubs().GetNearestQuestHub(s.raw());
     if (!hub || hub->mapId != s.map_id()) return false;
     return States::ChunkedWalkToward(s, ai, emit, hub->location.GetPositionX(), hub->location.GetPositionY(),
@@ -736,10 +679,15 @@ bool LeaveWaterFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
 }
 
 // ---------- idle:inn_rest ----------
-// In a capital a share of the bots (most at night) walk to the nearest inn and sit there for a while. One check of the town NPC index
-// per tick, only for the bots whose turn it is.
+// In a capital a share of the bots (most at night) walk to the nearest inn and stand there for a while. One check of the town NPC index
+// per tick, only for the bots whose turn it is. The inn holds Playerbot.World.Town.InnCap bots at once (TownErrand::Spots): with no cap
+// every resting bot of the city stood in the one inn (48 bots in the Gilded Rose in 20 minutes, live 273). A bot turned away, or one a
+// real player stands next to for PlayerNudgeSec, goes about its errands instead.
 constexpr float kInnSearchYards = 150.0f;
-constexpr float kInnStandYards = 5.0f;
+constexpr float kInnStandYards = 4.5f;
+constexpr uint32 kSpotHoldMs = 30000u;   // a claim not renewed for this long lapses (the bot walked off, logged out or died)
+
+namespace TE = ::Playerbot::V2::TownErrand;
 
 // One line per bot and outcome every five minutes, so a soak shows which bots reached the inn and which found no innkeeper (the counters
 // above are bot-ticks and a few bots dominate them).
@@ -748,7 +696,7 @@ static void InnLog(BotSnapshotView const& s, char const* what, float x, float y)
     static std::mutex mx;
     static std::unordered_map<uint64, uint32> last;
     uint32 const now = s.published_at_ms() ? s.published_at_ms() : 1u;
-    uint64 const key = (uint64(s.bot_id()) << 1) | (what[0] == 'r' ? 1u : 0u);
+    uint64 const key = (uint64(s.bot_id()) << 2) | (what[0] == 'r' ? 1u : what[0] == 'i' ? 2u : 0u);
     {
         std::lock_guard<std::mutex> lock(mx);
         uint32& at = last[key];
@@ -759,12 +707,39 @@ static void InnLog(BotSnapshotView const& s, char const* what, float x, float y)
     TC_LOG_INFO("playerbot.v2", "[inn] {} {} (zone {}, {:.0f},{:.0f})", s.raw().identity.name, what, s.zone_id(), x, y);
 }
 
-bool InnRestGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+// A real player (not a bot) standing within `yards` of the bot.
+static bool RealPlayerWithin(BotSnapshotView const& s, float yards)
+{
+    if (yards <= 0.0f) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    for (auto const& u : s.nearby_friends())
+    {
+        if (!u.is_player || u.hp <= 0) continue;
+        if (std::hypot(u.x - bx, u.y - by) > yards || std::fabs(u.z - bz) > 6.0f) continue;
+        if (!Services::Registry().has(BotId(u.guid.GetCounter()))) return true;
+    }
+    return false;
+}
+
+// Tracks how long a real player has stood next to the standing bot; true once it is PlayerNudgeSec.
+static bool PlayerNudgeDue(BotSnapshotView const& s, TE::State& st, uint32 now_ms)
+{
+    auto const& c = TE::Cfg();
+    if (!RealPlayerWithin(s, c.nudge_yards)) { st.near_player_ms = 0; return false; }
+    if (st.near_player_ms == 0) { st.near_player_ms = now_ms ? now_ms : 1u; return false; }
+    return now_ms - st.near_player_ms >= c.nudge_ms;
+}
+
+bool InnRestGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
 {
     if (!TownLifeEnabled()) return false;
     if (!::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id())) return false;
+    if (TE::Cfg().inn_cap == 0) return false;
+    if (int32(ai.town_errand().inn_skip_until_ms - s.published_at_ms()) > 0) return false;
     int const hour = TimeBreakdown(GameTime::GetGameTime()).tm_hour;
-    if (!V2::TownLife::TakesPart(s.bot_id(), 1u, s.published_at_ms(), V2::TownLife::InnPercent(hour), 15u * 60u * 1000u)) return false;
+    uint32 const pct = V2::TownLife::InnPercent(hour) * TE::Cfg().inn_share_pct / 100u;
+    if (!V2::TownLife::TakesPart(s.bot_id(), 1u, s.published_at_ms(), pct, 15u * 60u * 1000u)) return false;
     if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
     return s.enemies_within(40.0f) == 0 && !s.has_actionable_quest();
@@ -782,11 +757,20 @@ bool InnRestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
         InnLog(s, "no innkeeper within reach", bx, by);
         return false;
     }
-    // Stand a few yards from the innkeeper, on the side the bot comes from, so a crowd does not stack on one point.
-    float const dx = bx - inn->x, dy = by - inn->y, len = std::hypot(dx, dy);
-    float const ux = len > 0.5f ? dx / len : 1.0f, uy = len > 0.5f ? dy / len : 0.0f;
-    float const stand = kInnStandYards + float(s.bot_id() % 5u);
-    float const tx = inn->x + ux * stand, ty = inn->y + uy * stand;
+    auto& st = ai.town_errand();
+    uint64 const place = TE::Spots::PlaceKey(s.map_id(), inn->x, inn->y);
+    uint32 slot = 0;
+    if (!TE::Spots::Get().Claim(place, s.bot_id(), now_ms, kSpotHoldMs, TE::Cfg().inn_cap, &slot))
+    {
+        // Full: this window goes to the errands instead.
+        st.inn_skip_until_ms = now_ms + 15u * 60u * 1000u;
+        V2::TownLife::Counters().inn_full.fetch_add(1, std::memory_order_relaxed);
+        InnLog(s, "inn is full, goes on errands", bx, by);
+        return false;
+    }
+    // Stand a few yards from the innkeeper, on the side the bot comes from, each bot in its own slot of a fan so they stand side by side.
+    float tx, ty;
+    TE::StandPoint(inn->x, inn->y, bx, by, kInnStandYards + float(slot / 5u) * 1.5f, slot, tx, ty);
     // The stand point is a straight line from the innkeeper and can sit behind a wall; the inn is the goal, so a bot that is within a
     // few yards of the innkeeper, or that cannot get closer than a room's width, rests where it is.
     float const to_inn = std::hypot(bx - inn->x, by - inn->y);
@@ -796,19 +780,28 @@ bool InnRestFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
         if (States::ChunkedWalkToward(s, ai, emit, tx, ty, inn->z, "idle:inn_rest", now_ms))
             return true;
         V2::TownLife::Counters().inn_stuck.fetch_add(1, std::memory_order_relaxed);
-        if (to_inn > 20.0f) return false;
+        if (to_inn > 20.0f) { TE::Spots::Get().Release(place, s.bot_id()); return false; }
     }
     V2::TownLife::Counters().inn_ticks.fetch_add(1, std::memory_order_relaxed);
     if (s.is_moving()) return false;
+    // A real player standing next to the resting bot for a while: it gets up and goes about its business.
+    if (PlayerNudgeDue(s, st, now_ms))
+    {
+        st.near_player_ms = 0;
+        st.inn_skip_until_ms = now_ms + 15u * 60u * 1000u;
+        TE::Spots::Get().Release(place, s.bot_id());
+        V2::TownLife::Counters().player_nudges.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     InnLog(s, "rests at the inn", bx, by);
-    emit.sit();
+    // A bot sits only while it eats or drinks, so the inn visit is a stand.
     ai.set_last_rule_fired("idle:inn_rest");
     return true;
 }
 
 // ---------- idle:mailbox ----------
 // A few bots in a town walk to the nearest mailbox and stand there a while, then the window turns over and they go back to their errands.
-// The share is picked per time window by hash, so nothing is stored per bot.
+// The share is picked per time window by hash, so nothing is stored per bot. A mailbox takes Playerbot.World.Town.MailboxCap bots at once.
 constexpr float kMailboxSearchYards = 120.0f;
 constexpr float kMailboxStandYards = 2.5f;
 constexpr uint32 kMailboxWindowMs = 90u * 1000u;
@@ -817,6 +810,7 @@ bool MailboxGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uin
 {
     if (!TownLifeEnabled()) return false;
     if (!::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id())) return false;
+    if (TE::Cfg().mailbox_cap == 0) return false;
     if (!V2::TownLife::TakesPart(s.bot_id(), 5u, s.published_at_ms(), 4u, kMailboxWindowMs)) return false;
     if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
     if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
@@ -829,15 +823,287 @@ bool MailboxFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, 
     s.position(bx, by, bz);
     auto const* box = ::Playerbot::V2::Travel::TownNpcIndex::Instance().NearestMailbox(s.map_id(), bx, by, bz, kMailboxSearchYards);
     if (!box) return false;
-    V2::TownLife::Counters().mailbox_ticks.fetch_add(1, std::memory_order_relaxed);
-    float const dx = bx - box->x, dy = by - box->y, len = std::hypot(dx, dy);
-    if (len > kMailboxStandYards + 1.5f)
+    uint64 const place = TE::Spots::PlaceKey(s.map_id(), box->x, box->y);
+    uint32 slot = 0;
+    if (!TE::Spots::Get().Claim(place, s.bot_id(), now_ms, kSpotHoldMs, TE::Cfg().mailbox_cap, &slot))
     {
-        float const ux = dx / len, uy = dy / len;
-        return States::ChunkedWalkToward(s, ai, emit, box->x + ux * kMailboxStandYards, box->y + uy * kMailboxStandYards, box->z, "idle:mailbox", now_ms);
+        V2::TownLife::Counters().mailbox_full.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    V2::TownLife::Counters().mailbox_ticks.fetch_add(1, std::memory_order_relaxed);
+    float tx, ty;
+    TE::StandPoint(box->x, box->y, bx, by, kMailboxStandYards, slot, tx, ty);
+    if (std::hypot(bx - box->x, by - box->y) > kMailboxStandYards + 1.5f)
+        return States::ChunkedWalkToward(s, ai, emit, tx, ty, box->z, "idle:mailbox", now_ms);
     if (s.is_moving()) return false;
     ai.set_last_rule_fired("idle:mailbox");
+    return true;
+}
+
+// ---------- idle:town_errand ----------
+// A capital's residents go about their business (Bot/TownErrand.h): each runs to a real place anywhere in the city (the auction house,
+// the bank, its class trainer, the inn, a mailbox, the flight master, a vendor, now and then the city gate), stops there a few seconds
+// facing the NPC, and runs straight on to the next place. The walk is one pathed move to the place, so the bot runs a smooth line
+// through the streets and past the player, instead of the 25 y random wander hops with a stop and a turn at each. Every place holds a
+// few bots at once (SpotCap); a bot finding one full picks another.
+constexpr uint32 kErrandWalkTimeoutMs = 120000u;
+constexpr uint32 kErrandStaleMs = 180000u;
+constexpr uint64 kGateKeyBase = 0xE0000000ull;
+
+static bool HasGreyJunkItem(BotSnapshotView const& s)
+{
+    for (auto const& it : s.raw().inventory.bag_items)
+        if (!it.guid.IsEmpty() && !it.is_quest_item && it.quality == ITEM_QUALITY_POOR)
+            return true;
+    return false;
+}
+
+static uint32 PlaceCap(TE::Kind k)
+{
+    auto const& c = TE::Cfg();
+    if (k == TE::Kind::Inn) return std::max<uint32>(1u, c.inn_cap);
+    if (k == TE::Kind::Mailbox) return std::max<uint32>(1u, c.mailbox_cap);
+    if (k == TE::Kind::Exit) return c.spot_cap * 4u;   // a road: the bots leaving by it walk straight through
+    return c.spot_cap;
+}
+
+// The places of the city within ErrandRadius of (bx, by) that this bot has a reason to go to.
+static void TownDests(BotSnapshotView const& s, float bx, float by, float bz, std::vector<TE::Dest>& out)
+{
+    auto const& c = TE::Cfg();
+    bool const need_vendor = HasGreyJunkItem(s) || (s.lowest_equipped_durability_pct() < 100 && s.gold() > 0);
+    // Stormwind stands on layers 20 y and more apart, joined only by steep faces (Fleet/CityLayer.h): a place on another layer is not
+    // an errand.
+    constexpr float kLayerYards = 18.0f;
+    ::Playerbot::V2::Travel::TownNpcIndex::Instance().ForEachNear(s.map_id(), bx, by, c.radius, [&](::Playerbot::V2::Travel::TownNpc const& n)
+    {
+        if (!n.usable_by(s.is_alliance()) || std::fabs(n.z - bz) > kLayerYards) return;
+        uint32 const f = n.npc_flags;
+        TE::Kind k = TE::Kind::None;
+        float boost = 1.0f;
+        if (f & UNIT_NPC_FLAG_AUCTIONEER) k = TE::Kind::Auction;
+        else if (f & UNIT_NPC_FLAG_BANKER) k = TE::Kind::Bank;
+        else if (f & UNIT_NPC_FLAG_INNKEEPER) k = TE::Kind::Inn;
+        else if (f & UNIT_NPC_FLAG_FLIGHTMASTER) k = TE::Kind::Flight;
+        else if ((f & UNIT_NPC_FLAG_BATTLEMASTER) && s.level() >= 10) k = TE::Kind::Battlemaster;
+        else if ((f & UNIT_NPC_FLAG_STABLEMASTER) && s.cls() == CLASS_HUNTER) k = TE::Kind::Stable;
+        else if ((f & UNIT_NPC_FLAG_TRAINER) && n.trainer_class != 0 && n.trainer_class == s.cls()) k = TE::Kind::Trainer;
+        else if (f & (UNIT_NPC_FLAG_VENDOR_MASK | UNIT_NPC_FLAG_REPAIR)) { k = TE::Kind::Vendor; if (need_vendor) boost = 5.0f; }
+        if (k == TE::Kind::None) return;
+        out.push_back({ k, n.spawn_id, n.entry, n.x, n.y, n.z, TE::BaseWeight(k) * boost });
+    });
+    ::Playerbot::V2::Travel::TownNpcIndex::Instance().ForEachMailboxNear(s.map_id(), bx, by, c.radius, [&](::Playerbot::V2::Travel::TownNpc const& n)
+    {
+        if (std::fabs(n.z - bz) > kLayerYards) return;
+        out.push_back({ TE::Kind::Mailbox, n.spawn_id, 0u, n.x, n.y, n.z, TE::BaseWeight(TE::Kind::Mailbox) });
+    });
+    if (c.exits)
+    {
+        V2::GateDuels::GateSpot gate;
+        uint32 city = 0;
+        if (V2::GateDuels::Board::Get().GateNear(s.map_id(), bx, by, c.radius, s.is_alliance(), gate, city))
+            out.push_back({ TE::Kind::Exit, kGateKeyBase + city, 0u, gate.x, gate.y, gate.z, TE::BaseWeight(TE::Kind::Exit) });
+    }
+}
+
+static void EndErrand(BotSnapshotView const& s, TE::State& st, bool done)
+{
+    if (st.place) TE::Spots::Get().Release(st.place, s.bot_id());
+    if (st.key) st.recent.add(st.key);
+    if (done) ++st.errands;
+    st.Clear();
+}
+
+// A bot placed in the town by the spawner (TownPct) is in its profession mode for 45-90 minutes and lives there. Any other bot in a
+// capital runs errands in its town third of each hour (the rpg phase of RpgRules.cpp); out of it, its one errand is the walk out to the
+// city gate, from where idle:grind_roam takes it to level (live 275: these bots stood in the city under idle:wander, 25 y hops with a
+// stop and a turn at each, 406 of 507 wander lines in a capital).
+static bool TownTime(BotSnapshotView const& s, BotAI& ai, uint32 now_ms)
+{
+    if (ai.in_profession_mode(now_ms)) return true;
+    uint32 const seed = uint32(s.bot_id()) * 2654435761u;
+    return ((seed % 61u) + now_ms / 60000u) % 61u <= 20u;
+}
+
+constexpr uint32 kLeaveMs = 10u * 60u * 1000u;   // out at the gate: this long with no errands, grind_roam leads the bot off
+
+// Choose the next place and claim a stand slot there. False when the city offers nothing.
+static bool PickErrand(BotSnapshotView const& s, BotAI& ai, TE::State& st, uint32 now_ms)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    std::vector<TE::Dest> dests;
+    dests.reserve(64);
+    TownDests(s, bx, by, bz, dests);
+    // Out of its town time a bot only leaves; with no gate known it keeps to the errands rather than wander on the spot.
+    bool const leaving = !TownTime(s, ai, now_ms)
+        && std::any_of(dests.begin(), dests.end(), [](TE::Dest const& d) { return d.kind == TE::Kind::Exit; });
+    if (leaving)
+        std::erase_if(dests, [](TE::Dest const& d) { return d.kind != TE::Kind::Exit; });
+    if (dests.empty()) return false;
+    uint64 const bot = s.bot_id();
+    uint32 const map = s.map_id();
+    auto full = [&](TE::Dest const& d) { return TE::Spots::Get().Full(TE::Spots::PlaceKey(map, d.x, d.y), bot, now_ms, PlaceCap(d.kind)); };
+    int const k = TE::Pick(dests, bx, by, TE::Cfg().radius, leaving ? TE::Recent{} : st.recent, float(ai.rng().unit()), full);
+    if (k < 0) return false;
+    TE::Dest const& d = dests[size_t(k)];
+    uint64 const place = TE::Spots::PlaceKey(map, d.x, d.y);
+    uint32 slot = 0;
+    if (!TE::Spots::Get().Claim(place, bot, now_ms, kSpotHoldMs, PlaceCap(d.kind), &slot))
+        return false;
+    st.Clear();
+    st.kind = d.kind; st.key = d.key; st.place = place; st.entry = d.entry; st.slot = slot;
+    st.leaving = leaving;
+    st.nx = d.x; st.ny = d.y; st.nz = d.z;
+    float const ring = d.kind == TE::Kind::Mailbox ? 2.5f : d.kind == TE::Kind::Exit ? 3.0f + float(slot % 6u) * 1.5f : 3.5f + float(slot / 5u) * 1.5f;
+    TE::StandPoint(d.x, d.y, bx, by, ring, slot, st.tx, st.ty);
+    st.tz = d.z;
+    st.phase = 1;
+    st.phase_start_ms = now_ms;
+    // One bot in 16 logs its errands, so a soak shows where residents go without a line per errand of every bot.
+    if (s.bot_id() % 16u == 0u)
+        TC_LOG_INFO("playerbot.v2", "[town] {} -> {} ({:.0f},{:.0f}) {:.0f} y slot {} (zone {})",
+                    s.name(), TE::KindName(d.kind), d.x, d.y, std::hypot(d.x - bx, d.y - by), slot, s.zone_id());
+    return true;
+}
+
+// At the place: face the NPC, sell the junk or repair at a vendor, one gesture now and then, and stop a few seconds.
+static void ArriveErrand(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, TE::State& st, uint32 now_ms)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    if (s.is_mounted())
+        emit.dismount();
+    if (st.entry)
+    {
+        for (auto const& u : s.nearby_friends())
+        {
+            if (u.is_player || u.entry != st.entry || std::hypot(u.x - st.nx, u.y - st.ny) > 15.0f) continue;
+            emit.face_target(u.guid);
+            uint64 const low = u.guid.GetCounter();
+            bool const in_reach = std::hypot(u.x - bx, u.y - by) <= 5.0f;
+            if (in_reach && (u.npc_flags & UNIT_NPC_FLAG_VENDOR_MASK) && HasGreyJunkItem(s)
+                && !ai.action_recently_tried(BotAI::ActionKind::SellTrash, low, now_ms))
+            {
+                emit.vendor_sell_trash(u.guid);
+                ai.note_action_retry(BotAI::ActionKind::SellTrash, low, now_ms);
+            }
+            if (in_reach && (u.npc_flags & UNIT_NPC_FLAG_REPAIR) && s.lowest_equipped_durability_pct() < 100 && s.gold() > 0
+                && !ai.action_recently_tried(BotAI::ActionKind::Repair, low, now_ms))
+            {
+                emit.repair_all(u.guid);
+                ai.note_action_retry(BotAI::ActionKind::Repair, low, now_ms);
+            }
+            if (ai.rng().chance(0.4))
+            {
+                static constexpr uint32 kTalk[] = { EMOTE_ONESHOT_TALK, EMOTE_ONESHOT_TALK, EMOTE_ONESHOT_BOW, EMOTE_ONESHOT_QUESTION, EMOTE_ONESHOT_POINT };
+                emit.perform_emote(kTalk[ai.rng().int_range(0, int32(std::size(kTalk)))], u.guid);
+            }
+            break;
+        }
+    }
+    auto const& c = TE::Cfg();
+    uint32 linger = c.linger_min_ms;
+    if (c.linger_max_ms > c.linger_min_ms)
+        linger += uint32(ai.rng().int_range(0, int32((c.linger_max_ms - c.linger_min_ms) / 100u) + 1)) * 100u;
+    if (st.kind == TE::Kind::Exit || st.kind == TE::Kind::Mailbox) linger /= 2u;   // a look out of the gate, a letter posted
+    st.phase = 2;
+    st.phase_start_ms = now_ms;
+    st.linger_until_ms = now_ms + linger;
+    st.near_player_ms = 0;
+    V2::TownLife::Counters().errands.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TownErrandGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
+{
+    if (!TE::Cfg().errands) return false;
+    if (int32(ai.town_errand().leave_until_ms - now_ms) > 0) return false;   // left by the gate: off to level
+    // A member of a small party of world bots (Fleet/BotParties.h) goes where its leader goes: idle:party_follow sits under this rule.
+    {
+        std::shared_ptr<std::unordered_map<uint64, V2::Parties::Link> const> keep;
+        if (V2::Parties::LinkOf(s, keep)) return false;
+    }
+    auto const& st = ai.town_errand();
+    // A bot on its way out to the city gate is outside the capital's zone for the last yards; it finishes the errand.
+    if (!::Playerbot::V2::World::IsVanillaCapitalZone(s.zone_id()) && !(st.phase != 0 && st.kind == TE::Kind::Exit)) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.is_stunned() || s.is_rooted()) return false;
+    if (s.has_owner_character() || s.in_group() || s.on_transport()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground()) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    if (s.has_actionable_quest() || Classic::RecoverBeforeWalking(s)) return false;   // quest work in reach, or hurt / mid-meal / dry
+    return s.enemies_within(30.0f) == 0;
+}
+
+bool TownErrandFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32 now_ms)
+{
+    auto& st = ai.town_errand();
+    // An errand left long ago (a fight, a quest, a show took over) is not resumed: the next place is chosen from here.
+    if (st.phase != 0 && now_ms - st.phase_start_ms > kErrandStaleMs)
+        EndErrand(s, st, false);
+
+    if (st.phase == 2)
+    {
+        if (st.place) TE::Spots::Get().Claim(st.place, s.bot_id(), now_ms, kSpotHoldMs, PlaceCap(st.kind));
+        bool const nudged = PlayerNudgeDue(s, st, now_ms);
+        if (nudged) V2::TownLife::Counters().player_nudges.fetch_add(1, std::memory_order_relaxed);
+        if (now_ms < st.linger_until_ms && !nudged)
+        {
+            ai.set_last_rule_fired("idle:town_linger");
+            return true;
+        }
+        EndErrand(s, st, true);   // done: straight on to the next place, this tick
+    }
+
+    if (st.phase == 0 && !PickErrand(s, ai, st, now_ms))
+        return false;
+
+    // On the way.
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    TE::Spots::Get().Claim(st.place, s.bot_id(), now_ms, kSpotHoldMs, PlaceCap(st.kind));
+    float const d_npc = std::hypot(bx - st.nx, by - st.ny);
+    float const d_stand = std::hypot(bx - st.tx, by - st.ty);
+    float const ring = std::hypot(st.tx - st.nx, st.ty - st.ny);
+    bool there = (d_stand <= 2.5f || d_npc <= ring + 1.0f) && std::fabs(bz - st.nz) < 6.0f;
+    if (!there)
+    {
+        // No 3 y of progress in 8 s, standing or running against a wall.
+        bool const stalled = st.issued && TE::Stalled(st, bx, by, now_ms);
+        if (stalled && d_npc <= 15.0f && std::fabs(bz - st.nz) < 8.0f)
+            there = true;   // in the room: the stand point is behind a counter or a table
+        else if (stalled || now_ms - st.phase_start_ms > kErrandWalkTimeoutMs)
+        {
+            V2::TownLife::Counters().errand_gave_up.fetch_add(1, std::memory_order_relaxed);
+            if (s.bot_id() % 16u == 0u)
+                TC_LOG_INFO("playerbot.v2", "[town] {} gave up on the {} at ({:.0f},{:.0f}), {:.0f} y short", s.name(), TE::KindName(st.kind), st.nx, st.ny, d_npc);
+            EndErrand(s, st, false);
+            return false;
+        }
+    }
+    if (there && st.leaving)
+    {
+        // Out of the gate: no stop, the bot runs on to level (grind_roam, which lets it through the capital's edge until then).
+        st.leave_until_ms = now_ms + kLeaveMs;
+        V2::TownLife::Counters().errands.fetch_add(1, std::memory_order_relaxed);
+        EndErrand(s, st, true);
+        return false;
+    }
+    if (there)
+    {
+        ArriveErrand(s, ai, emit, st, now_ms);
+        ai.set_last_rule_fired("idle:town_errand");
+        return true;
+    }
+    // One pathed move to the place (the navmesh route goes out as one spline: PlayerbotAPI MoveAlongRoute), re-sent only when the bot
+    // has stopped short of it, so it runs through without a stop. The chunked walk is the fallback for a move the path call refused.
+    if (!st.issued || (!s.is_moving() && now_ms - st.last_emit_ms >= 1500u))
+    {
+        if (!emit.move_to(st.tx, st.ty, st.tz, /*run*/ true) && !emit.move_already_emitted(st.tx, st.ty, st.tz))
+            States::ChunkedWalkToward(s, ai, emit, st.tx, st.ty, st.tz, "idle:town_errand", now_ms);
+        st.issued = true;
+        st.last_emit_ms = now_ms;
+    }
+    ai.set_last_rule_fired("idle:town_errand");
     return true;
 }
 
@@ -885,6 +1151,185 @@ bool TownDuelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     return false;
 }
 
+// ---------- idle:gate_duel ----------
+// A world bot the gate-duel driver (WorldBotSpawner::DriveGateDuels, Fleet/GateDuels.h) put in a pair walks to its spot outside the
+// capital's gate. The challenger asks the other for a duel (spell 7266, the game's own request: the other accepts through the duel
+// pact in BotAI, the flag and countdown are the game's); an onlooker just stands. The duel is fought by the usual combat code.
+bool GateDuelGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    V2::GateDuels::Assignment a;
+    return V2::GateDuels::Board::Get().Find(s.bot_id(), a);
+}
+
+bool GateDuelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    V2::GateDuels::Assignment a;
+    if (!V2::GateDuels::Board::Get().Find(s.bot_id(), a)) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    uint32 const now = s.published_at_ms();
+    if (std::hypot(a.x - bx, a.y - by) > 3.0f)
+    {
+        // The game's own navmesh route to the spot, one leg at a time (a leg ends where the path is cut; the next tick, with the bot standing,
+        // routes the rest from there). The straight-line chunk walk is the fallback: it gives up on a goal it cannot step toward, which left
+        // pairs standing in the city and then timing out (117: Sinan 252 yd away, moving=false for the whole 120 s).
+        if (s.is_moving() || emit.move_to(a.x, a.y, a.z) || emit.move_already_emitted(a.x, a.y, a.z)
+            || States::ChunkedWalkToward(s, ai, emit, a.x, a.y, a.z, "idle:gate_duel", now))
+        {
+            ai.set_last_rule_fired("idle:gate_duel");
+            return true;
+        }
+    }
+    if (a.role == V2::GateDuels::Role::Challenger && !s.is_moving())
+    {
+        // Ask once the pair stands together; at most every 8 s, so a pending request is not asked again.
+        if (ai.last_town_show_ms() && now - ai.last_town_show_ms() < 8000u) { ai.set_last_rule_fired("idle:gate_duel"); return true; }
+        for (auto const& u : s.nearby_friends())
+        {
+            if (u.guid.GetCounter() != a.partner || !u.is_player || u.hp <= 0) continue;
+            float const d = std::hypot(u.x - bx, u.y - by);
+            if (d < 2.0f || d > 12.0f) continue;
+            V2::TownLife::PactSet(a.partner, s.bot_id(), now);
+            emit.cast(7266u, u.guid);   // Duel
+            ai.set_last_town_show_ms(now);
+            break;
+        }
+    }
+    else if (a.role == V2::GateDuels::Role::Onlooker && !s.is_moving()
+             && (!ai.last_town_show_ms() || now - ai.last_town_show_ms() > 15000u) && urand(0, 99) < 30)
+    {
+        // An onlooker cheers, claps or laughs now and then.
+        static constexpr uint32 kCheer[] = { 4u, 21u, 11u };   // cheer, applaud, laugh
+        emit.perform_emote(kCheer[urand(0, 2)]);
+        ai.set_last_town_show_ms(now);
+    }
+    ai.set_last_rule_fired("idle:gate_duel");
+    return true;
+}
+
+// ---------- idle:gathering ----------
+// A world bot the gathering driver (WorldBotSpawner::DriveGatherings, Fleet/Gathering.h) gave a seat outside a capital's gate walks to it
+// and stays there; the driver turns it to the middle, sits it down at the fire and runs the talk. Held until the driver lets it go.
+bool GatheringGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    return V2::Gathering::Board::Get().Has(s.bot_id());
+}
+
+bool GatheringFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    V2::Gathering::Spot a;
+    if (!V2::Gathering::Board::Get().Find(s.bot_id(), a)) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    uint32 const now = s.published_at_ms();
+    if (std::hypot(a.x - bx, a.y - by) > 2.0f)
+    {
+        if (s.is_moving() || emit.move_to(a.x, a.y, a.z) || emit.move_already_emitted(a.x, a.y, a.z)
+            || States::ChunkedWalkToward(s, ai, emit, a.x, a.y, a.z, "idle:gathering", now))
+        {
+            ai.set_last_rule_fired("idle:gathering");
+            return true;
+        }
+    }
+    ai.set_last_rule_fired("idle:gathering");
+    return true;
+}
+
+// ---------- idle:gate_challenge ----------
+// Near a capital's gate a bot now and then challenges a real player of about its level to a duel (Playerbot.World.GateDuels.
+// ChallengePlayers). A player is asked at most once every ChallengeCooldownSec, whoever asks; the player may say no.
+bool GateChallengeGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    auto const& cfg = Services::Config();
+    if (!cfg.gate_duels_enable() || !cfg.gate_duels_challenge()) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.has_owner_character() || s.in_group() || s.is_moving()) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    if (s.hp_pct() < 90 || s.level() < 6 || s.enemies_within(40.0f) > 0) return false;
+    if (s.raw().social_events.has_duel_request || s.duel_in_progress()) return false;
+    if (!V2::TownLife::TakesPart(s.bot_id(), 6u, s.published_at_ms(), 5u, 60u * 1000u)) return false;
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    return V2::GateDuels::Board::Get().NearGate(s.map_id(), bx, by, cfg.gate_duels_radius(), s.is_alliance());
+}
+
+bool GateChallengeFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    for (auto const& u : s.nearby_friends())
+    {
+        if (!u.is_player || u.hp <= 0) continue;
+        uint64 const id = u.guid.GetCounter();
+        if (Services::Registry().has(BotId(id))) continue;   // a real player only
+        float const d = std::hypot(u.x - bx, u.y - by);
+        if (d < 4.0f || d > 20.0f || !V2::GateDuels::PlayerDuelOk(s.level(), u.level)) continue;
+        if (!V2::GateDuels::Board::Get().ChallengeTake(id, s.published_at_ms(), Services::Config().gate_duels_challenge_cd_ms())) return false;
+        emit.cast(7266u, u.guid);   // Duel
+        V2::TownLife::Counters().gate_challenges.fetch_add(1, std::memory_order_relaxed);
+        ai.set_last_rule_fired("idle:gate_challenge");
+        return true;
+    }
+    return false;
+}
+
+// ---------- idle:grind_roam ----------
+// Playerbot.World.Questing = 0: a bot of the world levels by killing, so with no mob of its level in reach it walks to the nearest place
+// where such mobs stand (World::FindGrindSpotNear; the mobs themselves are taken by the usual engage rule, which runs below this one).
+// Within 30 yd of the spot, or with a mob to fight in reach, it yields: the local wander and the engage rule do the rest.
+bool GrindRoamGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32 now_ms)
+{
+    if (Services::Config().world_questing() || !s.is_free_world_bot()) return false;
+    if (!s.is_alive() || s.in_combat() || s.is_casting() || s.hp_pct() < 60) return false;
+    if (s.is_in_instance() || s.is_in_dungeon() || s.in_battleground() || s.raw().movement.is_mounted) return false;
+    // A capital is no grinding ground, except for a bot idle:town_errand has just walked out to the gate (the gate spot can lie in the
+    // capital's zone, the Gates of Stormwind do).
+    if (V2::World::IsVanillaCapitalZone(s.zone_id()) && int32(ai.town_errand().leave_until_ms - now_ms) <= 0) return false;
+    if (V2::Parties::Following(s)) return false;   // in a small party: the leader picks the spot (idle:party_follow)
+    uint8 const lvl = s.level();
+    for (auto const& u : s.nearby_enemies())
+    {
+        if (!u.guid.IsCreature() || u.no_xp_kill || u.is_pacified || u.untargetable) continue;
+        if (u.level > lvl + 4u || u.hp_pct() < 50 || u.victim != ObjectGuid::Empty) continue;
+        if (V2::ShareMobs::LeaveMob(s, u)) continue;   // a real player's: not ours to fight
+        return false;   // something to fight in reach: the engage rule takes it
+    }
+    return true;
+}
+
+bool GrindRoamFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    float bx, by, bz;
+    s.position(bx, by, bz);
+    float gx = 0.f, gy = 0.f, gz = 0.f;
+    // A spot a real player is working is skipped for the next one (Playerbot.World.ShareMobs).
+    uint64 const seed = s.guid().GetCounter();
+    bool found = false;
+    for (uint32 attempt = 0; attempt < 4 && !found; ++attempt)
+    {
+        if (!V2::World::FindGrindSpotNear(s.is_alliance(), s.map_id(), bx, by, s.level(), seed + attempt * 7919u, 700.0f, gx, gy, gz))
+            return false;
+        found = !V2::ShareMobs::SpotTaken(s, gx, gy);
+    }
+    if (!found)
+        return false;
+    if (std::hypot(gx - bx, gy - by) <= 30.0f)
+        return false;
+    uint32 const now = s.published_at_ms();
+    if (s.is_moving() || emit.move_to(gx, gy, gz) || emit.move_already_emitted(gx, gy, gz)
+        || States::ChunkedWalkToward(s, ai, emit, gx, gy, gz, "idle:grind_roam", now))
+    {
+        ai.set_last_rule_fired("idle:grind_roam");
+        return true;
+    }
+    return false;
+}
+
 // ---------- idle:campfire ----------
 // Outdoors at night, a few bots that stand still light a campfire (Basic Campfire, 818); the usual ambient sit does the rest.
 bool CampfireGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
@@ -912,10 +1357,281 @@ bool CampfireFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     return true;
 }
 
+// ---------- idle:kind_buff / idle:kind_help / idle:kind_rez ----------
+// Small kindnesses of a world bot for a real player it passes (Playerbot.World.Kindness, Fleet/StrangerBoard.h): a priest's
+// Fortitude, a mage's Intellect or a druid's Mark on a player who lacks it, a hand against the mob of a player losing the fight, a
+// resurrection for a player lying dead (not released) next to it. Each is rare: one per player per kind per cooldown, whoever
+// gives it, and the bot's own rule interval on top.
+constexpr float kKindBuffRange = 28.0f;
+constexpr float kKindHelpRange = 35.0f;
+constexpr float kKindRezRange  = 28.0f;
+constexpr uint32 kKindHelpCooldownMs = 180000u;
+constexpr uint32 kKindRezCooldownMs  = 120000u;
+
+bool KindFree(BotSnapshotView const& s)
+{
+    if (!Services::Config().kindness_enable() || !s.is_free_world_bot()) return false;
+    if (!s.is_alive() || s.is_ghost() || s.is_casting() || s.raw().movement.is_mounted) return false;
+    if (s.is_in_instance() || s.in_battleground()) return false;
+    return true;
+}
+
+uint32 KindRezSpell(uint8 cls)
+{
+    switch (cls)
+    {
+        case CLASS_PRIEST:  return 2006;   // Resurrection
+        case CLASS_PALADIN: return 7328;   // Redemption
+        case CLASS_SHAMAN:  return 2008;   // Ancestral Spirit
+        default:            return 0;
+    }
+}
+
+V2::Strangers::Stranger const* KindBuffTarget(BotSnapshotView const& s, std::vector<V2::Strangers::Stranger> const& list, uint32& spell)
+{
+    float bx, by, bz; s.position(bx, by, bz);
+    // The buff the bot has to give, for a player who holds none of the bots' buffs (the pick then skips the ones he holds).
+    uint8 bit = 0;
+    spell = Classic::PickStrangerBuff(s, 0, true, bit);
+    if (!spell) return nullptr;
+    V2::Strangers::Stranger const* t = V2::Strangers::PickBuffTarget(list, s.map_id(), s.is_alliance(), s.group_guid().GetCounter(), bx, by, kKindBuffRange, bit);
+    if (!t) return nullptr;
+    spell = Classic::PickStrangerBuff(s, t->buffs, t->has_mana, bit);
+    return spell ? t : nullptr;
+}
+
+bool KindBuffGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!KindFree(s) || s.in_combat() || s.power_pct(POWER_MANA) < 40) return false;
+    auto const list = V2::Strangers::Board::Get().Current();
+    uint32 spell = 0;
+    return list && !list->empty() && KindBuffTarget(s, *list, spell);
+}
+
+bool KindBuffFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    auto const list = V2::Strangers::Board::Get().Current();
+    uint32 spell = 0;
+    V2::Strangers::Stranger const* t = list ? KindBuffTarget(s, *list, spell) : nullptr;
+    if (!t) return false;
+    auto& board = V2::Strangers::Board::Get();
+    if (!board.cooldowns.Take(t->guid, V2::Strangers::Kind::Buff, s.published_at_ms(), Services::Config().kindness_buff_cd_ms()))
+    {
+        board.cooldown_skips.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    ObjectGuid const target = ObjectGuid::Create<HighGuid::Player>(t->guid);
+    emit.face_target(target);
+    if (!emit.cast(spell, target))
+    {
+        board.cast_fails.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    board.buffs.fetch_add(1, std::memory_order_relaxed);
+    TC_LOG_INFO("playerbot.v2", "[kindness] {} buffs a passing player (guid {}) with {}", s.name(), t->guid, spell);
+    ai.set_last_rule_fired("idle:kind_buff");
+    return true;
+}
+
+bool KindHelpGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!KindFree(s) || s.in_combat() || s.hp_pct() < 60) return false;
+    auto const list = V2::Strangers::Board::Get().Current();
+    if (!list || list->empty()) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    return V2::Strangers::PickHelpTarget(*list, s.map_id(), s.is_alliance(), s.group_guid().GetCounter(), bx, by, kKindHelpRange,
+                                         uint8(Services::Config().kindness_help_hp_pct()), uint8(s.level()), 3) != nullptr;
+}
+
+bool KindHelpFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    auto const list = V2::Strangers::Board::Get().Current();
+    if (!list) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    V2::Strangers::Stranger const* t = V2::Strangers::PickHelpTarget(*list, s.map_id(), s.is_alliance(), s.group_guid().GetCounter(), bx, by,
+        kKindHelpRange, uint8(Services::Config().kindness_help_hp_pct()), uint8(s.level()), 3);
+    if (!t) return false;
+    // The mob on him, as the bot sees it.
+    ObjectGuid const player = ObjectGuid::Create<HighGuid::Player>(t->guid);
+    NearbyUnit const* mob = nullptr;
+    for (auto const& u : s.nearby_enemies())
+        if (u.guid.IsCreature() && u.victim == player && u.hp > 0 && !u.untargetable) { mob = &u; break; }
+    if (!mob) return false;
+    auto& board = V2::Strangers::Board::Get();
+    if (!board.cooldowns.Take(t->guid, V2::Strangers::Kind::Help, s.published_at_ms(), kKindHelpCooldownMs)) return false;
+    if (!emit.start_attack(mob->guid)) return false;
+    board.helps.fetch_add(1, std::memory_order_relaxed);
+    TC_LOG_INFO("playerbot.v2", "[kindness] {} helps a player (guid {}) at {}% against {}", s.name(), t->guid, t->hp_pct, mob->entry);
+    ai.set_last_rule_fired("idle:kind_help");
+    return true;
+}
+
+bool KindRezGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!KindFree(s) || s.in_combat()) return false;
+    uint32 const rez = KindRezSpell(s.cls());
+    if (!rez || !s.knows_spell(rez) || !s.is_ready(rez) || s.power_pct(POWER_MANA) < 30) return false;
+    auto const list = V2::Strangers::Board::Get().Current();
+    if (!list || list->empty()) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    return V2::Strangers::PickRezTarget(*list, s.map_id(), s.is_alliance(), s.group_guid().GetCounter(), bx, by, kKindRezRange) != nullptr;
+}
+
+bool KindRezFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    auto const list = V2::Strangers::Board::Get().Current();
+    if (!list) return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    V2::Strangers::Stranger const* t = V2::Strangers::PickRezTarget(*list, s.map_id(), s.is_alliance(), s.group_guid().GetCounter(), bx, by, kKindRezRange);
+    if (!t) return false;
+    auto& board = V2::Strangers::Board::Get();
+    if (!board.cooldowns.Take(t->guid, V2::Strangers::Kind::Rez, s.published_at_ms(), kKindRezCooldownMs)) return false;
+    ObjectGuid const target = ObjectGuid::Create<HighGuid::Player>(t->guid);
+    emit.face_target(target);
+    if (!emit.cast(KindRezSpell(s.cls()), target)) return false;
+    static constexpr char const* kLines[] = { "rez inc", "hold on, rezzing you", "got you", "rez coming", "don't release, rezzing" };
+    emit.say_world(kLines[urand(0, uint32(std::size(kLines)) - 1)]);
+    board.rezzes.fetch_add(1, std::memory_order_relaxed);
+    TC_LOG_INFO("playerbot.v2", "[kindness] {} resurrects a player (guid {})", s.name(), t->guid);
+    ai.set_last_rule_fired("idle:kind_rez");
+    return true;
+}
+
+// ---------- idle:party_assist / idle:party_follow ----------
+// Small parties of world bots (Playerbot.World.Parties, Fleet/BotParties.h): a member joins the fight of a mate within 45 yd, and a
+// follower more than 15 yd behind its leader catches up to its place beside it. The leader pulls and picks the grind spot (the
+// follower's grind_roam and engage stand down, State_Idle.cpp engage_nearby_mob).
+constexpr float kPartyAssistRange = 45.0f;
+constexpr float kPartyKeepUp = 15.0f;
+
+bool PartyFree(BotSnapshotView const& s)
+{
+    if (!s.is_alive() || s.is_ghost() || s.is_casting() || s.in_combat() || s.raw().movement.is_mounted) return false;
+    return !s.is_in_instance() && !s.in_battleground();
+}
+
+NearbyUnit const* PartyAssistTarget(BotSnapshotView const& s, V2::Parties::Link const& l)
+{
+    float bx, by, bz; s.position(bx, by, bz);
+    for (V2::Parties::Mate const& m : l.mates)
+    {
+        if (!m.in_combat || !m.target || std::hypot(m.x - bx, m.y - by) > kPartyAssistRange) continue;
+        for (auto const& u : s.nearby_enemies())
+            if (u.guid.IsCreature() && u.guid.GetCounter() == m.target && u.hp > 0 && !u.untargetable && !u.is_pacified)
+                return &u;
+    }
+    return nullptr;
+}
+
+bool PartyAssistGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!PartyFree(s) || s.hp_pct() < 40) return false;
+    std::shared_ptr<std::unordered_map<uint64, V2::Parties::Link> const> keep;
+    V2::Parties::Link const* l = V2::Parties::LinkOf(s, keep);
+    return l && PartyAssistTarget(s, *l);
+}
+
+bool PartyAssistFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    std::shared_ptr<std::unordered_map<uint64, V2::Parties::Link> const> keep;
+    V2::Parties::Link const* l = V2::Parties::LinkOf(s, keep);
+    NearbyUnit const* mob = l ? PartyAssistTarget(s, *l) : nullptr;
+    if (!mob || !emit.start_attack(mob->guid)) return false;
+    V2::Parties::Board::Get().assists.fetch_add(1, std::memory_order_relaxed);
+    ai.set_last_rule_fired("idle:party_assist");
+    return true;
+}
+
+V2::Parties::Mate const* PartyLeader(V2::Parties::Link const& l)
+{
+    for (V2::Parties::Mate const& m : l.mates)
+        if (m.guid == l.leader) return &m;
+    return nullptr;
+}
+
+bool PartyFollowGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    if (!PartyFree(s)) return false;
+    std::shared_ptr<std::unordered_map<uint64, V2::Parties::Link> const> keep;
+    V2::Parties::Link const* l = V2::Parties::LinkOf(s, keep);
+    if (!l || l->slot == 0) return false;
+    V2::Parties::Mate const* lead = PartyLeader(*l);
+    float bx, by, bz; s.position(bx, by, bz);
+    return lead && std::hypot(lead->x - bx, lead->y - by) > kPartyKeepUp;
+}
+
+bool PartyFollowFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    std::shared_ptr<std::unordered_map<uint64, V2::Parties::Link> const> keep;
+    V2::Parties::Link const* l = V2::Parties::LinkOf(s, keep);
+    V2::Parties::Mate const* lead = l ? PartyLeader(*l) : nullptr;
+    if (!lead) return false;
+    // Its place beside the leader: 4 yd off, the first follower on one side, the second on the other.
+    float const a = l->slot == 1 ? 2.4f : -2.4f;
+    float const tx = lead->x + 4.0f * std::cos(a), ty = lead->y + 4.0f * std::sin(a), tz = lead->z;
+    uint32 const now = s.published_at_ms();
+    if (emit.move_to(tx, ty, tz) || emit.move_already_emitted(tx, ty, tz)
+        || States::ChunkedWalkToward(s, ai, emit, tx, ty, tz, "idle:party_follow", now))
+    {
+        V2::Parties::Board::Get().catchups.fetch_add(1, std::memory_order_relaxed);
+        ai.set_last_rule_fired("idle:party_follow");
+        return true;
+    }
+    return false;
+}
+
 } // anonymous namespace
 
 void RegisterAmbientRules(IdleRuleRegistry& r)
 {
+    {
+        IdleRule rule;
+        rule.name     = "idle:party_assist";
+        rule.priority = 138;   // under the kindnesses (141-143)
+        rule.gate     = &PartyAssistGate;
+        rule.fire     = &PartyAssistFire;
+        rule.min_interval_ms = 1000;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:party_follow";
+        rule.priority = 56;    // just above grind_roam (55), so a follower keeps up instead of picking its own spot
+        rule.gate     = &PartyFollowGate;
+        rule.fire     = &PartyFollowFire;
+        rule.min_interval_ms = 1500;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:kind_rez";
+        rule.priority = 143;   // above the town shows (inn rest, mailbox, duels: up to 140), below survival and upkeep
+        rule.gate     = &KindRezGate;
+        rule.fire     = &KindRezFire;
+        rule.min_interval_ms = 5000;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:kind_help";
+        rule.priority = 142;
+        rule.gate     = &KindHelpGate;
+        rule.fire     = &KindHelpFire;
+        rule.min_interval_ms = 3000;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:kind_buff";
+        // Above the town errands (133) and the town shows (inn rest 139, mailbox 138, gate duels 140): a capital resident is nearly
+        // always on one of them and would never stop for a passing player. Looked at every 5 s, so a bot walking past a player
+        // (in range for a few seconds) has a fair chance to see him; the per-player cooldown keeps it rare.
+        rule.priority = 141;
+        rule.gate     = &KindBuffGate;
+        rule.fire     = &KindBuffFire;
+        rule.min_interval_ms = 5000;
+        r.register_rule(std::move(rule));
+    }
     {
         IdleRule rule;
         rule.name     = "idle:leave_water";
@@ -1071,11 +1787,53 @@ void RegisterAmbientRules(IdleRuleRegistry& r)
         r.register_rule(std::move(rule));
     }
     {
+        // Below the shows (136-140) and the AH trip (135), above the city trip (130), the rpg visits (110) and the wander (autoact, 50): a
+        // capital resident with nothing else to do runs its errands.
+        IdleRule rule;
+        rule.name     = "idle:town_errand";
+        rule.priority = 133;
+        rule.gate     = &TownErrandGate;
+        rule.fire     = &TownErrandFire;
+        r.register_rule(std::move(rule));
+    }
+    {
         IdleRule rule;
         rule.name     = "idle:town_duel";
         rule.priority = 137;
         rule.gate     = &TownDuelGate;
         rule.fire     = &TownDuelFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:gate_duel";
+        rule.priority = 140;   // above the other town shows: the driver chose this bot and spot
+        rule.gate     = &GateDuelGate;
+        rule.fire     = &GateDuelFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:gathering";
+        rule.priority = 139;   // just under the gate duels (140): the driver chose this bot and seat
+        rule.gate     = &GatheringGate;
+        rule.fire     = &GatheringFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:grind_roam";
+        rule.priority = 55;    // just above the autoact cascade (50), which fights what is in reach and wanders
+        rule.gate     = &GrindRoamGate;
+        rule.fire     = &GrindRoamFire;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:gate_challenge";
+        rule.priority = 134;
+        rule.gate     = &GateChallengeGate;
+        rule.fire     = &GateChallengeFire;
         r.register_rule(std::move(rule));
     }
     {

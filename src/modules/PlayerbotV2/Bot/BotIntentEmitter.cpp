@@ -2,6 +2,8 @@
 #include <atomic>
 #include <mutex>
 #include "BotAI.h"
+#include "CcDeny.h"
+#include "AoeDeny.h"
 #include "BotSnapshot.h"
 #include "BotSnapshotView.h"
 #include "Log.h"
@@ -158,7 +160,7 @@ bool BotIntentEmitter::pet_attack(ObjectGuid target)
     if (uint8 const mask = pet_hold_mask(target))
         return hold_pet(target, mask);   // already held there: nothing pushed
     const bool pushed = emit(PetAttackIntent{target});
-    // PetAttack sets the pet aggressive and on `target`: any hold is over.
+    // PetAttack puts the pet on `target`: any hold is over.
     if (pushed && ai_)
     {
         ai_->raid_school().pet_hold_target = ObjectGuid::Empty;
@@ -167,8 +169,59 @@ bool BotIntentEmitter::pet_attack(ObjectGuid target)
     return pushed;
 }
 
+namespace {
+
+// The CcDeny kind of a spell: its rank in the table, else its first rank's, else (a harmful spell only) the crowd-control mechanic its
+// effects carry, so a Forever spell id missing from the table still counts.
+uint16 SpellCcKind(uint32 spell_id)
+{
+    if (uint16 const k = CcDeny::KindOfSpell(spell_id))
+        return k;
+    if (uint32 const first = sSpellMgr->GetFirstSpellInChain(spell_id); first && first != spell_id)
+        if (uint16 const k = CcDeny::KindOfSpell(first))
+            return k;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si || si->IsPositive())
+        return 0;
+    uint64 const m = si->GetAllEffectsMechanicMask();
+    auto const has = [m](Mechanics mech) { return (m & (uint64(1) << mech)) != 0; };
+    uint16 k = 0;
+    if (has(MECHANIC_FEAR) || has(MECHANIC_HORROR) || has(MECHANIC_TURN)) k |= CcDeny::Fear;
+    if (has(MECHANIC_POLYMORPH)) k |= CcDeny::Polymorph;
+    if (has(MECHANIC_BANISH))    k |= CcDeny::Banish;
+    if (has(MECHANIC_SHACKLE))   k |= CcDeny::Shackle;
+    if (has(MECHANIC_SAPPED))    k |= CcDeny::Sap;
+    if (has(MECHANIC_SLEEP))     k |= CcDeny::Sleep;
+    if (has(MECHANIC_CHARM))     k |= CcDeny::Charm;
+    return k;
+}
+
+} // namespace
+
+bool BotIntentEmitter::cc_denied(uint32 spell_id) const
+{
+    return school_snap_ && school_snap_->cc_deny && spell_id && (SpellCcKind(spell_id) & school_snap_->cc_deny) != 0;
+}
+
+bool BotIntentEmitter::aoe_denied(uint32 spell_id) const
+{
+    if (!school_snap_ || !school_snap_->aoe_denied || !spell_id)
+        return false;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si)
+        return false;
+    uint32 chain = 0;
+    for (SpellEffectInfo const& eff : si->GetEffects())
+        if (eff.IsEffect() && eff.ChainTargets > 0 && uint32(eff.ChainTargets) > chain)
+            chain = uint32(eff.ChainTargets);
+    uint32 const first = sSpellMgr->GetFirstSpellInChain(spell_id);
+    return AoeDeny::IsAoe(si->IsPositive(), si->IsAffectingArea(), chain, first ? first : spell_id);
+}
+
 bool BotIntentEmitter::pet_cast(uint32 spell_id, ObjectGuid target)
 {
+    if (owner_denied(spell_id))
+        return false;
     if (school_snap_)
     {
         SpellInfo const* si = spell_id ? sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE) : nullptr;
@@ -203,13 +256,13 @@ bool BotIntentEmitter::sync_school_hold(ObjectGuid victim)
         {
             // The held target's hint cleared (or it died and left the
             // hints): send the pet back in on the victim, or, with no
-            // victim, back to the defensive stance a pet gets on summon.
+            // victim, back to the passive stance a pet gets on summon.
             ObjectGuid const back = rs.pet_hold_target;
             if (!victim.IsEmpty() && pet_hold_mask(victim) == 0)
                 pushed_pet = pet_attack(victim);
             else
             {
-                pushed_pet = emit(HunterPetIntent{PetSetReactStateIntent{1 /*REACT_DEFENSIVE*/}});
+                pushed_pet = emit(HunterPetIntent{PetSetReactStateIntent{0 /*REACT_PASSIVE*/}});
                 if (pushed_pet)
                 {
                     rs.pet_hold_target = ObjectGuid::Empty;
@@ -437,6 +490,34 @@ static bool HasCastTime(uint32 spell_id)
     return si && si->CalcCastTime() > 0;
 }
 
+namespace
+{
+// Cat, Bear, Dire Bear, Moonkin, Travel and Aquatic Form.
+bool IsDruidShapeshiftSpell(uint32 spell_id)
+{
+    switch (spell_id)
+    {
+        case 768: case 5487: case 9634: case 24858: case 783: case 1066:
+            return true;
+        default:
+            return false;
+    }
+}
+}
+
+bool BotIntentEmitter::cast_imbue(uint32 spell_id, ObjectGuid item_guid)
+{
+    if (!ai_)
+        return emit(CastSpellOnItemIntent{spell_id, item_guid});
+    uint32 const now_ms = GameTime::GetGameTimeMS();
+    if (ai_->action_recently_tried(BotAI::ActionKind::ClassUpkeep, spell_id, now_ms))
+        return false;
+    bool const pushed = emit(CastSpellOnItemIntent{spell_id, item_guid});
+    if (pushed)
+        ai_->note_action_retry(BotAI::ActionKind::ClassUpkeep, spell_id, now_ms);
+    return pushed;
+}
+
 bool BotIntentEmitter::cast(uint32 spell_id, ObjectGuid target)
 {
     if (ai_ && ai_->mana_break_active(GameTime::GetGameTimeMS()) && HasCastTime(spell_id))
@@ -459,10 +540,18 @@ bool BotIntentEmitter::cast(uint32 spell_id, ObjectGuid target)
     // Raid school rule: an avoided school at a hinted enemy is not sent.
     if (school_blocked(spell_id, target))
         return false;
+    // The owner said no to this kind of crowd control ("@warlock no fear"), or to area spells ("aoe off").
+    if (owner_denied(spell_id))
+        return false;
     if (ai_)
     {
         const uint32 now_ms = GameTime::GetGameTimeMS();
         if (ai_->cast_recently_emitted(spell_id, now_ms))
+            return false;
+        // A bot that has just clicked a battleground flag or banner left its druid form to do it (API::use_game_object); the
+        // rotation's form rule shifted it straight back in and the next click left it again (WSG 2026-10-21: a dire bear druid
+        // "leaves form 8" three times in 7 s at a dropped flag and never took it).
+        if (IsDruidShapeshiftSpell(spell_id) && ai_->action_recently_tried(BotAI::ActionKind::BgFormHold, 0, now_ms))
             return false;
         uint32 const gcd_ms = GcdLengthMs(spell_id);
         if (gcd_ms && ai_->gcd_recently_started(now_ms))
@@ -483,13 +572,18 @@ bool BotIntentEmitter::cast_rank(uint32 spell_id, ObjectGuid target)
 {
     if (ai_ && ai_->mana_break_active(GameTime::GetGameTimeMS()) && HasCastTime(spell_id))
         return false;
-    // Same raid school gate and per-spell emit dedup as cast(); ranks have their own ids.
-    if (school_blocked(spell_id, target))
+    // Same raid school gate, crowd-control orders and per-spell emit dedup as cast(); ranks have their own ids.
+    if (school_blocked(spell_id, target) || owner_denied(spell_id))
         return false;
     if (ai_)
     {
         const uint32 now_ms = GameTime::GetGameTimeMS();
         if (ai_->cast_recently_emitted(spell_id, now_ms))
+            return false;
+        // A bot that has just clicked a battleground flag or banner left its druid form to do it (API::use_game_object); the
+        // rotation's form rule shifted it straight back in and the next click left it again (WSG 2026-10-21: a dire bear druid
+        // "leaves form 8" three times in 7 s at a dropped flag and never took it).
+        if (IsDruidShapeshiftSpell(spell_id) && ai_->action_recently_tried(BotAI::ActionKind::BgFormHold, 0, now_ms))
             return false;
         uint32 const gcd_ms = GcdLengthMs(spell_id);
         if (gcd_ms && ai_->gcd_recently_started(now_ms))

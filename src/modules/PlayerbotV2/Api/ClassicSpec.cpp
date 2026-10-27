@@ -12,6 +12,7 @@
 #include <array>
 #include <cctype>
 #include <map>
+#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <string_view>
@@ -61,7 +62,7 @@ struct ClassRules
 };
 
 constexpr std::array<ClassRules, 9> kRules = {{
-    { CLASS_WARRIOR, 71, {{
+    { CLASS_WARRIOR, 72, {{
         { 23922, 73 },   // Shield Slam
         { 12809, 73 },   // Concussion Blow
         { 23881, 72 },   // Bloodthirst
@@ -100,14 +101,14 @@ constexpr std::array<ClassRules, 9> kRules = {{
         { 17364, 263 },  // Stormstrike
         { 16166, 262 },  // Elemental Mastery
     }}},
-    { CLASS_MAGE, 64, {{
+    { CLASS_MAGE, 63, {{   // fallback: fire, the highest-damage raid spec (parity 184: fire 743, frost 523 buffed)
         { 12042, 62 },   // Arcane Power
         { 11129, 63 },   // Combustion
         { 11426, 64 },   // Ice Barrier
         { 11366, 63 },   // Pyroblast
         { 12043, 62 },   // Presence of Mind
     }}},
-    { CLASS_WARLOCK, 265, {{
+    { CLASS_WARLOCK, 267, {{
         { 18220, 265 },  // Dark Pact
         { 18265, 265 },  // Siphon Life
         { 19028, 266 },  // Soul Link
@@ -115,7 +116,7 @@ constexpr std::array<ClassRules, 9> kRules = {{
         { 17962, 267 },  // Conflagrate
         { 17877, 267 },  // Shadowburn
     }}},
-    { CLASS_DRUID, 102, {{
+    { CLASS_DRUID, 103, {{
         { 24858, 102 },  // Moonkin Form
         { 18562, 105 },  // Swiftmend
         { 17116, 105 },  // Nature's Swiftness
@@ -146,6 +147,22 @@ std::string TalentKey(std::string_view name)
         if (std::isalnum(static_cast<unsigned char>(c)))
             key.push_back(char(std::tolower(static_cast<unsigned char>(c))));
     return key;
+}
+
+// A build pick may name alternatives, "A|B": the node of the first one the client data has. The client builds differ in a few nodes
+// (70450 has Call of Thunder and Improved Fire Nova where 70532 has Elemental Mastery and Trial by Fire), and one build serves both.
+template <typename Fn>
+auto FirstTalentAlternative(std::string_view name, Fn&& lookup) -> decltype(lookup(std::string()))
+{
+    for (std::size_t from = 0;;)
+    {
+        std::size_t const bar = name.find('|', from);
+        if (auto found = lookup(TalentKey(name.substr(from, bar == std::string_view::npos ? std::string_view::npos : bar - from))))
+            return found;
+        if (bar == std::string_view::npos)
+            return {};
+        from = bar + 1;
+    }
 }
 
 std::mutex g_indexLock;
@@ -224,8 +241,9 @@ uint32 InferFromTalents(Player const* player)
             continue;
         int32 score = 0;
         for (TalentPick const& pick : build.picks)
-            if (auto itr = owned.find(TalentKey(pick.name)); itr != owned.end())
-                score += std::min<int32>(itr->second, pick.ranks);
+            if (int32 const held = FirstTalentAlternative(pick.name, [&](std::string const& key)
+                { auto itr = owned.find(key); return itr != owned.end() ? itr->second : 0; }))
+                score += std::min<int32>(held, pick.ranks);
         if (score > bestScore)
         {
             bestScore = score;
@@ -242,8 +260,24 @@ TalentNode const* FindTalent(Player const* player, std::string const& name)
     ClassTalentIndex const* index = player ? GetClassTalentIndex(player) : nullptr;
     if (!index)
         return nullptr;
-    auto itr = index->byName.find(TalentKey(name));
-    return itr != index->byName.end() ? &itr->second : nullptr;
+    return FirstTalentAlternative(name, [&](std::string const& key) -> TalentNode const*
+    {
+        auto itr = index->byName.find(key);
+        return itr != index->byName.end() ? &itr->second : nullptr;
+    });
+}
+
+std::vector<std::string> ListTalentNames(Player const* player)
+{
+    std::vector<std::string> names;
+    ClassTalentIndex const* index = player ? GetClassTalentIndex(player) : nullptr;
+    if (!index)
+        return names;
+    names.reserve(index->byName.size());
+    for (auto const& [name, node] : index->byName)
+        names.push_back(name);
+    std::ranges::sort(names);
+    return names;
 }
 
 bool IsRetailClassSpec(uint8 cls, uint32 spec)

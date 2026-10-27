@@ -11,6 +11,7 @@
 #include "BotTypes.h"
 #include "FlatIndex.h"
 #include "ObjectGuid.h"
+#include "OwnerPicks.h"
 #include "Raid/RaidOrder.h"
 #include "Quest/CompanionQuest.h"   // CompanionQuestState (companion_quest)
 #include <algorithm>
@@ -77,6 +78,9 @@ struct EquippedItem
     // is_ready(on_use_spell_id) without dragging ItemTemplate into the
     // worker thread. Used by InCombat for trinket auto-fire on cooldown.
     uint32 on_use_spell_id = 0;
+    // Remaining cooldown of that spell in ms (the item's use cooldown). The trinket's spell is not in the spellbook, so the snapshot's
+    // spell cooldown rows never carry it.
+    uint32 on_use_cd_ms = 0;
     // Stat block for the equipped item. Lets the equip-upgrade rule
     // compute score(equipped[slot]) without re-resolving the live Item*.
     ItemStatBlock stats{};
@@ -307,11 +311,18 @@ struct NearbyUnit
     // nearby_enemies). Drives the tanks' Demo refresh over a pack
     // (TankThreat::DemoMissingAround).
     int32      ap_debuff_ms = 0;
+    // A root or a snare (movement slowed) is on the unit. Hostile units (attackers + nearby_enemies).
+    bool       snared = false;
     // The unit is immune to a stun right now (template / aura mechanic
     // immunity, probed with Bash's stun effect - most raid bosses). Hostile
     // units (attackers + nearby_enemies). Keeps a bear's Bash out of the
     // interrupt rotation on such a mob (Combat/Apl/ApInterrupt.h).
     bool       stun_immune = false;
+    // The unit is immune to the warrior's Rend right now (bleed mechanic
+    // immunity, probed with Rend rank 1). Filled for warrior bots only, on the
+    // same units as stun_immune. Keeps Rend from being recast every GCD on a
+    // mob that never takes it.
+    bool       bleed_immune = false;
     Role       role = Role::Unknown;
     ObjectGuid victim;          // Who this unit is currently attacking (Empty if none).
     // For Creature units: lower 32 bits of UNIT_NPC_FLAG_* (vendor/repair/
@@ -1368,6 +1379,9 @@ struct CombatTargetsState
     // The group has more than 15 members (a 40-man raid): adds appear faster than
     // the tanks can build threat on them, so trash is never held for threat.
     bool                    big_raid = false;
+    // The bot's group is a raid group (wherever it stands). A raid in the open world (a world boss, the support scorecard) plays by the raid
+    // rules the instance maps get: threat discipline and the healers' mana-efficiency rules.
+    bool                    raid_group = false;
     // Hostile ground-effect zones around the bot (see GroundHazard).
     std::vector<GroundHazard> ground_hazards;
     // LoS to each live same-map group tank (see TankLos).
@@ -1379,6 +1393,7 @@ struct CombatTargetsState
         tank_los.clear();
         group_tank = ObjectGuid::Empty;
         big_raid = false;
+        raid_group = false;
         victim = ObjectGuid::Empty;
         current_target = ObjectGuid::Empty;
         current_target_hostile = false;
@@ -2063,6 +2078,9 @@ struct SpellbookState
     // (Overpower before a dodge, Revenge before a block, Execute above 20%).
     // Sorted ascending; BotSnapshotView::is_ready treats them as not ready.
     std::vector<uint32> aura_state_blocked;
+    // Known spells whose maximum range the bot's spell modifiers change (Flame Throwing, Arctic Reach, Grim Reach ...): the yards they add,
+    // sorted by spell id. Spell::CalcMinMaxRange applies SpellModOp::Range; a range read from the spell data alone missed it.
+    std::vector<std::pair<uint32, float>> range_bonus;
     bool                is_starter_build = false;
 
     void reset()
@@ -2072,6 +2090,7 @@ struct SpellbookState
         active_talents.clear();
         active_glyphs.clear();
         aura_state_blocked.clear();
+        range_bonus.clear();
         is_starter_build = false;
     }
 };
@@ -2685,6 +2704,15 @@ struct BotSnapshot
     // Owner "max dps" / "save mana" (BotAI::tactic_burn / tactic_save_mana), mirrored by the builder.
     bool tactic_burn = false;
     bool tactic_save_mana = false;
+    // The CcDeny kinds (CcDeny.h) this bot leaves out by its owner's order ("@warlock no fear", "off cc"), resolved by the builder
+    // from OwnerRegistry::CcDenied for the account that commands the bot. The emitter drops such a cast; MarkCc skips it.
+    uint16 cc_deny = 0;
+    // The owner's spell picks for this bot ("prefer blessing might", "pet off", "stealth off"; OwnerPicks.h), mirrored from
+    // BotAI::owner_picks by the builder. Read by the Classic upkeep picks and rotations.
+    OwnerPicks::Picks owner_picks;
+    // The owner's "aoe off" (BotAI::aoe_denied, AoeDeny.h), mirrored by the builder: the emitter drops a spell that hits more than
+    // one enemy.
+    bool aoe_denied = false;
     // (duel + quest-share + trade + summon migrated into social_events above)
     // LFG queue / role-check / proposal / vote-kick state — REFACTOR_2
     // sub-struct rollout. See LfgState above for per-field semantics.
@@ -2968,6 +2996,9 @@ struct BotSnapshot
         owner_dist = -1.0f;
         tactic_burn = false;
         tactic_save_mana = false;
+        cc_deny = 0;
+        owner_picks = {};
+        aoe_denied = false;
 
         // Sub-structs (declaration order).
         identity.reset();

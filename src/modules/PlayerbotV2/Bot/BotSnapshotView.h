@@ -25,6 +25,10 @@ public:
     bool   is_horde()    const { return s_->identity.team == 2u; }
     uint8  cls()     const { return s_->identity.cls; }
     uint32 spec()    const { return s_->identity.spec; }
+    // The owner's pick for a slot ("prefer blessing might"; OwnerPicks.h): rank-1 spell id, 0 = the bot's own plan.
+    uint32 owner_pick(OwnerPicks::Slot slot) const { return s_->owner_picks[slot]; }
+    bool   owner_pet_off() const { return s_->owner_picks.pet_off; }
+    bool   owner_stealth_off() const { return s_->owner_picks.stealth_off; }
     uint8  gender()  const { return s_->identity.gender; }
     uint32 faction() const { return s_->identity.faction; }
     ObjectGuid guid() const { return s_->guid; }
@@ -93,6 +97,8 @@ public:
     bool   is_companion_with_owner() const { return s_->owner_in_group; }
     // In a group with a player who commands it: a companion, or a world bot a player invited. Neither runs world errands.
     bool   is_led_by_player() const { return s_->owner_in_group || s_->led_by_player; }
+    // A bot of the world: no owner, not in any group, not led by a player.
+    bool   is_free_world_bot() const { return s_->owner_guid.IsEmpty() && s_->owner_name.empty() && s_->group.group_guid.IsEmpty() && !s_->led_by_player; }
     bool   no_tag_stance() const { return s_->no_tag_stance; }
     bool   holding_position() const { return s_->holding_position; }
     ObjectGuid controller_guid() const { return s_->owner_in_group ? s_->owner_guid : s_->controller_guid; }
@@ -281,6 +287,9 @@ public:
     // in_spell_range against victim_info(); true when the victim is not in the
     // snapshot lists (no distance to judge) - the API's own gate still holds.
     bool victim_in_spell_range(uint32 spell_id, float slack = 1.0f) const;
+    // The core's minimum range for a hostile cast at `t` (Spell::GetMinMaxRange): the range entry's own minimum, plus the melee range (both
+    // combat reaches + 4/3, at least 5 y) for a spell with the ranged flag. 0 when the spell has no minimum.
+    float spell_min_range(uint32 spell_id, NearbyUnit const& t) const;
     NearbyUnit const* lowest_hp_friend() const;
     NearbyUnit const* highest_threat_attacker() const;
     // First attacker in the threat list that is currently casting an
@@ -388,6 +397,7 @@ public:
     // ungrouped or no tank is on this map.
     ObjectGuid group_tank() const { return s_->combat.group_tank; }
     bool       big_raid()   const { return s_->combat.big_raid; }
+    bool       in_raid_group() const { return s_->combat.raid_group; }
     // Damage-restraint verdict for a NON-TANK group member about to damage
     // `target` (MCRaidHoldDamage): TankOpening while the tank has not yet
     // built `opening_lead` threat (or nobody has engaged the mob yet);
@@ -504,19 +514,19 @@ public:
         return seen ? lo : 100;
     }
 
-    // First trinket on-use spell that's actually ready to fire. Returns 0
-    // when the bot has no equipped on-use trinket or both are on cooldown.
-    // Trinkets live in EQUIPMENT_SLOT_TRINKET1 (13) and TRINKET2 (14); the
-    // builder pre-resolved each slot's ON_USE spell so we just probe the
-    // ready bit. InCombat fires this on cooldown to extract trinket value
-    // without per-tick ItemTemplate lookups.
-    uint32 ready_on_use_trinket() const
+    // Item entry of the first equipped trinket whose on-use spell is off cooldown; 0 when there is none. A trinket's spell is not in the
+    // spellbook, so is_ready() (which refuses an unknown spell) never passed one: no trinket of any class fired until this check
+    // (215 scorecard: no trinket in any hunter's cast list). The builder pre-resolved each slot's ON_USE spell; the cooldown is the spell's,
+    // as the core keeps an item's use cooldown under its spell. The caller uses the item (UseItemByEntry), not a spell cast.
+    uint32 ready_on_use_trinket_item() const
     {
-        constexpr uint8 TRINKET1 = 13, TRINKET2 = 14;
+        constexpr uint8 TRINKET1 = 12, TRINKET2 = 13;   // EQUIPMENT_SLOT_TRINKET1 / TRINKET2
+        if (s_->vitals.is_stunned) return 0;
         for (uint8 slot : {TRINKET1, TRINKET2})
         {
-            const uint32 sid = s_->inventory.equipped[slot].on_use_spell_id;
-            if (sid != 0 && is_ready(sid)) return sid;
+            auto const& eq = s_->inventory.equipped[slot];
+            if (eq.entry != 0 && eq.on_use_spell_id != 0 && eq.on_use_cd_ms == 0)
+                return eq.entry;
         }
         return 0;
     }

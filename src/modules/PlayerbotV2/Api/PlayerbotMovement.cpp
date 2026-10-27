@@ -633,6 +633,10 @@ void PostTeleportSnap(Player* p)
 {
     if (!p || !p->IsInWorld())
         return;
+    // A teleport is still pending (delayed or waiting for its ack): the position here is the one being left, so the probe would judge
+    // and snap the wrong place (WSG 2026-10-24: a bot's refused BG port logged an "off-mesh landing" on its Redridge spawn spot).
+    if (p->IsBeingTeleported())
+        return;
     Map* m = p->GetMap();
     if (!m)
         return;
@@ -704,7 +708,7 @@ LiquidVerdict ClassifyDestinationLiquid(Player* p, float x, float y, float z,
     if (outData)
         *outData = liq;
 
-    if (zs == LIQUID_MAP_NO_WATER)
+    if (zs == LIQUID_MAP_NO_WATER || !LiquidMattersFor(p->IsAlive()))
         return LiquidVerdict::Dry;
 
     // Magma / slime is lethal on contact regardless of depth.

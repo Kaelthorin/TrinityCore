@@ -5,6 +5,7 @@
 #include "SkyborneIsle.h"
 #include "../Util/SlowCall.h"
 #include "../Bot/Gear/BotGearGenerator.h"
+#include "../Bot/Gear/ArmorSwapGate.h"
 #include "../Bot/World/CapitalsTable.h"
 #include "../Bot/World/ZonesByLevel.h"
 #include "../Bot/World/MountsByRace.h"
@@ -409,6 +410,10 @@ bool BotSetupPipeline::DoGrantStarterKit(Player* bot)
 
 bool BotSetupPipeline::DoGenerateGear(Player* bot)
 {
+    // Not while fighting or casting: every piece would be refused (results 61 and 40, seen as equipped=0 in [GearGen]) after being stored
+    // in the bags, and the step would still count as done. Returning false keeps it open for the next pipeline tick.
+    if (!::Playerbot::Gear::CanSwapArmorNow(bot->IsInCombat(), bot->HasUnitState(UNIT_STATE_CASTING) || bot->IsNonMeleeSpellCast(false)))
+        return false;
     RollClassicRole(bot);
     Gear::GearGenerationContext ctx;
     ctx.level  = bot->GetLevel();
@@ -1017,8 +1022,21 @@ bool BotSetupPipeline::RunFor(Player* bot, uint8 target_level, StateRef* known)
         if (fn(bot)) state |= bit;
         else
         {
-            TC_LOG_WARN("playerbot.v2", "[BotSetupPipeline] step {} failed for char {} L{}",
-                        name, bot->GetName(), uint32(bot->GetLevel()));
+            // At most one line a minute per bot and step, with the number of failures since the last line: a step that waits
+            // (gear waits for the fight to end) is retried every pipeline tick.
+            static std::unordered_map<uint64, std::pair<uint32, uint32>> sFailLog;   // (char << 8 | bit) -> (last line ms, failures since)
+            uint32 const nowMs = GameTime::GetGameTimeMS();
+            if (sFailLog.size() > 8192)
+                sFailLog.clear();
+            auto& [lastMs, since] = sFailLog[(char_guid << 8) | bit];
+            ++since;
+            if (!lastMs || nowMs - lastMs >= 60000u)
+            {
+                TC_LOG_WARN("playerbot.v2", "[BotSetupPipeline] step {} failed for char {} L{} ({} failures in the last minute, in combat {})",
+                            name, bot->GetName(), uint32(bot->GetLevel()), since, int(bot->IsInCombat()));
+                lastMs = nowMs;
+                since = 0;
+            }
             // Per-bot diagnostic ring. Surfaces the same failure to /diag so
             // the GM can see which step is misbehaving without scraping
             // Server.log. No early exit — pipeline continues so other steps
@@ -1052,6 +1070,17 @@ bool BotSetupPipeline::RunFor(Player* bot, uint8 target_level, StateRef* known)
             persist(state, target_level);
             return false;
         }
+    }
+    // A bot being set up is not out in the world yet: a fight it has from its start spot (a mob of the start zone engaged before it
+    // was levelled and placed) is ended here. Placement teleports it far across the same continent, and the fight would follow:
+    // it chased a Young Thistle Boar 16 km away for good, never left combat, and the gear step waited on the fight every tick.
+    // A fight with a victim beside it is kept.
+    if (bot->IsInCombat() && (!bot->GetVictim() || !bot->IsWithinDistInMap(bot->GetVictim(), 100.0f)))
+    {
+        Unit const* victim = bot->GetVictim();
+        TC_LOG_INFO("playerbot.v2", "[BotSetupPipeline] {} L{}: setup ends a fight with {} at {:.0f} y", bot->GetName(), uint32(bot->GetLevel()),
+                    victim ? victim->GetName() : std::string("no victim"), victim ? bot->GetExactDist(victim) : -1.0f);
+        bot->CombatStopWithPets(true);
     }
     step(SetupBit::StarterKit,       [&](Player* p){ return DoGrantStarterKit(p); }, "StarterKit");
     step(SetupBit::GenerateGear,     [&](Player* p){ return DoGenerateGear(p); },   "GenerateGear");

@@ -15,6 +15,7 @@
 #pragma once
 
 #include "Bot/BotTypes.h"
+#include <array>
 #include <cstdint>
 #include <shared_mutex>
 #include <unordered_map>
@@ -117,6 +118,15 @@ public:
     // set; memory only, so a restart is back to on. Returns true when the value changed.
     bool CcEnabled(uint32 account_id) const;
     bool SetCcEnabled(uint32 account_id, bool enabled);
+
+    // The owner's crowd-control orders ("no fear", "@warlock no fear", "@mage yes sheep", "off cc"; CcDeny.h): the CcDeny kinds the
+    // bots of class `cls` leave out for this account. An order for every class (cls 0) covers each class unless that class was told
+    // "yes" since. The switch above is the marked crowd control alone (the panel's icon). Memory only, so a restart is back to all
+    // crowd control. Any thread.
+    uint16 CcDenied(uint32 account_id, uint8 cls) const;
+    void   SetCcDeny(uint32 account_id, uint8 cls, uint16 kinds, bool deny);
+    // "on cc" for every class: every order of this account is gone (the switch is SetCcEnabled's).
+    void   ClearCcDeny(uint32 account_id);
 
     // Returns the bot ids currently owned by `account_id`. Empty if none.
     // O(N) in the registry; only used by GM diagnostic commands and the
@@ -221,6 +231,13 @@ private:
     std::unordered_map<BotId, uint8>         subgroup_;   // 0-based raid sub-group
     std::unordered_map<uint32, uint8>        owner_gear_mode_;
     std::unordered_set<uint32>               cc_disabled_;
+    struct CcDenyState
+    {
+        uint16 every = 0;                    // denied for every class
+        std::array<uint16, 16> deny{};       // denied for one class (by class id)
+        std::array<uint16, 16> allow{};      // allowed for one class against `every`
+    };
+    std::unordered_map<uint32, CcDenyState>  cc_deny_;
 };
 
 } // namespace Playerbot
