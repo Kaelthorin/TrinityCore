@@ -10315,8 +10315,8 @@ bool Player::SetAmmo(uint32 itemId)
 
 void Player::AutoSelectAmmo()
 {
-    // A bot has no client to choose its ammo: it takes a stack that is drawn with a model, not the generic white-box display.
-    bool const preferDrawable = GetSession() && GetSession()->IsBot();
+    // Without a client to choose its ammo, a player takes a stack that is drawn with a model, not the generic white-box display.
+    bool const preferDrawable = m_preferDrawableAmmo;
     if (uint32 current = GetAmmoId())
         if (HasItemCount(current) && IsAmmoUsableWithRangedWeapon(sObjectMgr->GetItemTemplate(current)) &&
             (!preferDrawable || HasDrawableAmmoDisplay(sObjectMgr->GetItemTemplate(current))))
@@ -17272,7 +17272,18 @@ void Player::AdjustQuestObjectiveProgress(Quest const* quest)
                 {
                     uint32 reqItemCount = obj.Amount;
                     uint32 curItemCount = GetItemCount(obj.ObjectID, true);
-                    SetQuestObjectiveData(obj, std::min(curItemCount, reqItemCount));
+                    uint32 itemProgress = std::min(curItemCount, reqItemCount);
+
+                    // QUEST_OBJECTIVE_FLAG_PRESERVE_QUEST_ITEMS: same as Player::ItemRemovedQuestCheck, never lower
+                    // the recorded progress of such an objective (the item is meant to be consumed).
+                    if (obj.Flags & QUEST_OBJECTIVE_FLAG_PRESERVE_QUEST_ITEMS)
+                    {
+                        uint16 slot = FindQuestSlot(quest->GetQuestId());
+                        if (slot < MAX_QUEST_LOG_SIZE && GetQuestSlotObjectiveData(slot, obj) >= int32(itemProgress))
+                            break;
+                    }
+
+                    SetQuestObjectiveData(obj, itemProgress);
                 }
                 break;
             case QUEST_OBJECTIVE_HAVE_CURRENCY:
@@ -17559,6 +17570,12 @@ void Player::ItemRemovedQuestCheck(uint32 entry, uint32 /*count*/)
         QuestObjective const* objective = sObjectMgr->GetQuestObjective(objectiveItr.second.ObjectiveId);
 
         if (!quest || !objective || !IsQuestObjectiveCompletable(logSlot, quest, *objective))
+            continue;
+
+        // QUEST_OBJECTIVE_FLAG_PRESERVE_QUEST_ITEMS: these objectives are completed by using/consuming the item
+        // itself (e.g. an on-use item whose spell takes it as a reagent to fire a follow-up kill credit), so losing
+        // the item from the inventory must not roll the objective back.
+        if (objective->Flags & QUEST_OBJECTIVE_FLAG_PRESERVE_QUEST_ITEMS)
             continue;
 
         int32 newItemCount = GetItemCount(entry, false);  // we may have more than what the status shows, so we have to iterate inventory
@@ -32756,8 +32773,41 @@ int32 TraitMgr::PlayerDataAccessor::GetLevel() const
 
 int32 TraitMgr::PlayerDataAccessor::GetClassicTalentedStartLevel() const
 {
-    // Classic 1.60 Legacy perk Talented 1225474: talent points every level starting at this level instead of 10
-    return _player->GetClassicLegacyPerkAmount(1225474, EFFECT_0);
+    // Classic 1.60 Legacy perk Talented 1225474: talent points every level starting at this level instead of 10.
+    // Read from the Legacy trait config, not the aura: the aura amount stayed at the rank 1 value (9), so with Talented 5/5 the
+    // client offered 6 points at level 10, the server granted 2 and Apply Changes failed (found by krakenunbound,
+    // advocaite/TrinityCore #150). Every entry granting the perk counts: the 5 rank node's curve gives 9..5 by rank, the
+    // single rank nodes give a fixed 9, 8, 7, 6 or 5 (TraitDefinitionEffectPoints, Set); the lowest start level wins.
+    static constexpr uint32 TalentedSpellId = 1225474;
+    int32 startLevel = 0;
+    for (auto const& [configId, config] : _player->m_activePlayerData->TraitConfigs)
+    {
+        for (UF::TraitEntry const& entry : config.value.Entries)
+        {
+            int32 rank = entry.Rank + entry.GrantedRanks;
+            if (rank <= 0)
+                continue;
+
+            TraitNodeEntryEntry const* nodeEntry = sTraitNodeEntryStore.LookupEntry(entry.TraitNodeEntryID);
+            TraitDefinitionEntry const* definition = nodeEntry ? sTraitDefinitionStore.LookupEntry(nodeEntry->TraitDefinitionID) : nullptr;
+            if (!definition || uint32(definition->SpellID) != TalentedSpellId)
+                continue;
+
+            std::vector<TraitDefinitionEffectPointsEntry const*> const* points = GetTraitDefinitionEffectPointModifiers(definition->ID);
+            if (!points)
+                continue;
+
+            auto pointsForLevel = std::ranges::find(*points, 0, &TraitDefinitionEffectPointsEntry::EffectIndex);
+            if (pointsForLevel == points->end() || (*pointsForLevel)->GetOperationType() != TraitPointsOperationType::Set)
+                continue;
+
+            int32 level = int32(sDB2Manager.GetCurveValueAt((*pointsForLevel)->CurveID, float(rank)));
+            if (level > 0 && (!startLevel || level < startLevel))
+                startLevel = level;
+        }
+    }
+
+    return startLevel ? startLevel : _player->GetClassicLegacyPerkAmount(TalentedSpellId, EFFECT_0);
 }
 
 bool TraitMgr::PlayerDataAccessor::IsQuestRewarded(int32 questId) const
