@@ -1508,6 +1508,8 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // has no model: the client draws a white box for it, nocked and in flight.
         static uint32 GetAmmoDisplayId(ItemTemplate const* proto);
         static bool HasDrawableAmmoDisplay(ItemTemplate const* proto) { uint32 const id = GetAmmoDisplayId(proto); return id && id < 500000; }
+        // A player without a client to choose its ammo (a bot) sets this: AutoSelectAmmo then takes a stack that is drawn with a model.
+        void SetPreferDrawableAmmo(bool on) { m_preferDrawableAmmo = on; }
         bool NeedsAmmo() const;                             // bow, gun or crossbow equipped
         Item* GetShield(bool useable = false) const;
         Item* GetChildItemByGuid(ObjectGuid guid) const;
@@ -3327,6 +3329,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         bool m_itemUpdateQueueBlocked;
 
         uint32 m_ExtraFlags;
+        bool m_preferDrawableAmmo = false;
 
         std::atomic<float> _botCastSpeedMod{ 1.0f };
 

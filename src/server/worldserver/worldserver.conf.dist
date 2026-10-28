@@ -3364,6 +3364,24 @@ Network.SkipBuildAuthKeyCheck = 0
 Network.EnterEncryptedModeDelay = 1500
 
 #
+#    Network.ConnectionsPerIp
+#        Description: Open game connections allowed from one address. A player uses two (realm and instance). Connections
+#                     from this PC (127.0.0.1) are never limited. Raise it when many players share one internet address
+#                     (LAN party, one household).
+#        Default:     16
+#                     0 - (No limit)
+
+Network.ConnectionsPerIp = 16
+
+#
+#    Network.AuthTimeout
+#        Description: Seconds a new game connection has to log in before it is closed.
+#        Default:     60
+#                     0 - (No limit)
+
+Network.AuthTimeout = 60
+
+#
 ###################################################################################################
 
 ###################################################################################################
