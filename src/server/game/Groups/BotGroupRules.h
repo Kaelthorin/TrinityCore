@@ -40,6 +40,15 @@ namespace BotGroupRules
         return raidMap || sameSubGroup || (groupHasBot && !memberIsBot);
     }
 
+    // Nothing turns a raid back into a party, so a player who once called a fifth companion kept a raid with one or two bots left
+    // (Discord report 2026-10-27: no credit for Lieutenant Benedict with 1-2 bots until he left the group). A raid of players and bots
+    // that fits a party again goes back to one, unless someone in it is on a raid map (the instance needs the raid group).
+    inline bool RevertBotRaidToParty(bool raidGroup, bool battlegroundOrLfg, std::size_t members, std::size_t partySize, bool anyBot,
+        bool anyPlayer, bool anyOnRaidMap)
+    {
+        return raidGroup && !battlegroundOrLfg && members <= partySize && anyBot && anyPlayer && !anyOnRaidMap;
+    }
+
     struct LooterCandidate
     {
         bool inRange = false;
