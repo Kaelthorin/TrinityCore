@@ -139,18 +139,53 @@ inline Request ParseRequest(std::string_view text, std::uint32_t max_count)
     return r;
 }
 
+enum class Conjured : std::uint8_t { None, Water, Food };
+
 struct Option
 {
     std::uint32_t spell = 0;
     std::uint32_t item = 0;
     std::uint32_t yield = 1;   // items one cast makes
     std::string name;          // lower case item name
+    std::uint32_t rank = 0;    // how good the item is (required level, then item level): the better one wins a name that fits several ranks
+    std::string spell_name;    // lower case recipe name ("conjure food"), tried only when no item name fits
+    Conjured conjured = Conjured::None;   // a Conjure Water / Conjure Food rank, from the spell data (no names, so any locale)
 };
 
-// Index of the recipe that answers the request, -1 when none. A link matches by item entry; a name matches exactly, then as a prefix,
-// then as a substring (ties: shorter name, then lower spell id).
-inline int Match(Request const& request, std::span<Option const> options)
+namespace detail {
+
+// "water" / "food" in English, and the Russian words, whatever the server's locale: the item and recipe names are in the server's
+// language, so on a ruRU server "craft water" fitted nothing (Tornn, 2026-10-27). The add-on's Conjure buttons send the English words.
+// The Russian words are UTF-8 bytes (this file is Latin-1): voda/vodu, napitok/napitki; eda/edu, pishcha/pishchu, lower and capitalised.
+inline Conjured Keyword(std::string_view name)
 {
+    static constexpr std::string_view kWater[] = {
+        "water", "drink", "drinks", "\xd0\xb2\xd0\xbe\xd0\xb4\xd0\xb0", "\xd0\xb2\xd0\xbe\xd0\xb4\xd1\x83", "\xd0\x92\xd0\xbe\xd0\xb4\xd0\xb0",
+        "\xd0\x92\xd0\xbe\xd0\xb4\xd1\x83", "\xd0\xbd\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xbe\xd0\xba",
+        "\xd0\xbd\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xba\xd0\xb8", "\xd0\x9d\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xbe\xd0\xba",
+        "\xd0\x9d\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x82\xd0\xba\xd0\xb8",
+    };
+    static constexpr std::string_view kFood[] = {
+        "food", "\xd0\xb5\xd0\xb4\xd0\xb0", "\xd0\xb5\xd0\xb4\xd1\x83", "\xd0\x95\xd0\xb4\xd0\xb0", "\xd0\x95\xd0\xb4\xd1\x83",
+        "\xd0\xbf\xd0\xb8\xd1\x89\xd0\xb0", "\xd0\xbf\xd0\xb8\xd1\x89\xd1\x83", "\xd0\x9f\xd0\xb8\xd1\x89\xd0\xb0",
+        "\xd0\x9f\xd0\xb8\xd1\x89\xd1\x83",
+    };
+    for (std::string_view w : kWater)
+        if (name == w)
+            return Conjured::Water;
+    for (std::string_view w : kFood)
+        if (name == w)
+            return Conjured::Food;
+    return Conjured::None;
+}
+
+// `field` null: match by `want` (the conjured kind) instead of a name.
+inline int MatchBy(Request const& request, std::span<Option const> options, std::string Option::*field, std::uint32_t user_level,
+    Conjured want = Conjured::None)
+{
+    auto const usable = [user_level](Option const& o) { return user_level == 0 || o.rank / 1000u <= user_level; };
+    std::string const empty;
+    auto const text = [&](Option const& o) -> std::string const& { return field ? o.*field : empty; };
     int best = -1;
     int best_rank = 4;
     for (std::size_t i = 0; i < options.size(); ++i)
@@ -159,11 +194,13 @@ inline int Match(Request const& request, std::span<Option const> options)
         int rank = 4;
         if (request.item_entry)
             rank = o.item == request.item_entry ? 0 : 4;
+        else if (!field)
+            rank = o.conjured == want ? 1 : 4;
         else if (!request.name.empty())
         {
-            if (o.name == request.name) rank = 1;
-            else if (o.name.rfind(request.name, 0) == 0) rank = 2;
-            else if (o.name.find(request.name) != std::string::npos) rank = 3;
+            if (text(o) == request.name) rank = 1;
+            else if (text(o).rfind(request.name, 0) == 0) rank = 2;
+            else if (text(o).find(request.name) != std::string::npos) rank = 3;
         }
         if (rank == 4)
             continue;
@@ -171,7 +208,12 @@ inline int Match(Request const& request, std::span<Option const> options)
         if (!better && rank == best_rank)
         {
             Option const& b = options[std::size_t(best)];
-            better = o.name.size() < b.name.size() || (o.name.size() == b.name.size() && o.spell < b.spell);
+            if (usable(o) != usable(b))
+                better = usable(o);
+            else if (o.rank != b.rank && (rank != 1 || field != &Option::name))   // every rank shares its recipe name and its kind
+                better = o.rank > b.rank;
+            else
+                better = text(o).size() < text(b).size() || (text(o).size() == text(b).size() && o.spell < b.spell);
         }
         if (better)
         {
@@ -181,6 +223,26 @@ inline int Match(Request const& request, std::span<Option const> options)
     }
     return best;
 }
+} // namespace detail
+
+// Index of the recipe that answers the request, -1 when none. A link matches by item entry; a name matches exactly, then as a prefix,
+// then as a substring (ties: the better rank, then shorter name, then lower spell id). "craft water" fits every Conjure Water rank and the
+// mage gave the first one; an exact name still gets exactly that item. When no item name fits, the recipe names are tried the same way:
+// "craft food" names no conjured item (Conjured Muffin .. Conjured Cinnamon Roll) but fits every Conjure Food rank.
+// `user_level` is the requester's level (0 = any): among the items a name fits, one he is high enough to use beats a better one he
+// is not, so a level 30 player asking a level 60 mage for water gets water he can drink. "water" and "food" (and the Russian words) go
+// first to the mage's Conjure Water / Conjure Food ranks by the spell data, so they work whatever language the server's names are in.
+inline int Match(Request const& request, std::span<Option const> options, std::uint32_t user_level = 0)
+{
+    if (!request.item_entry)
+        if (Conjured const want = detail::Keyword(request.name); want != Conjured::None)
+            if (int const kind = detail::MatchBy(request, options, nullptr, user_level, want); kind >= 0)
+                return kind;
+    int const best = detail::MatchBy(request, options, &Option::name, user_level);
+    if (best >= 0 || request.item_entry || request.name.empty())
+        return best;
+    return detail::MatchBy(request, options, &Option::spell_name, user_level);
+}
 
 struct Facts
 {
@@ -188,13 +250,14 @@ struct Facts
     std::uint32_t yield = 1;           // items per cast
     std::uint32_t max_items = 0;       // config cap per order
     std::uint32_t casts_possible = 0;  // casts the bot's reagents allow right now
+    std::uint32_t carry_room = 0xFFFFFFFFu;  // more of the item the bot may hold: a unique item (max count 1) it already carries leaves 0
 };
 
 struct Plan
 {
     std::uint32_t casts = 0;
     std::uint32_t items = 0;           // casts * yield
-    char const* refusal = nullptr;     // "no_reagents" | "too_many" when nothing can be made
+    char const* refusal = nullptr;     // "no_reagents" | "too_many" | "already_carried" when nothing can be made
     bool trimmed = false;              // fewer than wanted
 };
 
@@ -208,18 +271,43 @@ inline Plan PlanOrder(Facts const& f)
         p.refusal = "too_many";
         return p;
     }
+    if (f.carry_room < yield)
+    {
+        p.refusal = "already_carried";
+        return p;
+    }
     if (f.casts_possible == 0)
     {
         p.refusal = "no_reagents";
         return p;
     }
-    std::uint32_t const wanted = std::min(f.wanted, f.max_items);
+    std::uint32_t const wanted = std::min({ f.wanted, f.max_items, f.carry_room });
     std::uint32_t const need = (wanted + yield - 1u) / yield;
-    std::uint32_t const cap = f.max_items / yield;
+    std::uint32_t const cap = std::min(f.max_items, f.carry_room) / yield;
     p.casts = std::min({ need, f.casts_possible, std::max<std::uint32_t>(cap, 1u) });
     p.items = p.casts * yield;
     p.trimmed = p.items < f.wanted;
     return p;
+}
+
+// How many more of an item the bot may hold: a unique item (max count 1, like Mana Jade) it already carries leaves none, 0 max count
+// means no limit.
+constexpr std::uint32_t CarryRoom(std::uint32_t max_count, std::uint32_t carried)
+{
+    if (max_count == 0)
+        return 0xFFFFFFFFu;
+    return max_count > carried ? max_count - carried : 0u;
+}
+
+// A finished order goes to the requester by mail, unless the item cannot travel that way: a conjured item is refused by the mail, so the
+// bot hands it over in a trade window instead. A soulbound item cannot be given away by either route.
+enum class Delivery : std::uint8_t { Mail, Trade, Bound };
+
+constexpr Delivery DeliveryFor(bool conjured, bool soulbound)
+{
+    if (soulbound)
+        return Delivery::Bound;
+    return conjured ? Delivery::Trade : Delivery::Mail;
 }
 
 } // namespace Playerbot::V2::PlayerCraft

@@ -18,6 +18,7 @@
 #include "Bot/IdleRule.h"
 #include "Group/GroupSnapshot.h"
 #include "Bot/BotAI.h"
+#include "Diagnostics/DamageParity.h"
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/ThreatDiscipline.h"            // RaidLogDue (opener pull discipline)
@@ -35,6 +36,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 
 namespace Playerbot {
 
@@ -368,10 +371,15 @@ bool OpenerFire(BotSnapshotView const& s, BotAI& ai,
     // Give up and shield the target for minutes so engage_nearby_mob /
     // assist rules don't re-pick it the moment an 8s shield lapses.
     constexpr uint32 kOpenerStallMs = 25000;
-    if (now_ms - ai.opener_victim_since_ms() > kOpenerStallMs)
+    if (now_ms - ai.opener_victim_since_ms() > kOpenerStallMs && !Diagnostics::Parity::IsDummy(vg))   // the measuring dummy is shielded by no one
     {
         emit.stop_attack();
-        ai.note_engage(vg, now_ms, 5u * 60u * 1000u);
+        // A mob the group is fighting is shielded briefly, so the bot comes back to the fight from wherever it gets to; an unreachable
+        // mob nobody fights keeps the long shield (the re-pick loop it exists for).
+        ThreatVictim const vk = vu ? ThreatVictim(vu->victim_kind) : ThreatVictim::None;
+        bool const group_fight = vu && vu->unit_in_combat &&
+            (vk == ThreatVictim::Tank || vk == ThreatVictim::Member || vk == ThreatVictim::MemberPet);
+        ai.note_engage(vg, now_ms, group_fight ? 15000u : 5u * 60u * 1000u);
         ai.set_last_rule_fired("combat:opener_give_up");
         TC_LOG_INFO("playerbot.v2",
             "[opener_give_up] bot={} victim={} unreachable for {}ms — shielded 5min",
@@ -395,12 +403,22 @@ bool OpenerFire(BotSnapshotView const& s, BotAI& ai,
             const float dist = std::sqrt(dsq);
             const float step = std::min(10.0f, dist);
             // A caster or healer is not walked into an idle pack's reach for a line of sight or a range it can find from here: the
-            // owner's Attack on a mob up a ramp took two casters up it, and the Dragonspawn beside the target came with them (line-of-sight
-            // failures on the first casts, then 10 y approach steps toward the unpulled pack). The pack of the target itself counts. The rotation keeps trying from where it stands.
+            // owner's Attack on a mob up a ramp took two casters up it, and the Dragonspawn beside the target came with them (UBRS
+            // 132f 22:15:16-22:15:26: LINE_OF_SIGHT on the first casts, then 10 y approach steps toward the unpulled Veteran, a rogue
+            // dead 4 s after the pack arrived). The pack of the target itself counts. The rotation keeps trying from where it stands.
             if (ai.effective_role(s) != Role::Tank && (IsRangedSpec(s.cls(), uint16(s.spec())) || IsHealerSpec(s.cls(), uint16(s.spec()))) &&
                 States::RaidPointInUnpulledReach(s, bx + dx / dist * step, by + dy / dist * step, bz, /*exempt_victim_pack*/ false))
             {
-                ai.reset_cast_oor();   // no step: the rotation below retries from here, the stall timer bounds the wait
+                // Not straight in, but to a spot that sees the target and stays out of the idle packs' reach: standing still
+                // here held a caster out of the group's fight until the 25 s give-up (playtest 2026-10-27, Zul'Farrak: the mage
+                // and the other casters watched while only the player and the tank hit the mobs).
+                ai.reset_cast_oor();
+                float qx, qy, qz, qr;
+                if (vu && States::SightSpotMove(s, *vu, /*melee*/ false, /*pack_safe*/ true, emit, qx, qy, qz, qr))
+                {
+                    ai.set_last_rule_fired("combat:opener_sight_spot");
+                    return true;
+                }
             }
             else
             {
@@ -540,9 +558,40 @@ bool OwnerStayGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&
     return ManualModeActive(s, ai) && ai.owner_command() == BotAI::OwnerCommand::Stay;
 }
 bool OwnerStayFire(BotSnapshotView const& s, BotAI& ai,
-                   GroupSnapshotView const&, BotIntentEmitter&, uint32)
+                   GroupSnapshotView const& g, BotIntentEmitter&, uint32)
 {
     ai.set_last_rule_fired("idle:owner_stay");
+    // A Stay that holds a bot while its group fights is how a damage dealer stands out of a boss fight: say so (once per 5 s per bot).
+    if (s.is_alive() && !s.in_combat())
+    {
+        if (auto const* members = g.members())
+            for (auto const& m : *members)
+                if (m.in_combat && m.guid != s.guid())
+                {
+                    static std::mutex sStayLogMutex;
+                    static std::unordered_map<uint64, uint32> sStayLog;
+                    uint32 const now = s.published_at_ms();
+                    bool log_now = false;
+                    {
+                        std::lock_guard<std::mutex> lock(sStayLogMutex);
+                        if (sStayLog.size() > 4096) sStayLog.clear();
+                        uint32& last = sStayLog[s.guid().GetCounter()];
+                        if (!last || now - last > 5000u) { last = now; log_now = true; }
+                    }
+                    if (ai.use_stay())
+                    {
+                        // The Stay of an object use ends when the group's fight starts, not only when the bot's own does: Halorio (hunter) stood
+                        // at the altar for 16 s of the Emberseer fight, idle under it, because the boss never turned to him (UBRS 132g 23:38).
+                        ai.clear_use_stay();
+                        ai.exit_manual();
+                        TC_LOG_INFO("playerbot.v2", "[stay_end] {} leaves the object-use Stay: {} is in combat", s.name(), m.name);
+                        return false;   // the lower rules (engage, assist) run on this tick
+                    }
+                    if (log_now)
+                        TC_LOG_INFO("playerbot.v2", "[stay_hold] {} idle under an owner Stay while {} is in combat", s.name(), m.name);
+                    break;
+                }
+    }
     return !s.is_companion_with_owner();   // see OwnerFollowFire; loot runs wait (LootDrainGate)
 }
 
@@ -565,6 +614,10 @@ bool OwnerEngageFire(BotSnapshotView const& s, BotAI& ai,
             target_in_sight = true;
             break;
         }
+    // The order's own victim is in sight whatever the 40 y enemy scan holds: the ordered mob stood 40-46 y off at Red Cloud Mesa, the order was dropped
+    // on the first tick as "mob gone" and the group went back to its formation slots instead of walking up (PC 20 Oct 21:06).
+    if (!target_in_sight && !owner_target.IsEmpty() && s.victim() == owner_target)
+        target_in_sight = true;
     if (s.is_in_dungeon() && s.is_alive() && !s.in_combat() && !s.is_casting() && ai.effective_role(s) == Role::Tank)
     {
         ObjectGuid const target = owner_target;
@@ -969,8 +1022,41 @@ bool PullBackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     for (auto const& u : s.raw().combat.attackers)      if (u.guid == p.target) { tu = &u; break; }
     if (!tu)
         for (auto const& u : s.raw().combat.nearby_enemies) if (u.guid == p.target) { tu = &u; break; }
-    if (tu && tu->hp <= 0)
-        return finish("target dead");
+    // The target died or left the scan while its pack came: the order goes on with the pack mob that is on the group, so the
+    // tank still runs the pack back to the return point. Ending the order here left the tank fighting where the pull had taken it
+    // (SFK 2026-10-20 run 4: the Black Ravager died to the opener, "target left the scan", and the tank fought the two Bleak Worgs
+    // on the balcony 9 y above the healer, out of its sight, for 42 s and died). A Hold ends as before: the tank is at the point.
+    if (p.phase != Phase::Hold && (!tu || tu->hp <= 0))
+    {
+        NearbyUnit const* next = nullptr;
+        float next_d2 = 30.0f * 30.0f;
+        auto consider = [&](NearbyUnit const& u)
+        {
+            if (u.hp <= 0 || u.guid == p.target || !u.unit_in_combat) return;
+            ThreatVictim const k = ThreatVictim(u.victim_kind);
+            if (k != ThreatVictim::Me && k != ThreatVictim::Tank && k != ThreatVictim::Member && k != ThreatVictim::MemberPet) return;
+            const float d2 = d2xy(bx, by, u.x, u.y);
+            if (d2 < next_d2) { next_d2 = d2; next = &u; }
+        };
+        for (auto const& u : s.raw().combat.attackers)      consider(u);
+        for (auto const& u : s.raw().combat.nearby_enemies) consider(u);
+        if (next)
+        {
+            TC_LOG_INFO("playerbot.v2", "[pull_back] {} target {} {}: entry {} ({}) of its pack is on the group {:.0f}y away, the order goes on with it",
+                s.name(), p.target.GetCounter(), tu ? "dead" : "left the scan", next->entry, next->guid.GetCounter(), std::sqrt(next_d2));
+            ObjectGuid const ng = next->guid;
+            float const nx = next->x, ny = next->y, nz = next->z;
+            ai.edit_pull_back([&](BotAI::PullBackPlan& q) { q.target = ng; q.tx = nx; q.ty = ny; q.tz = nz; });
+            ai.set_pull_back_phase(Phase::Retreat, now_ms);
+            if (!s.victim().IsEmpty()) emit.stop_attack();
+            if (s.is_casting()) emit.cancel_cast();
+            head_to(p.rx, p.ry, p.rz, true);
+            tag("idle:pull_back_retreat", "combat:pull_back_retreat");
+            return true;
+        }
+        if (tu)
+            return finish("target dead");
+    }
 
     // Taunt-type pull spell the class knows (melee range), else 0.
     auto melee_taunt = [&]() -> uint32
@@ -1110,12 +1196,28 @@ bool PullBackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
                         }
                     }
                 }
+                // Neither the spot nor the whole line is pathable (MC lava, 2026-10-22: the tank ran out and back without a shot):
+                // try shorter steps along the line toward the target, each its own path, before giving the approach up.
+                if (!queued && d > want + 1.0f)
+                    for (float frac : { 0.75f, 0.5f, 0.25f })
+                    {
+                        const float k = frac * (d - want) / d;
+                        const float ax = bx + (tx - bx) * k, ay = by + (ty - by) * k, az = bz + (tz - bz) * k;
+                        if (in_circle(ax, ay)) continue;
+                        if (head_to(ax, ay, az, true))
+                        {
+                            queued = true;
+                            TC_LOG_INFO("playerbot.v2", "[pull_back] {} short step {:.0f}% toward the target ({:.1f},{:.1f},{:.1f}) queued",
+                                s.name(), frac * 100.0f, ax, ay, az);
+                            break;
+                        }
+                    }
             }
             std::string why;
             if (hopeless(std::sqrt(d2xy(bx, by, sx, sy)), !queued, why))
             {
                 // Pull from where we stand if anything reaches from here; else abort.
-                bool const can_range = pick && d >= pick->min_d && d <= pick->max_d;
+                bool const can_range = pick && d >= pick->min_d && d <= pick->max_d && (!tu || tu->in_los);
                 bool const can_melee = d <= 6.0f;
                 if (!can_range && !can_melee)
                     return go_home_and_finish(why.c_str());
@@ -1128,7 +1230,7 @@ bool PullBackTick(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
         }
         if (p.stand_pull)
         {
-            bool const can_range = pick && d >= pick->min_d && d <= pick->max_d;
+            bool const can_range = pick && d >= pick->min_d && d <= pick->max_d && (!tu || tu->in_los);
             if (!can_range && d > 6.0f)
                 return go_home_and_finish("nothing reaches the target from here");
             pick = can_range ? pick : nullptr;
@@ -1269,7 +1371,7 @@ bool OwnerUseFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&,
     emit.use_game_object(o.go);
     ai.end_owner_use();
     // The Stay the command set keeps the follow from walking the bot off the object while the ritual runs; it does not outlive it. The 30 min
-    // hold pinned a rogue on the altar floor while the group fought Pyroguard Emberseer ("combat:melee_hold_hazard" with no
+    // hold pinned a rogue on the altar floor while the group fought Pyroguard Emberseer (UBRS 132f 22:25, "combat:melee_hold_hazard" with no
     // hazard in the log: the Stay, with the boss on a tank, blocks the melee chase). It ends when the bot's fight starts (DispatchInCombat); two minutes is only the backstop.
     ai.enter_manual(BotAI::OwnerCommand::Stay, ObjectGuid::Empty, now_ms, 120000u);
     ai.set_use_stay();

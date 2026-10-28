@@ -28,6 +28,7 @@
 #include "Travel/QuestHubDatabase.h"
 #include "Travel/PortalIndex.h"
 #include "Travel/UnifiedTravelGraph.h"
+#include "Travel/SoakBoard.h"
 #include "Bot/States/MaintainHelpers.h"
 #include "GameTime.h"
 #include "DB2Stores.h"
@@ -41,6 +42,76 @@
 namespace Playerbot {
 
 namespace {
+
+// ---------- idle:soak_travel ----------
+// The travel soak (Playerbot.World.TravelSoak, Fleet/WorldBotSpawner.cpp DriveTravelSoak): the world thread gives a few bots a place of the
+// travel graph (Travel/SoakBoard.h); this rule walks, flies and rides them there with the quest travel executor and reports how the leg
+// ended: arrived, timed out where it stood, or no route. Ordinary bots never have an assignment, so the gate costs one locked lookup.
+bool SoakTravelGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView const&, uint32)
+{
+    return !s.in_group() && ::Playerbot::V2::Travel::SoakBoard::Instance().Has(s.raw().guid.GetCounter());
+}
+
+bool SoakTravelFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+{
+    using namespace ::Playerbot::V2::Travel;
+    SoakBoard& board = SoakBoard::Instance();
+    uint64 const id = s.raw().guid.GetCounter();
+    SoakGoal g;
+    if (!board.Get(id, g))
+        return false;
+    float bx, by, bz; s.position(bx, by, bz);
+    uint32 const now_ms = GameTime::GetGameTimeMS();
+    uint32 const legs = uint32(ai.travel_plan().size()), leg_index = uint32(ai.travel_plan_leg_index());
+    if (SoakArrived(g, s.map_id(), bx, by))
+    {
+        board.Finish(id, SoakResult::Arrived, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+        ai.clear_travel_plan();
+        return false;
+    }
+    if (SoakTimedOut(g, now_ms))
+    {
+        board.Finish(id, SoakResult::TimedOut, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+        ai.clear_travel_plan();
+        return false;
+    }
+    // Aboard a ship or zeppelin the ride rules step the bot off at the far dock; a flight runs out by itself.
+    if (s.on_transport())
+        return false;
+    if (s.is_moving())
+    {
+        ai.set_last_rule_fired("idle:soak_travel");
+        return true;
+    }
+    ::Playerbot::States::EnsureTravelPlan(s, ai, bx, by, bz, g.map, g.x, g.y, g.z, /*quest_goal=*/false);
+    if (!ai.has_travel_plan())
+    {
+        // No plan on the goal's own map is the plain walk; no plan for another map is no route.
+        if (g.map != s.map_id())
+        {
+            board.Finish(id, SoakResult::NoRoute, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+            ai.clear_travel_plan();
+            return false;
+        }
+        // A goal past the graph's own walk reach with no plan cannot be walked in a straight line (the 105 soak
+        // wandered 1000 y off course for the full 1200 s); report it with the attach counts the router logged.
+        if (std::hypot(g.x - bx, g.y - by) > 600.0f)
+        {
+            board.Finish(id, SoakResult::NoRoute, now_ms, s.map_id(), bx, by, bz, legs, leg_index);
+            ai.clear_travel_plan();
+            return false;
+        }
+        if (::Playerbot::States::ChunkedWalkToward(s, ai, emit, g.x, g.y, g.z, "idle:soak_walk", now_ms))
+            return true;
+        return false;
+    }
+    if (::Playerbot::States::DriveTravelPlanTo(s, ai, emit, bx, by, bz, g.map, g.x, g.y, g.z, /*quest_goal=*/false))
+    {
+        ai.set_last_rule_fired("idle:soak_travel");
+        return true;
+    }
+    return false;
+}
 
 // ---------- idle:swim_stuck ----------
 bool SwimStuckGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, uint32)
@@ -1055,6 +1126,14 @@ bool InviteNearbyPlayerFire(BotSnapshotView const& s, BotAI& ai,
 
 void RegisterCoreFlowRules(IdleRuleRegistry& r)
 {
+    {
+        IdleRule rule;
+        rule.name     = "idle:soak_travel";
+        rule.priority = 863;   // under swim_stuck (870) and water_escape (865): a soak bot in the water still gets out first
+        rule.gate     = &SoakTravelGate;
+        rule.fire     = &SoakTravelFire;
+        r.register_rule(std::move(rule));
+    }
     {
         IdleRule rule;
         rule.name     = "idle:swim_stuck";

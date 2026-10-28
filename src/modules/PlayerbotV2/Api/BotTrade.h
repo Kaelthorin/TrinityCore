@@ -89,6 +89,8 @@ struct View
     std::uint64_t order_price = 0;
     bool order_item_present = false;         // the ordered item is still in the bot's bags (or already in the window)
     bool bot_has_room = true;                // the bot can store everything the player put up
+    bool has_delivery = false;               // a craft order made for this player is waiting in the bot's bags, to be handed over for free
+    bool delivery_present = false;           // that item is still in the bags (or already in the window)
 };
 
 enum class Act : unsigned char
@@ -98,6 +100,7 @@ enum class Act : unsigned char
     Cancel,         // close the window
     SetMoney,       // put `money` in the bot's side (0 clears it)
     AddOrdered,     // put the ordered item in the bot's side
+    AddDelivery,    // put the finished craft order in the bot's side
     ClearMine       // take the bot's items back
 };
 
@@ -146,6 +149,15 @@ inline std::uint64_t TotalValue(std::vector<Line> const& v)
 inline Action Decide(View const& v)
 {
     bool const he_gives = !v.his.empty();
+
+    // A finished craft order that could not go by mail: handed over for nothing when he opens a trade with nothing in it.
+    if (!he_gives && v.has_delivery && v.his_money == 0 && v.my_money == 0)
+    {
+        if (v.mine.empty())
+            return v.delivery_present ? Action{ Act::AddDelivery } : Action{ Act::Cancel, 0, Say::OrderGone };
+        if (v.his_accepted && !v.my_accepted) return { Act::Accept };
+        return {};
+    }
 
     // Sell to the player: no items from him, an order on the bot's list.
     if (!he_gives && v.has_order)

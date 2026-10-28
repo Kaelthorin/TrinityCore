@@ -82,6 +82,13 @@ struct GroupMemberSummary
     // (Player::IsResurrectRequested). The cast claim ends with the cast, so this keeps the corpse claimed until the offer is
     // taken (MC Garr 2026-10-10: Rebirth on a corpse whose offer was already up, 1057 mana for nothing).
     bool                   rez_pending      = false;
+    // The member's living pet (hunter, warlock, a druid's treants excluded: Player::GetPet only), so the healers can heal it
+    // (Classic: pets were never heal targets and died to raid AoE). Empty guid / pet_alive false: no pet out.
+    ObjectGuid             pet_guid;
+    bool                   pet_alive        = false;
+    int32                  pet_hp           = 0;
+    int32                  pet_max_hp       = 0;
+    float                  pet_x = 0.f, pet_y = 0.f, pet_z = 0.f;
     std::vector<AuraEntry> debuffs;
     // Tracked raid buffs the member currently carries. Filtered by the
     // builder to a small static allowlist (Fortitude / Mark of the Wild /
@@ -96,6 +103,10 @@ struct GroupMemberSummary
     // pull buff hold use it so a buff nobody in the group can cast is neither
     // assigned nor waited for.
     uint8                  known_class_buffs = 0;
+    // A bot paladin's owner picks ("prefer blessing might", "prefer aura fire"; OwnerPicks.h), rank-1 spell ids, 0 = none: the
+    // other paladins plan around them (PickBlessing leaves the pinned blessing out of its split, PickPaladinAura counts the aura taken).
+    uint32                 owner_blessing = 0;
+    uint32                 owner_aura     = 0;
     bool knows_class_buff(uint32 rank1_spell) const
     {
         for (size_t i = 0; i < sizeof(kGroupClassBuffSpells) / sizeof(kGroupClassBuffSpells[0]); ++i)

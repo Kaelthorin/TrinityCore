@@ -1,11 +1,14 @@
 #include "ClassicSupplies.h"
 #include "DB2Stores.h"
 #include "ItemTemplate.h"
+#include "Log.h"
 #include "ObjectMgr.h"
+#include "Player.h"
 #include "SharedDefines.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include <algorithm>
+#include <initializer_list>
 #include <array>
 
 namespace Playerbot::Classic {
@@ -45,6 +48,11 @@ constexpr SupplyRank kRebirthReagent[] = {
 
 // ---- Warlock ----
 constexpr SupplyRank kSoulShard[] = { { 6265, 10 } };
+constexpr SupplyRank kInfernalStone[]   = { { 5565, 50 } };    // Inferno
+constexpr SupplyRank kDemonicFigurine[] = { { 16583, 60 } };   // Ritual of Doom
+constexpr SupplyRank kRuneTeleport[]    = { { 17031, 20 } };   // Teleport spells
+constexpr SupplyRank kRunePortals[]     = { { 17032, 40 } };   // Portal spells
+constexpr SupplyRank kBlindingPowder[]  = { { 5530, 34 } };    // Blind
 
 // ---- Every class: vendor food and water, potions, bandages (1.12 ids) ----
 // Rank = the item's required level (bandages: the bot's First Aid at that
@@ -84,6 +92,11 @@ constexpr SupplyFamily kFamilies[] = {
     { "Gift Reagent",    CLASS_DRUID,   20, kGiftReagent },
     { "Rebirth Reagent", CLASS_DRUID,   5,  kRebirthReagent },
     { "Soul Shard",      CLASS_WARLOCK, 5,  kSoulShard },
+    { "Infernal Stone",  CLASS_WARLOCK, 5,  kInfernalStone },
+    { "Demonic Figurine", CLASS_WARLOCK, 5, kDemonicFigurine },
+    { "Rune of Teleportation", CLASS_MAGE, 10, kRuneTeleport },
+    { "Rune of Portals", CLASS_MAGE,    10, kRunePortals },
+    { "Blinding Powder", CLASS_ROGUE,   10, kBlindingPowder },
     // Open-world bots keep a small stock; raid-level (55+) bots carry what a
     // raid night needs (the owner: full potion stacks, 20 food, 40 drinks).
     { "Food",            0, 5,  kFood,          kConsumable,                     20 },
@@ -98,26 +111,48 @@ constexpr SupplyFamily kFamilies[] = {
 // Flask of the Titans 13510, Flask of Supreme Power 13512, Flask of Distilled Wisdom 13511, Elixir of Fortitude 3825,
 // Elixir of Superior Defense 13445, Elixir of the Mongoose 13452, Elixir of the Giants 9206, Greater Arcane Elixir 13454,
 // Mageblood Potion 20007, Smoked Desert Dumplings 20452, Grilled Squid 13928, Runn Tum Tuber Surprise 18254,
-// Nightfin Soup 13931, Tender Wolf Steak 18045.
+// Nightfin Soup 13931, Tender Wolf Steak 18045, Greater Fire / Frost / Nature / Shadow Protection Potion 13457 / 13456 / 13458 / 13459.
+// Stock: how many a bot is topped up to before every pull (flasks, elixirs and potions 5, food 20), so a raid night does not run them out.
 constexpr RaidConsumable kTankKit[] = {
-    { 13510, false, 2, true }, { 13445, false, 2 }, { 3825, false, 2 }, { 18045, true, 5 },
-    { 13457, false, 2, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros)
+    { 13510, false, 5, true }, { 13445, false, 5 }, { 3825, false, 5 }, { 18045, true, 20 },
+    { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
+    { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
+    { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
+    { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
 };
 constexpr RaidConsumable kMeleeKit[] = {
-    { 13452, false, 2 }, { 9206, false, 2 }, { 20452, true, 5 },
-    { 13457, false, 1, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros' Might hits 20 y round a random mana user)
+    { 13452, false, 5 }, { 9206, false, 5 }, { 20452, true, 20 },
+    { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
+    { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
+    { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
+    { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
 };
 constexpr RaidConsumable kCasterKit[] = {
-    { 13512, false, 2, true }, { 13454, false, 2 }, { 18254, true, 5 },
-    { 13457, false, 1, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros' Might hits 20 y round a random mana user)
+    { 13512, false, 5, true }, { 13454, false, 5 }, { 18254, true, 20 },
+    // Stocked, never drunk by the pre-pull picker (combat flag): Brilliant Wizard Oil goes on the main hand by idle:classic_weapon, the Major Mana
+    // Potion and the Dark / Demonic Rune by the fight's mana item rule (PickCombatManaItem).
+    { 20749, false, 5, false, true },   // Brilliant Wizard Oil: +36 spell damage, +1% spell crit on the weapon
+    { 13444, false, 5, false, true },   // Major Mana Potion
+    { 12662, false, 5, false, true },   // Demonic Rune
+    { 20520, false, 5, false, true },   // Dark Rune
+    { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
+    { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
+    { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
+    { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
 };
 constexpr RaidConsumable kHealerKit[] = {
-    { 13511, false, 2, true }, { 20007, false, 2 }, { 13931, true, 5 },
-    { 13457, false, 1, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros' Might hits 20 y round a random mana user)
+    { 13511, false, 5, true }, { 20007, false, 5 }, { 13931, true, 20 },
+    { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
+    { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
+    { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
+    { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
 };
 constexpr RaidConsumable kHunterKit[] = {
-    { 13452, false, 2 }, { 9206, false, 2 }, { 13928, true, 5 },
-    { 13457, false, 1, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros' Might hits 20 y round a random mana user)
+    { 13452, false, 5 }, { 9206, false, 5 }, { 13928, true, 20 },
+    { 13457, false, 5, false, true },   // Greater Fire Protection Potion: drunk in the fight where the boss data orders it (Ragnaros, Geddon, Onyxia, Firemaw, Vaelastrasz)
+    { 13459, false, 5, false, true },   // Greater Shadow Protection Potion: BWL Shadow Flame (Ebonroc, Flamegor, Nefarian)
+    { 13458, false, 5, false, true },   // Greater Nature Protection Potion: AQ40 Huhuran's Poison Bolt Volley
+    { 13456, false, 5, false, true },   // Greater Frost Protection Potion: Naxxramas Sapphiron
 };
 
 } // namespace
@@ -236,6 +271,29 @@ uint32 BestSupplyRank(SupplyFamily const& family, uint8 level)
     return 0;
 }
 
+uint32 VirtualRecoveryRank(bool water, uint8 cls, uint8 level)
+{
+    SupplyFamily const* f = FindSupplyFamily(water ? "Water" : "Food");
+    return f && SupplyFamilyForClass(*f, cls) ? BestSupplyRank(*f, level) : 0;
+}
+
+bool IsVirtualRecoveryItem(uint32 item, uint8 cls, uint8 level, bool& water)
+{
+    for (bool const w : { false, true })
+    {
+        SupplyFamily const* f = FindSupplyFamily(w ? "Water" : "Food");
+        if (!f || !SupplyFamilyForClass(*f, cls))
+            continue;
+        for (SupplyRank const& r : f->ranks)
+            if (r.item == item && r.min_level <= level)
+            {
+                water = w;
+                return true;
+            }
+    }
+    return false;
+}
+
 uint32 BestAmmo(uint8 kind, uint8 level)
 {
     if (kind != 1 && kind != 2)
@@ -252,6 +310,8 @@ uint32 BestAmmo(uint8 kind, uint8 level)
             {
                 // First pass: Classic-era (expansion 0) vendor-grade ammo; second pass drops the era filter
                 // in case the item data does not tag it.
+                // Ammo the client draws with a model first: the generic 1.60 ammo display is a white box (Player::HasDrawableAmmoDisplay).
+                for (int drawable = 1; drawable >= 0 && !t[k - 1][lvl]; --drawable)
                 for (int strict = 1; strict >= 0 && !t[k - 1][lvl]; --strict)
                 {
                     float bestDmg = -1.0f;
@@ -266,6 +326,8 @@ uint32 BestAmmo(uint8 kind, uint8 level)
                         if (proto.GetRequiredSkill() || proto.GetRequiredReputationFaction() || proto.GetStartQuest() || proto.GetRequiredSpell())
                             continue;
                         if (strict && proto.GetRequiredExpansion() != 0)
+                            continue;
+                        if (drawable && !Player::HasDrawableAmmoDisplay(&proto))
                             continue;
                         ItemDamageAmmoEntry const* dmgRow = sItemDamageAmmoStore.LookupEntry(proto.GetBaseItemLevel());
                         float const dmg = dmgRow ? dmgRow->Quality[proto.GetQuality()] : 0.0f;
@@ -283,6 +345,14 @@ uint32 BestAmmo(uint8 kind, uint8 level)
                 }
             }
         }
+        for (uint8 k = 1; k <= 2; ++k)
+            for (uint8 lvl : { uint8(1), uint8(10), uint8(20), uint8(40), uint8(60) })
+                if (uint32 const id = t[k - 1][lvl])
+                {
+                    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(id);
+                    TC_LOG_INFO("playerbot.v2", "[ammo_display] {} level {}: item {} display {} drawable {}", k == 2 ? "bullet" : "arrow", lvl, id,
+                        Player::GetAmmoDisplayId(proto), int(Player::HasDrawableAmmoDisplay(proto)));
+                }
         return t;
     }();
     return table[kind - 1][std::min<uint8>(level, 60)];

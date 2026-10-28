@@ -11,8 +11,11 @@
 #include "Diagnostics/PerfCounters.h"
 #include "Fleet/OwnerRegistry.h"
 #include "Fleet/BotIdentityRegistry.h"
+#include "Fleet/BotPopulationManager.h"
 #include "Services.h"
 #include "Session/BotSessionMgr.h"
+#include "Session/HumanLogin.h"
+#include "Fleet/BotAccountMgr.h"
 #include "Threading/SnapshotPublisher.h"
 #include "Util/ConfigReader.h"
 
@@ -903,11 +906,13 @@ void HandleSelfToggle(uint32 client_seq, WorldSession* sess,
             Services::Snapshots().remove(id);
             Services::Registry().unregister_bot(id);
         }
-        // Use the transient unmark so we don't accidentally DELETE a
-        // legitimate persistent marking for a headless fleet bot whose
-        // GUID happened to match. (mark_as_bot_transient only added to
-        // the in-memory set, so removing from it is the inverse.)
-        if (Services::Lifecycle().is_bot(id))
+        // The same as `.playerbot self off`: the player's own character loses the saved mark too (a summoned alt kept it, and
+        // the transient unmark here brought the bot logic back at the next login). A bot pool character keeps its database row.
+        bool const marked = Services::Lifecycle().is_bot(id);
+        HumanLoginAction const action = HumanClientAction(marked, false, marked && Services::Accounts().is_pool_account(sess->GetAccountId()));
+        if (action == HumanLoginAction::Release)
+            Services::Lifecycle().unmark_as_bot(id);
+        else if (action == HumanLoginAction::SkipThisLogin)
             Services::Lifecycle().unmark_as_bot_transient(id);
         Services::Owners().ClearOwner(id);
         // Return movement control to the WoW client — the human takes
@@ -955,7 +960,8 @@ void HandleSummon(uint32 /*client_seq*/, WorldSession* sess,
         PushEvent(sess, "warn", "0", "summon_failed", "no player on session");
         return;
     }
-    std::string const& target_name = fields[0];
+    std::string target_name = fields[0];
+    normalizePlayerName(target_name);
 
     CharacterCacheEntry const* cc = sCharacterCache->GetCharacterCacheByName(target_name);
     if (!cc)
@@ -992,10 +998,8 @@ void HandleSummon(uint32 /*client_seq*/, WorldSession* sess,
                   "alt-summon disabled on this realm");
         return;
     }
-    auto owned = Services::Owners().BotsOwnedBy(sess->GetAccountId());
-    size_t active_alts = 0;
-    for (BotId b : owned)
-        if (Services::Lifecycle().is_bot(b)) ++active_alts;
+    // This account's own characters in world as bots; companions are not alts.
+    size_t const active_alts = Services::SessionMgr().HeadlessCountOnAccount(sess->GetAccountId());
     if (active_alts >= cap)
     {
         char buf[160];
@@ -1013,6 +1017,8 @@ void HandleSummon(uint32 /*client_seq*/, WorldSession* sess,
         Services::Lifecycle().mark_as_bot(BotId(guid_low));
     Services::Owners().SetOwner(BotId(guid_low),
                                 sess->GetAccountId(), /*player_guid=*/0u);
+    // Brought to the caller and grouped once in world (its own level, spells, talents and gear are kept).
+    Services::Population().QueueCompanionSetup(BotId(guid_low), me->GetGUID().GetCounter(), uint8(::Playerbot::Role::Unknown));
 
     auto res = Services::SessionMgr().LoginBot(cc->Guid);
     if (!res.ok)
@@ -1188,10 +1194,7 @@ void HandleLoginReq(uint32 /*client_seq*/, WorldSession* sess,
                       "alt-summon disabled on this realm");
             return;
         }
-        auto owned = Services::Owners().BotsOwnedBy(sess->GetAccountId());
-        size_t active_alts = 0;
-        for (BotId b : owned)
-            if (Services::Lifecycle().is_bot(b)) ++active_alts;
+        size_t const active_alts = Services::SessionMgr().HeadlessCountOnAccount(sess->GetAccountId());
         if (active_alts >= cap)
         {
             char buf[160];

@@ -1,7 +1,7 @@
 // PoolBalance - which character the roster seeder creates next so the pool of sleeping residents is balanced between the factions
 // in every level bracket (playtest, 2026-10-11: the pool was ~94% Alliance, so no Horde was around when he quested and the Horde
 // battleground queues starved). The seeder used to flip a coin per bot; now it creates whichever (faction, bracket) is furthest
-// below the target ratio. The roster is balanced at every level, 1-9 included, and each level bracket has a cap of its own,
+// below the target ratio. 2026-10-18: the roster is balanced at every level, 1-9 included, and each level bracket has a cap of its own,
 // so a faction one player has used for hours cannot pull the roster toward it and the 60s cannot crowd out the low brackets. Pure: no game types, tested in tests/game/ClassicPoolBalance.cpp.
 
 #pragma once

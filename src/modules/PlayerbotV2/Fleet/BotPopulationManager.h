@@ -127,6 +127,10 @@ public:
     // The damage_parity scenarios (Diagnostics/DamageParity.cpp): the gear mode the bot is geared with, whoever owns it (Gear::Owned::GearMode
     // value; -1 clears the override). A scenario bot has no owner account to choose t1 / t3 for it. Thread safe.
     static void SetGearModeOverride(BotId bot, int mode);
+    // ... and the fight it gears resistance for (a SpellSchools value, GearGenerationContext::resist_school; 0 clears it). Thread safe.
+    static void SetGearResistOverride(BotId bot, uint8 school);
+    // ... and a piece it wears for the fight whatever it scores (an item entry, GearGenerationContext::wear_entry; 0 clears it). Thread safe.
+    static void SetGearWearOverride(BotId bot, uint32 entry);
 
     // An owner's choice of gear for the companions it owns (Gear::Owned::GearMode value; `gear t3` to a bot, `.bot gear t3`, the
     // panel). Refused, with the reason in `reply`, when the server does not allow the mode (Playerbot.OwnedGear.AllowedModes).
@@ -145,6 +149,13 @@ public:
     // is left as it is. A player's own character is never touched. World thread only.
     enum class RerollResult : uint8 { Done, NotNow, NotACompanion };   // NotNow: in combat or dead
     RerollResult RerollCompanionGear(Player* p, uint32& changed_slots);
+
+    // Raid resistance gear (Playerbot.Raid.ResistGear): puts the vanilla pieces with the most `school` resistance (a SpellSchools value) on a
+    // grouped companion in place of its own, where that adds resistance (Classic::ResistSwapSlot: a tank keeps its armor pieces), and with
+    // school 0 puts its own back and deletes the copies. The pieces are free stock for the raid map, like the consumable kits. Never in
+    // combat, never when the bags have no room for the replaced piece (nothing is destroyed). A player's own character is never touched.
+    // Returns the number of slots changed. World thread only.
+    uint32 SwapResistGear(Player* p, uint8 school);
 
     // One-step companion (`.bot add`). Once the newly created bot is in the world: level it to its owner, teach its
     // class trainer spells, set the requested role (a Role value; Role::Unknown keeps the class default), apply
@@ -173,6 +184,9 @@ public:
     void QueueCompanionDelete(BotId bot);
     // The owner removed this companion from the group (or it left): let go like `.bot dismiss` (goodbye, logout) on the next tick.
     void QueueCompanionRelease(BotId bot) { pending_releases_.push_back(bot); }
+    // A world bot (no owner) whose group no longer holds a player: it leaves the leftover bots-only group, hands in the quests it finished
+    // if the giver is beside it, drops the rest, and goes back to the world (grinding). Next tick, world thread.
+    void QueueLedWorldBotRelease(BotId bot) { pending_led_releases_.push_back(bot); }
 
     // One bot's step of RunGearBackfill (also RegearNow). Increments regear_count when the bot is processed.
     void BackfillOne(BotId id, Player* p, uint32 now_ms, uint32& regear_count, bool ignore_cooldown);
@@ -182,6 +196,10 @@ public:
     void CompanionUpkeep(BotId id, Player* p);
     // A hunter companion's starter pet, granted once per bot (OwnerRegistry::StarterPetGranted).
     void GrantCompanionStarterPet(BotId id, Player* p);
+    // A bot hunter of level 10+ nobody owns (world, pool and scenario bots) that has no pet, summoned, dismissed or stabled, gets a beast of its own:
+    // the setup pipeline's pet step is marked done for characters made before it existed (live DB: 423 of 925 hunters petless). Not a player's
+    // character, and not an owned companion (its pet, or its abandoned pet, is the owner's: GrantCompanionStarterPet). Logged when one is given.
+    static void EnsureBotHunterPet(Player* p);
 
     struct PendingCompanion
     {
@@ -206,6 +224,8 @@ public:
     // Companions their owner removed from the group: let go like a dismissal on the next tick (said goodbye to, logged out).
     std::vector<uint64> pending_releases_;
     void DrainCompanionReleases();
+    std::vector<uint64> pending_led_releases_;
+    void DrainLedWorldBotReleases();
     void DrainCompanionDeletes();
 
     // Bots found wearing unrenderable gear while in combat, awaiting an
@@ -308,6 +328,9 @@ public:
     void ScrubWorldGear(uint32 now_ms);
     // Owner-less bots in a battleground must not sit in a human's party / raid (their combat greys out the human's Release Spirit).
     void BgGroupHygiene(uint32 now_ms);
+    // A companion whose owner is no longer in its group (the owner left or disbanded, or a bot-led remainder survived) leaves that group and
+    // stops: it would otherwise keep following the owner's old movement or the next bot leader, and refuse a new invite as "already in a group".
+    void CompanionGroupHygiene(uint32 now_ms);
 
     // Autonomous BG seeding (audit B24): with no real player ever queueing,
     // OnPlayerJoinedBgQueue never fires, BotQueueFiller never runs, and the
@@ -386,6 +409,7 @@ private:
         uint16 bg_type = 0;
         uint32 started_ms = 0, deadline_ms = 0, last_log_ms = 0, last_poll_ms = 0, first_in_bg_ms = 0, peak_in_bg = 0;
         uint8 last_status = 0;
+        bool end_logged = false;       // the "[bgsoak] match over" line was written
         std::string result;            // the final line once Done
     } bg_soak_;
     struct BgStress { uint16 bg_type = 0; uint32 cycles_left = 0, cycle = 0, hold_ms = 60000, phase_end_ms = 0;
@@ -492,6 +516,7 @@ private:
     uint32 last_gear_backfill_ms_ = 0;
     uint32 last_gear_scrub_ms_ = 0;
     uint32 last_bg_group_hygiene_ms_ = 0;
+    uint32 last_companion_group_hygiene_ms_ = 0;
     std::unordered_map<uint32, uint32> prep_jit_ms_;   // BG instance id -> last prep-phase JIT fill (TopUpActiveBGs)
     // Sweep in progress: bots still to visit and the re-gear count so far (RunGearBackfill spends a few ms per frame).
     std::vector<BotId> gear_scan_;

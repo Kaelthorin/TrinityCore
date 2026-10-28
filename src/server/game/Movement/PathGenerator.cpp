@@ -119,16 +119,31 @@ bool PathGenerator::CalculatePath(float srcX, float srcY, float srcZ, float dest
 {
     _wetRoute = false;
     bool ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);
-    if (!ok || (_type & PATHFIND_NOPATH) || !_liquidRouteCheck || !_liquidRouteCheck(_source, _pathPoints))
+    if (!ok || (_type & PATHFIND_NOPATH) || !_liquidRouteCheck || !_liquidRouteCheck(_source, _pathPoints, CrossesWaterPolys()))
         return ok;
     _avoidWater = true;
-    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH) && !_liquidRouteCheck(_source, _pathPoints);
+    bool const dry = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest) && !(_type & PATHFIND_NOPATH)
+        && !_liquidRouteCheck(_source, _pathPoints, CrossesWaterPolys());
     _avoidWater = false;
     if (dry)
         return true;
     ok = CalculatePathImpl(srcX, srcY, srcZ, destX, destY, destZ, forceDest);   // restore the first route
     _wetRoute = true;
     return ok;
+}
+
+// The start polygon is where the source stands: a source leaving the water must be able to start.
+bool PathGenerator::CrossesWaterPolys() const
+{
+    if (!_navMesh)
+        return false;
+    for (uint32 i = 1; i < _polyLength; ++i)
+    {
+        unsigned short flags = 0;
+        if (dtStatusSucceed(_navMesh->getPolyFlags(_pathPolyRefs[i], &flags)) && (flags & NAV_WATER))
+            return true;
+    }
+    return false;
 }
 
 bool PathGenerator::CalculatePathImpl(float srcX, float srcY, float srcZ, float destX, float destY, float destZ, bool forceDest)

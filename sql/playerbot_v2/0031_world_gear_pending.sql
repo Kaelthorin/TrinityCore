@@ -1,6 +1,6 @@
 -- Migration: 0031_world_gear_pending
 -- Date:    2026-10-18
--- Purpose: World bots made before this change wear a generated full set at level 1-9 (a level 1 wore rings, trinkets, neck and cloak). New world bots
+-- Purpose: World bots made before build 109 wear a generated full set at level 1-9 (a level 1 wore rings, trinkets, neck and cloak). New world bots
 --          under level 10 keep the outfit their character was created with. Each existing world bot under level 10 is marked here; the world
 --          spawner strips it to its starter outfit once, on its next login, and clears the mark.
 --

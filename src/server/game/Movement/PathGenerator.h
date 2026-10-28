@@ -76,7 +76,8 @@ class TC_GAME_API PathGenerator
 
         // Optional check (set by a module): returns true when `source` should keep out of liquid and `path` touches liquid.
         // CalculatePath then searches a land-only route and keeps it when it is dry, else keeps the first route (IsWetRoute).
-        using LiquidRouteCheck = bool(*)(WorldObject const* source, Movement::PointsArray const& path);
+        // `waterPolys`: the corridor runs over navmesh water polygons past its first one (the liquid probes miss some of them).
+        using LiquidRouteCheck = bool(*)(WorldObject const* source, Movement::PointsArray const& path, bool waterPolys);
         static void SetLiquidRouteCheck(LiquidRouteCheck check) { _liquidRouteCheck = check; }
         bool CalculatePath(float destX, float destY, float destZ, bool forceDest = false);
         bool IsInvalidDestinationZ(WorldObject const* target) const;
@@ -113,6 +114,7 @@ class TC_GAME_API PathGenerator
     private:
 
         dtPolyRef _pathPolyRefs[MAX_PATH_LENGTH];   // array of detour polygon references
+        bool CrossesWaterPolys() const;
         uint32 _polyLength;                         // number of polygons in the path
 
         Movement::PointsArray _pathPoints;  // our actual (x,y,z) path to the target

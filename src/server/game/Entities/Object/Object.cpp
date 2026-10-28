@@ -2026,6 +2026,12 @@ SpellMissInfo WorldObject::SpellHitResult(Unit* victim, SpellInfo const* spellIn
     if (spellInfo->HasAttribute(SPELL_ATTR3_ALWAYS_HIT))
         return SPELL_MISS_NONE;
 
+    // A playerbot raid tank's taunt lands (ThreatManager::SetTauntNeverMisses): immunity and reflect above still apply.
+    if (Unit const* caster = ToUnit())
+        if (caster->GetThreatManager().GetTauntNeverMisses() &&
+            (spellInfo->HasAura(SPELL_AURA_MOD_TAUNT) || spellInfo->HasEffect(SPELL_EFFECT_ATTACK_ME)))
+            return SPELL_MISS_NONE;
+
     switch (spellInfo->DmgClass)
     {
         case SPELL_DAMAGE_CLASS_RANGED:

@@ -408,5 +408,7 @@ void RegisterBlackwingMovement(RaidRules& rules);
 void RegisterOnyxia(RaidRules& rules);
 void RegisterNaxxramas(RaidRules& rules);
 void RegisterTempleOfAhnQiraj(RaidRules& rules);
+void RegisterRuinsOfAhnQiraj(RaidRules& rules);
+void RegisterZulGurub(RaidRules& rules);
 
 } // namespace Playerbot::Raid

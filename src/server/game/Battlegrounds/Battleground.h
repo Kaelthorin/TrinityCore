@@ -366,6 +366,21 @@ class TC_GAME_API Battleground
         {
             return thisTeamPlayers < maxPlayersPerTeam ? maxPlayersPerTeam - thisTeamPlayers : 0u;
         }
+        // A waiting real player's team is full of bots but none can leave this moment (all in combat or carrying a flag): the player waits
+        // for one to become free instead of a second instance being opened. False when the places can be made now, or when the team is
+        // mostly real players and there is nobody to swap.
+        static constexpr bool WaitForBotToFree(uint32 placesToMake, uint32 evictableNow, uint32 botsOnTeam)
+        {
+            return placesToMake > evictableNow && botsOnTeam >= placesToMake;
+        }
+        // The shortfall minus the bots an earlier top-up already created or reused for this side that have not queued yet (their setup is
+        // still running). WSG 2026-10-21: one player's queue opened ten instances, because every 20 s prep tick asked again for places
+        // the bots in setup were about to take, and the surplus formed new battlegrounds.
+        static constexpr uint32 TopUpAfterInFlight(uint32 thisTeamPlayers, uint32 maxPlayersPerTeam, uint32 inFlight)
+        {
+            uint32 const request = TopUpRequest(thisTeamPlayers, maxPlayersPerTeam);
+            return request > inFlight ? request - inFlight : 0u;
+        }
 
         bool isArena() const;
         bool isBattleground() const;

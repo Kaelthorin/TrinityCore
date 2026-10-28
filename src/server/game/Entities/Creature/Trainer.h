@@ -95,6 +95,8 @@ namespace Trainer
         // class skill lines name; all classes when the data does not say. Some Forever class spells (Paladin Judgement, Seal of Righteousness) carry no
         // class restriction of their own, so IsSpellFitByClassAndRace lets them through for any class: the trainer decides.
         uint32 GetClassMask() const;
+        // Why TeachAvailableSpellsFree would not teach `spellId` to this player, in the order it checks ("would be taught" when it would).
+        std::string DescribeFreeTeachRefusal(Player const* player, uint32 spellId) const;
 
     private:
         Spell const* GetSpell(uint32 spellId) const;

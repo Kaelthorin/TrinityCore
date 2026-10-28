@@ -34,6 +34,11 @@ public:
     // command needs to run, and by tests that bypass the prefix layer.
     static bool DispatchSingle(Player* sender, Player* bot_player, std::string const& msg, char const* via = "whisper");
 
+    // The owner's crowd-control orders ("no fear", "@warlock no fear", "@mages no sheep", "yes sheep", "off cc", "on cc"; CcDeny.h):
+    // when `line` is one, stores it for the sender's account (OwnerRegistry::SetCcDeny, the marked-CC switch for "off cc" / "on cc"),
+    // answers the sender once and returns true. The bots pick it up with their next snapshot. World thread.
+    static bool ApplyCcOrder(Player* sender, std::string const& line, char const* via);
+
     // May `sender` give this bot a group order (the panel, a party / raid line)? Its owner, or for a bot with no owner a player
     // who is its controller in the group they share (GroupControl.h): the group leader when human, else the first human
     // member. An invited world bot obeys the leader exactly like a companion.

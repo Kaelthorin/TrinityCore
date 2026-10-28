@@ -47,6 +47,7 @@
 #include <vector>
 
 class Player;
+class Unit;
 
 namespace Playerbot {
 
@@ -68,6 +69,10 @@ public:
         auto it = orders_.find(bot_guid_low);
         return it == orders_.end() ? nullptr : &it->second;
     }
+
+    // Damage a player (or its pet) did to a creature, tallied per player for the [raid_dps] line. From Module::OnDamageTaken on the
+    // map's thread; takes its own lock.
+    static void NoteDamageDone(Unit* attacker, Unit* victim, int32 amount);
 
     // Human-readable plan dump for `.playerbot pvecoord`.
     std::string DebugDump() const;
@@ -111,6 +116,8 @@ private:
         std::unordered_map<uint64, int64> mob_hp;
         uint64 dmg_total = 0;
         uint32 dmg_last_ms = 0;
+        // Mana % of each member when the pull started, for the [raid_dps] line.
+        std::unordered_map<uint64, int32> start_mana;
     };
 
     // Raid tank -> mob assignment for one (group, map) bucket, the generic

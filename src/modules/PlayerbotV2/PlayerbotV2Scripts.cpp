@@ -7,11 +7,13 @@
 // worker threads read the maps, so the module must not tick while they update), Shutdown with the world.
 
 #include "PlayerbotV2.h"
+#include "LfgBotFill.h"
 #include "Config.h"
 #include "DB2Stores.h"
 #include "Group.h"
 #include "Guild.h"
 #include "Item.h"
+#include "ObjectAccessor.h"
 #include "GameTime.h"
 #include "Log.h"
 #include "PathGenerator.h"
@@ -39,7 +41,7 @@ bool IsHuman(Player const* player)
 
 // PathGenerator::LiquidRouteCheck: a bot in a capital keeps out of canals (module liquid policy, PathLiquid.h). Sampling is along
 // the whole path, not only its corners.
-bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArray const& path)
+bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArray const& path, bool waterPolys)
 {
     using namespace Playerbot::BotMovement;
     if (!g_LiquidPathPolicy)
@@ -49,6 +51,9 @@ bool BotPathTouchesAvoidedLiquid(WorldObject const* source, Movement::PointsArra
         return false;
     if (g_LiquidPathPolicy(player) == LiquidPolicy::None)
         return false;
+    // The navmesh marks its own water polygons; the point probe below can miss them (Stormwind's canal water lies level with the quay).
+    if (waterPolys)
+        return true;
     std::vector<PathPoint> pts;
     pts.reserve(path.size());
     for (G3D::Vector3 const& v : path)
@@ -99,6 +104,12 @@ public:
 
     void OnLogin(Player* player, bool /*firstLogin*/) override
     {
+        if (player->GetSession() && player->GetSession()->IsBot())
+        {
+            // A bot has no client to choose its ammo: it takes a stack that is drawn with a model, not the generic white box.
+            player->SetPreferDrawableAmmo(true);
+            player->AutoSelectAmmo();
+        }
         Module::instance().OnPlayerLogin(player);
     }
 
@@ -179,6 +190,14 @@ public:
             Module::instance().OnYellChat(player, msg);
     }
 
+    // General, Trade and LookingForGroup: world bots answer a player's LFM / LFG / WTB line or question. Read only, before the
+    // line is sent; the answers come a few seconds later.
+    void OnChat(Player* player, uint32 type, uint32 /*lang*/, std::string& msg, Channel* channel) override
+    {
+        if (type == CHAT_MSG_CHANNEL && channel)
+            Module::instance().OnChannelChat(player, channel, msg);
+    }
+
     void OnChatSent(Player* player, uint32 /*type*/, uint32 /*lang*/, std::string const& msg, Player* receiver) override
     {
         Module::instance().OnWhisperReceived(player, receiver, msg);
@@ -191,11 +210,13 @@ public:
         {
             case CHAT_MSG_PARTY:
             case CHAT_MSG_PARTY_LEADER:
-            case CHAT_MSG_RAID:
-            case CHAT_MSG_RAID_LEADER:
             case CHAT_MSG_INSTANCE_CHAT:
             case CHAT_MSG_INSTANCE_CHAT_LEADER:
-                Module::instance().OnPartyChat(player, group, msg);
+                Module::instance().OnPartyChat(player, group, msg, /*raid_chat=*/false);
+                break;
+            case CHAT_MSG_RAID:
+            case CHAT_MSG_RAID_LEADER:
+                Module::instance().OnPartyChat(player, group, msg, /*raid_chat=*/true);
                 break;
             default:
                 break;
@@ -263,6 +284,25 @@ public:
             Module::instance().OnPlayerJoinedLfg(player, dungeonId, roles);
     }
 
+    // A player posted or removed a Group Finder listing: bots fill the group if nobody joins in time.
+    void OnGroupFinderListing(Player* player, uint32 categoryId, std::vector<uint32> const& activities, bool listed) override
+    {
+        if (IsHuman(player))
+            Playerbot::V2::LfgListingChanged(player, categoryId, activities, listed);
+    }
+
+    // A player invited a member of a bot group listed in the Group Finder: that is their sign-up.
+    bool OnGroupFinderJoinRequest(Player* member, Player* applicant) override
+    {
+        return Playerbot::V2::LfgBotGroupJoinRequest(member, applicant);
+    }
+
+    // A player searched the Group Finder list: a faction without a bot group gets one now, so the first search already shows it.
+    void OnGroupFinderSearch(Player* searcher) override
+    {
+        Playerbot::V2::LfgBotGroupsOnSearch(searcher);
+    }
+
     // Bots accept a proposal well inside the proposal time instead of waiting for the snapshot poll.
     void OnLfgProposal(Player* player, uint32 proposalId) override
     {
@@ -280,6 +320,11 @@ public:
         Module::instance().NoteDamageSpell(spellInfo ? spellInfo->Id : 0);
     }
 
+    void OnHitOutcome(Unit* attacker, Unit* victim, uint32 spellId, uint8 outcome, uint32 damage) override
+    {
+        Module::instance().OnHitOutcome(attacker, victim, spellId, outcome, damage);
+    }
+
     void OnDamage(Unit* attacker, Unit* victim, uint32& damage) override
     {
         Module::instance().OnDamageTaken(attacker, victim, int32(damage), 0);
@@ -290,6 +335,11 @@ public:
         if (attacker && victim && victim->GetTypeId() == TYPEID_UNIT)
             if (Player* dealer = attacker->GetCharmerOrOwnerPlayerOrPlayerItself())
                 Playerbot::Raid::DealtHit(victim->GetEntry(), victim->GetName().c_str(), dealer->GetGUID().GetCounter(), damage);
+    }
+
+    void OnHealOutcome(Unit* healer, Unit* target, uint32 spellId, uint32 raw, uint32 effective) override
+    {
+        Module::instance().OnHealOutcome(healer, target, spellId, raw, effective);
     }
 
     // Raid mana ledger: healing that landed (the core passes the effective gain, overheal already removed).
@@ -314,6 +364,12 @@ public:
     void OnSubgroupChange(Group* group, ObjectGuid guid, uint8 subgroup) override
     {
         Module::instance().OnRaidSubgroupChanged(group, guid, subgroup);
+    }
+
+    // A bot that joins a group has the riding and mount its level allows (a world bot a player invited rides with him).
+    void OnAddMember(Group* group, ObjectGuid guid) override
+    {
+        Module::instance().OnGroupMemberJoined(group, ObjectAccessor::FindConnectedPlayer(guid));
     }
 
     // Before the member is taken out: an owner who removes a companion (or a companion that leaves) lets it go.

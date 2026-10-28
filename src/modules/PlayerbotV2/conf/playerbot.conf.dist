@@ -120,6 +120,11 @@ Playerbot.Population.Shape = MaxHeavy
 # HR-yes
 Playerbot.Population.MaxHeavyFactor = 0.40
 
+# How far above TotalTarget the pool of bot characters may grow (at least 1.0). A pool whose characters do not
+# fit the level / faction buckets (only Horde, too few level 60s) can only be completed by creating more.
+# HR-yes
+Playerbot.Population.SpawnCapFactor = 1.10
+
 #-----------------------------------------------------------------------------
 # World bots around real players (proximity spawner, Fleet/WorldBotSpawner)
 #-----------------------------------------------------------------------------
@@ -147,6 +152,10 @@ Playerbot.World.ActivityRadius = 300
 # zone. Bots are placed at quest hubs within ActivityRadius, so a bigger radius spreads a zone crowd over the zone.
 Playerbot.World.CityBots = 0
 Playerbot.World.ZoneBots = 0
+# The same in a start zone (Mulgore, Durotar, Elwynn, ...): one valley and one camp, so no more than this many world bots there (0 = ZoneBots).
+# A valley has a few dozen mobs on a slow respawn: 50 bots left a new character in Deathknell nothing to kill, 8 looked empty.
+# Only bots at the start levels (1-10) of the races that begin there are placed or kept in a start zone.
+Playerbot.World.StartZoneBots = 25
 
 # Spawn rate (bots per spawner tick) while the player is in a capital; 0 = SpawnPerTick. Fills a city faster.
 Playerbot.World.CitySpawnPerTick = 0
@@ -173,6 +182,21 @@ Playerbot.World.SpawnPerTick = 2
 Playerbot.World.DespawnPerTick = 5
 # A freshly placed bot is not logged out for this long (s).
 Playerbot.World.PlacedGraceSec = 30
+# A player riding (or running) faster than Moving.MinSpeed (yards per second, smoothed over about 2 s; a 60% mount is
+# 11.2, a run 7) gets a bubble along his heading: only bots in a corridor from BehindYards behind him to ActivityRadius
+# ahead, CorridorYards to each side, count toward his target; new bots are put LeadMin to LeadSec seconds of his travel
+# ahead of him; sleeping residents on the road ahead wake first; the spawn rate is SpawnFactor times higher (at most 8 a
+# pass unless SpawnPerTick is higher already); and bots more than DespawnBehindYards behind him that are in nobody's
+# bubble log out (0 = only DespawnRadius). Not in a capital or a start zone, and not on a flight path.
+# Enable = 0: the bubble is always the circle.
+Playerbot.World.Moving.Enable = 1
+Playerbot.World.Moving.MinSpeed = 9
+Playerbot.World.Moving.BehindYards = 150
+Playerbot.World.Moving.CorridorYards = 250
+Playerbot.World.Moving.LeadSec = 25
+Playerbot.World.Moving.LeadMin = 130
+Playerbot.World.Moving.SpawnFactor = 2
+Playerbot.World.Moving.DespawnBehindYards = 450
 # Share (%) of bots placed in a town (capital) that stay there for 20-40 min, using trainers, AH, bank and vendors.
 Playerbot.World.TownPct = 100
 # World-wide filler: 1 = the MaxBots budget not needed for the bubble around players is filled with bots all over
@@ -219,13 +243,112 @@ Playerbot.World.SeedInFlight = 8
 # pool still lacks.
 Playerbot.World.PoolHordePct = 50
 
-# Bots arrive on foot from out of the player's sight instead of appearing in view, and a bot the spawner retires in view walks to the
-# nearest inn (or away) and logs out once unseen (at most a minute). 0 = appear and vanish where they stand.
+# Bots arrive on foot from out of the player's sight instead of appearing in view, and a bot the spawner retires in view walks out of
+# sight (to the city gate in a capital, else to a place away from the player he cannot see, else the nearest inn) and logs out once
+# unseen (at most a minute). 0 = appear and vanish where they stand.
 Playerbot.World.NaturalMoves = 1
+# Idle watch: a world bot standing this many seconds with no reason (not fighting, eating, resting, grouped...) is given something to do:
+# a short walk first, then a walk to a hub. In a capital Playerbot.World.Town.IdleSec applies instead.
+Playerbot.World.IdleSec = 30
+# Out-of-sight swap: a world bot the idle watch has found standing IdleSwapStrikes times running, where no player can see it, is placed
+# again around the player (out of his sight) and walks in. A bot in view is never swapped. At most once per IdleSwapCooldownSec a bot.
+Playerbot.World.IdleSwap = 1
+Playerbot.World.IdleSwapStrikes = 2
+Playerbot.World.IdleSwapCooldownSec = 180
 
 # Town life: a share of the bots rest at the inn (most at night), pairs duel in towns, a few light a campfire outdoors at night, and some
 # call LFG for a dungeon of their level. No bot is created for it and a bot joins a dungeon only when a real player invites it. 0 = off.
 Playerbot.World.TownLife = 1
+
+# Town errands: a capital's residents run from place to place across the city (the auction house, the bank, their class trainer, the
+# inn, a mailbox, the flight master, a vendor, now and then the city gate), stop there LingerMinSec..LingerMaxSec facing the NPC and run
+# on to the next. Each walk is one pathed move, so they run smooth lines through the streets instead of short hops with a stop and a turn.
+# 0 = off (the old NPC-to-NPC visits within 60 yards and the random wander).
+Playerbot.World.Town.Errands = 1
+# How far across the city (yards) the next place may be.
+Playerbot.World.Town.ErrandRadius = 300
+Playerbot.World.Town.LingerMinSec = 4
+Playerbot.World.Town.LingerMaxSec = 12
+# Crowd caps: bots at one place at once (a bank, an auction house, a trainer), at one inn (resting or on an errand) and at one mailbox.
+# A bot that finds a place full goes somewhere else. InnCap = 0 or MailboxCap = 0 turns that show off.
+Playerbot.World.Town.SpotCap = 5
+Playerbot.World.Town.InnCap = 4
+Playerbot.World.Town.MailboxCap = 2
+# The share of the city's bots that rest at the inn (8% by day, 20% in the evening, 35% at night) is scaled by this percent.
+Playerbot.World.Town.InnSharePct = 50
+# 1 = the city gate is one of the places (once the gate-duel driver has found it).
+Playerbot.World.Town.Exits = 1
+# 1 = in a capital any walk of up to SmoothWalkYards is one pathed move instead of 35-yard chunks that each end in a stop.
+Playerbot.World.Town.SmoothWalk = 1
+Playerbot.World.Town.SmoothWalkYards = 200
+# A standing bot (at an errand or resting at the inn) that a real player stands within PlayerNudgeYards of for PlayerNudgeSec moves on.
+Playerbot.World.Town.PlayerNudgeYards = 5
+Playerbot.World.Town.PlayerNudgeSec = 6
+# A bot in a capital standing this long with no reason gets a new errand (elsewhere the idle watch waits 45 s).
+Playerbot.World.Town.IdleSec = 20
+
+# Questing of the world's bots. 0 (default): they do not pick up or do quests on their own; they level by killing the mobs of their level
+# (walking to where such mobs stand when none is near), stand around inns and flight masters, duel and chat. Companions (bots grouped
+# with a player) still quest with him: they accept the quests he shares, do the objectives beside him and hand in with him.
+# 1: the old behaviour, world bots walk to quest hubs, take quests and do them.
+Playerbot.World.Questing = 0
+
+# Small kindnesses of world bots for real players they pass: a priest's Fortitude, a mage's Intellect (mana users) or a druid's Mark
+# on a player who lacks it (one per player per BuffCooldownSec, whoever gives it), a hand against the mob of a player at or under
+# HelpHpPct health (once per player per 3 minutes), and a resurrection for a player lying dead, not released, next to a priest,
+# paladin or shaman, in the open world and in the capitals alike. Lines in Playerbot.log start with [kindness]; the [world] line counts
+# them (kindness players= real players listed, buffs/helps/rezzes given, cooldown_skips, cast_fails). Enable = 0 switches all of it off.
+Playerbot.World.Kindness.Enable = 1
+Playerbot.World.Kindness.BuffCooldownSec = 900
+Playerbot.World.Kindness.HelpHpPct = 40
+
+# Leave real players their mobs: a world bot (no owner, not led by a player) does not open on a mob within CampRadius yards of a real
+# player it is not grouped with, nor, while that player is within QuestRadius yards, on a mob his open kill or collect quests need. It
+# also skips a grind spot a player stands in. Mobs that attack the bot are still fought. Counters in the [world] line (share_mobs).
+# Enable = 0 switches it off.
+Playerbot.World.ShareMobs.Enable = 1
+Playerbot.World.ShareMobs.CampRadius = 35
+Playerbot.World.ShareMobs.QuestRadius = 120
+# Small parties: about Pct percent of the world bots (no owner, not grouped, out of the cities) team up in twos or threes (MaxSize 2-3)
+# with a bot of their faction within 60 yards and 3 levels, travel and fight together for about LifeMin minutes, then go their own
+# ways. The higher level leads and pulls; the others keep up with it and join any fight a mate is in. No game group is made, so the
+# bots stay world bots for the spawner. Counters in the [world] line (parties). Enable = 0 switches it off.
+Playerbot.World.Parties.Enable = 1
+Playerbot.World.Parties.Pct = 30
+Playerbot.World.Parties.MaxSize = 3
+Playerbot.World.Parties.LifeMin = 15
+# Gate duels: while a real player stands within Radius yards of a capital's gate (Stormwind, Ironforge, Darnassus, Orgrimmar, Thunder
+# Bluff, Undercity), up to PairsPerGate pairs of same-faction world bots of about one level duel on the road outside it, with a few
+# onlookers. They use the game's own duel request, so the duel flag and rules apply; after a duel the pair sits out and others take
+# over. The gate is found from the navmesh as the first point outside the city on the road to the next town ("[gate_duel] <city> gate
+# found" in the log). With the keys on, an idle world bot within 10 levels accepts a real player's duel request, and now and then an
+# idle bot near a gate asks a player of about its level for one (ChallengePlayers), each player at most once per ChallengeCooldownSec.
+# Enable = 0 switches all of it off (a player's duel request is then answered as before: about one time in three within 5 levels).
+Playerbot.World.GateDuels.Enable = 1
+Playerbot.World.GateDuels.PairsPerGate = 3
+Playerbot.World.GateDuels.Radius = 80
+Playerbot.World.GateDuels.ChallengePlayers = 1
+Playerbot.World.GateDuels.ChallengeCooldownSec = 600
+# PairsPerGate is for Orgrimmar, Ironforge and Stormwind, where the crowds were; Darnassus, Thunder Bluff and Undercity get
+# SmallCityPairs (0 = no duels there).
+Playerbot.World.GateDuels.SmallCityPairs = 1
+# Gatherings outside the gates (needs GateDuels.Enable, which finds the gates): while a real player of that side is within Radius
+# yards of the gate of Orgrimmar, Ironforge or Stormwind (all six with AllCities = 1), up to BotsPerGate world bots (3-12) gather a
+# little way off the road: about half sit in a ring round a campfire, the rest stand together. Now and then two or three of a ring talk
+# in /say, one line every 6-14 seconds, a short exchange, then about TalkGapSec seconds of quiet. With Playerbot.ChatModel.Enable = 1
+# and UseChatModel = 1 the lines come from the chat model (at most ChatModelPerMinute requests a minute for all gatherings together,
+# and only while the model's queue has room, so whispers to bots come first); otherwise, or when the model is busy, from a set of
+# written exchanges. After about StayMin minutes a ring breaks up and other bots take the places. Campfire = 0: no fire. The log
+# shows "[gathering]" lines. Enable = 0 switches it off.
+Playerbot.World.Gathering.Enable = 1
+Playerbot.World.Gathering.BotsPerGate = 8
+Playerbot.World.Gathering.Radius = 90
+Playerbot.World.Gathering.AllCities = 0
+Playerbot.World.Gathering.StayMin = 10
+Playerbot.World.Gathering.TalkGapSec = 40
+Playerbot.World.Gathering.Campfire = 1
+Playerbot.World.Gathering.UseChatModel = 1
+Playerbot.World.Gathering.ChatModelPerMinute = 4
 
 # How many other players may stand within 40 yards of a world bot working a quest objective before it gives that objective up for 15
 # minutes and takes another quest (real players and their companions keep their place first, then world bots by id). Keeps a popular mob
@@ -249,6 +372,8 @@ Playerbot.World.JumpGraceSec = 20
 # next to the nearest player (0 = no cap). Outdoors and in a capital.
 Playerbot.World.AreaCapOutdoors = 14
 Playerbot.World.AreaCapTown = 40
+# The same in a start zone (Camp Narache, Deathknell, ...), where every new character has the same camp and the same quest giver (0 = AreaCapOutdoors).
+Playerbot.World.AreaCapStart = 10
 Playerbot.World.AreaRadius = 45
 # Temporary residents. PoolMax is the standing (core) roster; VariableMax more characters may exist next to it, created around a real
 # player where the core has nobody fitting (a new character on Zephras Isle, a new low-level player) and deleted again, with the
@@ -257,6 +382,14 @@ Playerbot.World.AreaRadius = 45
 # island is moved to a leveling town of the vanilla world. VariableMax = 0: no temporary residents.
 Playerbot.World.VariableMax = 2000
 Playerbot.World.VariableTtlHours = 24
+
+# Travel soak (for testing, off by default): a few world bots at a time are sent between towns, flight masters, quest hubs and docks of the
+# travel graph, across maps by flight path, boat or zeppelin too, and each leg is logged when it ends ("[travel_soak] leg ... arrived /
+# timeout / no_route"); a summary every ten minutes lists the 50 y cells where legs stopped most. Run it overnight with no player online.
+# TravelSoakBots legs run at once; a leg that takes longer than TravelSoakLegSeconds counts as stuck.
+Playerbot.World.TravelSoak = 0
+Playerbot.World.TravelSoakBots = 8
+Playerbot.World.TravelSoakLegSeconds = 1200
 
 #-----------------------------------------------------------------------------
 # Player interaction
@@ -361,6 +494,19 @@ Playerbot.Raid.AutoAcceptOwnerRez = 1
 # 1.0 disables. Read every bot tick (HR-yes).
 Playerbot.TankThreatMultiplier = 3.0
 
+# The same for a tank bot on a raid map (Molten Core, Onyxia, Blackwing Lair, ...), where the
+# bosses cut their tank's threat (Knock Away, Wing Buffet halve it): at 3.0 a halved tank fell
+# below the DPS and the boss turned on them. Clamped to [1.0, 10.0]; 1.0 disables.
+Playerbot.Raid.TankThreatMultiplier = 5.0
+
+# 1 = a tank bot's taunts (Taunt, Growl, Mocking Blow, Challenging Shout/Roar) never miss on a
+# raid map; a boss immune to taunt stays immune. 0 = the normal hit roll.
+Playerbot.Raid.SureTaunt = 1
+
+# 1 = the test squads of `.playerbot scenario` get the threat multipliers above as if a player
+# owned them, so a scenario plays like a player's raid. 0 = they get none (before 0.1.21).
+Playerbot.Scenario.OwnerThreat = 1
+
 # Bot pacing: how fast bots cast, by situation. Values are PERCENT of the normal cast
 # time and global cooldown (100 = normal, 80 = 25% faster, 115 = 15% slower). Applied
 # core-side to the bot only (no aura, invisible to the client); a cast never drops
@@ -394,7 +540,15 @@ Playerbot.Cast.MaxPct = 140
 #                        ghost bots and bots under 35% HP bypass it (healing, defensives, ress).
 #                        Replaces the old Playerbot.Reaction.* StartAttack holds, now removed.
 Playerbot.Pacing.DecisionDelayMs = 600
-Playerbot.Pacing.PvpReactionDelayMs = 700
+Playerbot.Pacing.PvpReactionDelayMs = 630
+
+# Reaction speed. A bot in combat whose global cooldown or cast ends between two of its regular tick slots (Combat 100 ms) is woken on
+# the world tick it ends in, instead of waiting out the rest of the slot (about 50 ms on average). Only bots in the Combat tier, at
+# most one wake per 40 ms each; no effect on the PvP reaction floor above. 0 = off. The [react] lines (channel playerbot.v2.react,
+# every 60 s, need Logger.playerbot.v2=3) show GCD-end -> next-cast, kick, and leave-hazard timings either way, so the setting can be
+# compared on and off.
+# HR-yes
+Playerbot.Reaction.WakeOnGcd = 1
 
 # Threat of non-tank bots grouped with a human, inside a dungeon or raid (not battlegrounds),
 # 0.3..1.5; 1.0 = off. Karrz's VMaNGOS value is 0.8 (tank 1.6; see Playerbot.TankThreatMultiplier).
@@ -481,6 +635,18 @@ Playerbot.Behavior.AcceptOwnerTrade = 1
 #   Playerbot.Gear.RaidIlvlCap   explicit item level ceiling; when set above 0 it overrides MaxTier. Default 0 (use MaxTier).
 Playerbot.Gear.MaxTier = 2
 Playerbot.Gear.RaidIlvlCap = 0
+#   Playerbot.Gear.RaidEnchants  every bot, world bots too, gets the permanent enchants a vanilla raider wore for its
+#                                role (chest, bracers, gloves, boots, cloak, weapon; Bot/Gear/RaidLoadout.cpp), on any worn piece
+#                                without one, when its gear is set up. Names the spell data lacks are skipped and logged
+#                                as "[enchant] unresolved". Level-cap bots only: a bot below the realm's max level gets
+#                                none, and loses any it was given by an older build. The enchants follow the bot's gear
+#                                (average equipped item level): below 60 (greens, blues) only cheap bracer, glove, boot,
+#                                cloak, shield and chest enchants; from 60 (pre-raid, Molten Core, Blackwing Lair) the
+#                                vanilla raider's set (Crusader, Zul'Gurub / Dire Maul head and legs, Zandalar shoulders);
+#                                from 86 (Ahn'Qiraj, tier 2.5 and above) also the Naxxramas shoulder enchants (... of the
+#                                Scourge). A bot whose gear changes gets its enchants swapped to match. 0 = no bot is
+#                                enchanted. Default 1.
+Playerbot.Gear.RaidEnchants = 1
 #   Playerbot.World.Gear.MaxTier world / ambient / BG-fill bots (the ones nobody owns): the same tier scale as Gear.MaxTier,
 #                                default 1 (item level 76). Owned and raid bots keep Playerbot.Gear.MaxTier. A world bot wearing
 #                                a piece above this cap is re-geared down to it the next time the gear pass runs for it.
@@ -518,6 +684,10 @@ Playerbot.OwnedGear.AllowedModes = ""
 #                         talent_audit_<class>): a creature_template entry that can be attacked and does nothing; the runner makes it level 63,
 #                         3731 armor, 2 billion health. 0 (default): the first "Training Dummy" / "Target Dummy" template without a script.
 Playerbot.Scenario.DummyEntry = 0
+#   DamageParity.AllLegs  1 = every damage_parity run also does the four sensitivity legs (spell power, attack power, bare and sundered
+#                         armor), eight legs in all. 0 (default): the four reference legs (none, t1, t3, t3_buffed); a class that failed a check
+#                         in them runs the other four as well.
+Playerbot.DamageParity.AllLegs = 0
 #   AmmoSupply        a bot with a bow, crossbow or gun equipped (hunters; warriors / rogues if the generator gives
 #                     them one) is handed the best arrows / bullets its level allows, up to 1000, and the ammo slot
 #                     is pointed at them, whenever the stock drops under 30% (1000 = 300). Out of combat, bots only,
@@ -559,6 +729,9 @@ Playerbot.Behavior.InstanceGroupCap = 1
 #                     outside: grouped ones are kept first. Needs InstanceGroupCap = 1. Battleground and arena maps
 #                     are not capped by this. Range 1-40.
 Playerbot.Behavior.OpenWorldGroupCap = 40
+#
+#   Lfg.*             the Group Finder settings (Lfg.Enable, BotFillSeconds, InstantFillIfNobody, LevelRange, ActivityMaps,
+#                     Categories) live in worldserver.conf.d\zz-forever-lfg.conf.
 #   BgHumanPriority   a human queueing for a battleground never opens a second instance while a running one can
 #                     make room: a bot leaves it for the human, and a bots-only battleground keeps playing to its
 #                     normal end after the last human leaves ([bg_queue] log lines).
@@ -621,7 +794,9 @@ Playerbot.Behavior.OwnerCommands = 1
 #   PassiveLeashYd    a bot in a group with a player is Passive until told otherwise: it starts nothing and fights only what the
 #                     leader pulled (his target) or what is attacking it or a member, and in the open world only within this
 #                     many yards of the leader or of the member being attacked. It never chases further and goes back to
-#                     follow when the fight is done. 0 = no distance limit.
+#                     follow when the fight is done. Once the player himself is in combat this limit gives way to his fight:
+#                     his bots fight his target, any mob within 40 yards of him, and a mob fighting a member who stands
+#                     within 40 yards of him; never a fight elsewhere on the map. 0 = no distance limit.
 #   AggressiveRadiusYd  Aggressive stance: a bot attacks any hostile within this many yards of the leader (not of itself) and
 #                     nothing beyond; in a dungeon or raid only mobs not yet in combat inside this radius.
 Playerbot.Behavior.PassiveLeashYd = 25
@@ -987,7 +1162,7 @@ PlayerbotV2.Alert.ThrottleMs = 300000
 #-----------------------------------------------------------------------------
 
 # Master switch for the bot guild system (founding, recruiting, membership).
-PlayerbotV2.Guilds.Enabled = 0
+PlayerbotV2.Guilds.Enabled = 1
 
 # Enable scheduled bot guild events (group activities, social cadence).
 PlayerbotV2.Guilds.EventsEnabled = 1
@@ -1053,8 +1228,9 @@ PlayerbotV2.Combat.SkipUnfightable       = 1
 # a mob already hitting a non-tank member (self-defence). Holding = the bot
 # stops attacking that mob (pet called back) but keeps healing / buffing.
 #   HoldEnabled        master switch
-#   HoldInOpenWorld    0 = dungeons/raids only (the owner: open-world groups just
-#                      fight); 1 = also hold in the open world
+#   HoldInOpenWorld    0 = dungeons, raids and raid groups only (the owner: open-world
+#                      parties just fight; a raid group holds wherever it fights);
+#                      1 = every group also holds in the open world
 #   MaxRatio           stay below this fraction of the tank's threat on the
 #                      target; over it, damage stops (and Fade / Feign Death /
 #                      Feint / Cower are used when ready)
@@ -1074,6 +1250,15 @@ Playerbot.Raid.DpsWaitForAttack       = 1
 #   Nightfin Soup). Bots always use ones they carry; with this on, the bags are stocked for them first (free, like
 #   the potion and reagent stock). Default 0; the server's make-configs set 1.
 Playerbot.Raid.ProvideConsumables     = 1
+# Playerbot.Raid.ConsumablesInDungeons  the same kits in dungeon instances (level 58+ bots in a group), not only raids.
+#   Default 1.
+Playerbot.Raid.ConsumablesInDungeons  = 1
+# Playerbot.Raid.ResistGear  grouped raid bots wear the vanilla pieces with the most resistance of the school a boss deals
+#   (the boss's Greater Protection Potion row: Vaelastrasz and Firemaw fire, Ebonroc / Flamegor / Nefarian shadow, Huhuran
+#   nature, Sapphiron frost) while they stand before it, and put their own gear back afterwards. Free pieces for the raid
+#   map, only where they add resistance, never in combat, nothing is destroyed. Tanks keep their armor pieces (head,
+#   shoulders, chest, legs, hands, feet). Molten Core and Onyxia are left alone. Default 0.
+Playerbot.Raid.ResistGear             = 0
 # Playerbot.Consumables.PvE / Playerbot.Consumables.PvP  server choice, separately for PvE (open world, dungeons,
 #   raids) and PvP (battlegrounds and arenas): whether bots use flasks, elixirs, buff food, combat healing and mana
 #   potions, healthstones and resistance potions on that kind of map. Off also stops ProvideConsumables stocking.
@@ -1081,6 +1266,33 @@ Playerbot.Raid.ProvideConsumables     = 1
 #   PvE 1, PvP 0.
 Playerbot.Consumables.PvE             = 1
 Playerbot.Consumables.PvP             = 0
+# Playerbot.AlwaysBuffs.<Switch>.<Place>  keeps bots supplied so nobody has to find or buy anything. Bots only; real players
+#   are never touched. Each switch is 1 (on) or 0 (off) for each place:
+#     Raid          raids and dungeons (any instance that is not a battleground)
+#     World         everywhere else (open world, cities)
+#     Battleground  battlegrounds and arenas
+#   Switches:
+#     Supplies     ammo, reagents, soul shards, poisons, runes, food, water and potions kept at the full stack, topped up as
+#                  soon as one is used, in a fight too. Defaults: 1 everywhere.
+#     Repair       gear kept at full durability with no repair bill, and at least 200 gold in the pocket. Defaults: 1 everywhere.
+#     WorldBuffs   Rallying Cry, Spirit of Zandalar, Songflower, Warchief's Blessing (Horde), and the Dire Maul buffs of the role,
+#                  put on as auras (no item, no cast). Defaults: 1 in Raid, 0 in World and Battleground.
+#     Consumables  the role's flask or elixirs, scrolls, stat food and weapon stone (Bot/AlwaysBuffs.h), put on as auras (no
+#                  item, no cast, no GCD), level 58+. Defaults: 1 in Raid, 0 in World and Battleground.
+#   A WorldBuffs or Consumables switch that is 0 where the bot stands also takes those auras off it, so they do not follow it
+#   from a raid into a battleground.
+Playerbot.AlwaysBuffs.Supplies.Raid          = 1
+Playerbot.AlwaysBuffs.Supplies.World         = 1
+Playerbot.AlwaysBuffs.Supplies.Battleground  = 1
+Playerbot.AlwaysBuffs.Repair.Raid            = 1
+Playerbot.AlwaysBuffs.Repair.World           = 1
+Playerbot.AlwaysBuffs.Repair.Battleground    = 1
+Playerbot.AlwaysBuffs.WorldBuffs.Raid        = 1
+Playerbot.AlwaysBuffs.WorldBuffs.World       = 0
+Playerbot.AlwaysBuffs.WorldBuffs.Battleground = 0
+Playerbot.AlwaysBuffs.Consumables.Raid       = 1
+Playerbot.AlwaysBuffs.Consumables.World      = 0
+Playerbot.AlwaysBuffs.Consumables.Battleground = 0
 # Playerbot.Raid.DpsWaitTimeoutMs  with DpsWaitForAttack: after the tanks have fought this long without the owner's
 #   Attack, the DPS go anyway (a forgotten Attack no longer wipes the raid). Eight seconds for a raid, because the tank
 #   takes a while to run in (a party's Pull keeps six); the value is limited to 1000-8000 (there is no "never").
@@ -1112,6 +1324,71 @@ Playerbot.Chatter.Conversation    = 1
 Playerbot.Chatter.GroupCooldownMs = 20000
 Playerbot.Chatter.BotCooldownMs   = 60000
 
+# Chat model (optional, off by default): bots answer whispers and party chat with a locally run language model through
+# Ollama (https://ollama.com) instead of the keyword replies above. Replies are generated text, so they can be odd or
+# wrong. Needs Ollama running on this PC with the model pulled first, e.g. `ollama pull llama3.2:3b` (about 2 GB;
+# `llama3.2:1b`, about 1.3 GB, for a slower PC). The model uses 2 to 4 GB of memory while loaded. The world never waits
+# for it: requests run on their own thread, and a reply that is not back in time is dropped.
+#   Enable           1 = on.
+#   Whispers / Party 1 = the model answers whispers / party chat (party: a bot named in the line, else PartyChance).
+#   Say              1 = the model answers a /say that names a bot within /say range, or that the speaker says with a bot
+#                    targeted. Whispers, named party lines and these /say lines are answered whatever the bot's chattiness;
+#                    chattiness only keeps quiet bots out of unprompted party chat.
+#   Host / Port      the Ollama server (default 127.0.0.1:11434).
+#   Model            the Ollama model name.
+#   TimeoutMs        give up on one request after this long (default 45000).
+#   MaxTokens        longest reply, in tokens (one line of chat is about 20-40).
+#   Temperature      0 = always the same answer, higher = more varied.
+#   KeepAlive        how long Ollama keeps the model in memory after a reply ("30m", "-1" = always, "0" = unload).
+#   ContextLength    the model's context window in tokens (sent as num_ctx). Our prompts need well under 2048; Ollama's own
+#                    default can be 32768, which costs several GB of graphics memory for nothing.
+#   PartyChance      percent of party / raid lines no bot was named in that one bot answers (default 100).
+#   SecondReplyChance percent of those answered lines (and of /say lines) where a second bot chimes in a few seconds later.
+#   QuietChance      percent chance a quiet (Silent / Terse) bot may be the one to answer an unprompted group or /say line.
+#   SayChance        percent of /say lines no bot was named in that a bot within /say range answers (bots in the speaker's
+#                    group first). Bots in combat, battlegrounds and arenas stay out of it.
+#   SayPerMinute     realm-wide cap on those unprompted /say answers, so a busy city doesn't flood (0 = none).
+#   DateInPrompt     1 = the bot knows the server's real date, time and time zone (for "what's the date?").
+#   BotCooldownMs    one bot asks the model at most this often (a whisper inside the gap gets the usual reply).
+#   GroupCooldownMs  gap between two unprompted party / raid answers in one group (default 0 = none).
+#   MaxPerMinute     realm-wide requests per minute.
+#   MaxQueue         requests waiting at once; more are answered the usual way.
+#   MaxWaitMs        a reply that comes back later than this after the line is dropped.
+#   HistoryLines     lines of each bot's conversation with a player the model sees (0 = none), so a follow-up like
+#                    "what about you?" makes sense. Default 8 (four exchanges).
+#   HistoryMinutes   a conversation quiet for this long is forgotten and the next line starts fresh.
+#   Language         "auto" = answer in the player's language (a line in Cyrillic is answered in Russian); a language name
+#                    ("Russian", "German", ...) = always that language. Small models write English best; llama3.2 does
+#                    not officially support Russian, so for Russian players gemma3:4b or qwen2.5:3b are the better pick.
+#   ExtraPrompt      text added to every request's instructions (style, server name, ...).
+Playerbot.ChatModel.Enable          = 0
+Playerbot.ChatModel.Whispers        = 1
+Playerbot.ChatModel.Party           = 1
+Playerbot.ChatModel.Say             = 1
+Playerbot.ChatModel.Host            = "127.0.0.1"
+Playerbot.ChatModel.Port            = 11434
+Playerbot.ChatModel.Model           = "llama3.2:3b"
+Playerbot.ChatModel.TimeoutMs       = 45000
+Playerbot.ChatModel.MaxTokens       = 60
+Playerbot.ChatModel.Temperature     = 0.8
+Playerbot.ChatModel.KeepAlive       = "30m"
+Playerbot.ChatModel.ContextLength   = 2048
+Playerbot.ChatModel.PartyChance     = 100
+Playerbot.ChatModel.SecondReplyChance = 35
+Playerbot.ChatModel.QuietChance     = 30
+Playerbot.ChatModel.SayChance       = 100
+Playerbot.ChatModel.SayPerMinute    = 10
+Playerbot.ChatModel.DateInPrompt    = 1
+Playerbot.ChatModel.BotCooldownMs   = 3000
+Playerbot.ChatModel.GroupCooldownMs = 0
+Playerbot.ChatModel.MaxPerMinute    = 30
+Playerbot.ChatModel.MaxQueue        = 6
+Playerbot.ChatModel.MaxWaitMs       = 60000
+Playerbot.ChatModel.HistoryLines    = 8
+Playerbot.ChatModel.HistoryMinutes  = 10
+Playerbot.ChatModel.Language        = "auto"
+Playerbot.ChatModel.ExtraPrompt     = ""
+
 # Speech no game event announces (also off with Playerbot.Chatter.Enabled = 0):
 #   Callouts.*   a companion (owner in its group) speaks ike3's combat lines: "Heal me!" when it
 #                drops under 20% health, a heal request under 50%, "OOM" under 15% mana, a hunter's
@@ -1131,10 +1408,24 @@ Playerbot.Chatter.Callouts.Enabled           = 1
 Playerbot.Chatter.Callouts.KeyCooldownMs     = 60000
 Playerbot.Chatter.Callouts.GroupCooldownMs   = 8000
 Playerbot.Chatter.Suggest.Enabled            = 1
-Playerbot.Chatter.Suggest.BotCooldownMs      = 1800000
-Playerbot.Chatter.Suggest.ChannelCooldownMs  = 180000
+Playerbot.Chatter.Suggest.BotCooldownMs      = 900000
+Playerbot.Chatter.Suggest.ChannelCooldownMs  = 90000
 Playerbot.Chatter.Suggest.GlobalCooldownMs   = 10000
 Playerbot.Chatter.GlobalMaxPerMinute         = 60
+
+# Channel replies: world bots answer what a real player writes in General (bots in his zone), Trade (bots in a city) and
+# LookingForGroup (bots of his faction). An LFM ("LF healer DM") gets a whisper from a free bot of each wanted role and level, an
+# LFG from a listed Group Finder bot group with a place (or a free bot of his level), a WTB from a bot that sells the item (then
+# "buy 1" and a trade, as in a whisper). A question is answered in the channel QuestionPct of the time, a greeting GreetPct.
+# At most one answered line per player per 20 s. Enable = 0 switches all of it off.
+Playerbot.Chatter.ChannelReplies.Enable      = 1
+Playerbot.Chatter.ChannelReplies.QuestionPct = 60
+Playerbot.Chatter.ChannelReplies.GreetPct    = 40
+# The bots' own LFG calls in towns go to the LookingForGroup channel (60%) or the zone's General (40%), one per faction per 20 s,
+# never repeating a recent line. 0 = the old /yell.
+Playerbot.Chatter.LfgChannel                 = 1
+# A tank's taunt line at a loose mob (/say). Off: most lines in that pool are villain quotes no player says.
+Playerbot.Chatter.Callouts.Taunts            = 0
 
 # Activity tiers: bots near a player, in a group, a raid or a battleground tick at full rate (Combat/Active) and are never
 # held back. Everything else is light (travelling) or parked (idle) and shares a per-frame time budget in ms for rebuilding
@@ -1166,3 +1457,21 @@ Playerbot.LoadTest.MaxP99Ms = 100
 Playerbot.LoadTest.MaxAvgMs = 40
 Playerbot.LoadTest.MaxRssMb = 9000
 Playerbot.LoadTest.MaxSlowCallMs = 250
+
+#
+#    Playerbot.ClassicTalents.ApplyOnLogin
+#        Description: 0 = a bot that already holds all the talent points of its level on the build its talents show is not walked again at
+#                     login or in upkeep (the walk validates the whole trait config rank by rank and froze the world thread when
+#                     dozens of bots logged in together). Walks that remain run at most one per world update. 1 = walk every bot as before.
+#        Default:     0
+
+Playerbot.ClassicTalents.ApplyOnLogin = 0
+
+#
+#    Playerbot.ClassicTalents.WalkBudgetMs
+#        Description: The longest one bot's talent walk may hold the world thread, in milliseconds. A walk that reaches it keeps the ranks
+#                     it validated, logs an error once per class and spec, and the bot is not walked again until its level, spec or
+#                     ranks change.
+#        Default:     250
+
+Playerbot.ClassicTalents.WalkBudgetMs = 250

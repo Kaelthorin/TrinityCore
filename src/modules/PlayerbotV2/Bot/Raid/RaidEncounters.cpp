@@ -41,6 +41,16 @@ std::map<uint32_t, std::unique_ptr<RaidRules>>& Registry()
         RegisterTempleOfAhnQiraj(*aq40);
         rules[531] = std::move(aq40);
 
+        auto aq20 = std::make_unique<RaidRules>();
+        aq20->name = "Ruins of Ahn'Qiraj";
+        RegisterRuinsOfAhnQiraj(*aq20);
+        rules[509] = std::move(aq20);
+
+        auto zg = std::make_unique<RaidRules>();
+        zg->name = "Zul'Gurub";
+        RegisterZulGurub(*zg);
+        rules[309] = std::move(zg);
+
         auto naxx = std::make_unique<RaidRules>();
         naxx->name = "Naxxramas";
         RegisterNaxxramas(*naxx);

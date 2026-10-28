@@ -37,7 +37,10 @@ std::optional<std::string> ClassifyGroupOrder(std::string_view msg, bool owner_w
         (std::find(kOwnerWords.begin(), kOwnerWords.end(), order) != kOwnerWords.end() || order.rfind("drop quest ", 0) == 0);
     // Formation / spacing / main tank orders carry an argument ("formation circle", "spacing tight", "set main tank X").
     // Gear orders: "equip <item link / name / upgrades / best>", "use your best gear" (BotCommandParser OrderEquip).
+    // "use <object>" (an altar, brazier, lever, orb; BotCommandParser "use") is unambiguous as a bare party line, so it needs no ";"
+    // (chris typed "use altar" / "use orb" in party chat and nothing answered, 2026-10-23). A bare "use" alone still says nothing.
     bool const arg_order = order.rfind("gear ", 0) == 0 || order == "equip" || order.rfind("equip ", 0) == 0 || order == "use your best gear" ||
+        order.rfind("use ", 0) == 0 ||
         order == "wear your best gear" || order.rfind("formation ", 0) == 0 || order.rfind("spacing ", 0) == 0 ||
         order == "spread out" || order == "spaced out" || order == "tight" || order == "close" ||
         order == "maintank" || order == "main tank" || order == "set main tank" ||

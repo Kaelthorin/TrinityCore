@@ -1,5 +1,7 @@
 ﻿#include "BotAI.h"
 #include "TownLife.h"
+#include "Fleet/GateDuels.h"
+#include "Fleet/BotPool.h"   // Pool::IsScenarioBot - a test character trades with nobody
 #include "BotSnapshotView.h"
 #include "TradeRule.h"
 #include "BotTrade.h"
@@ -288,18 +290,20 @@ void BotAI::tick(BotSnapshotView snapshot,
     // on false→true transition; clear on true→false. Ships pass
     // through this latch too — harmless since the exit rule gates
     // on metadata kind, not raw Z.
-    // Normalise newly-summoned pets to defensive. Aggressive mode (the
+    // Normalise newly-summoned pets to passive. Aggressive mode (the
     // server default for hunter pets) makes the pet pull every mob in
     // its 25y leash radius — breaking CC, dragging adds onto the group,
-    // chasing respawns out of LoS — all things that actively hinder
-    // bot progress. Detect any pet-guid transition (Empty→guid or
-    // guid→different-guid) and fire one PetSetReactStateIntent{1}.
+    // chasing respawns out of LoS — and defensive still lets it open on
+    // whatever touches it or its owner. A bot pet only fights what the
+    // bot orders it onto (State_InCombat's pet_attack on the bot's own
+    // victim). Detect any pet-guid transition (Empty→guid or
+    // guid→different-guid) and fire one PetSetReactStateIntent{0}.
     // The intent is GCD-free so it doesn't compete with combat casts.
     {
         const ObjectGuid cur_pet = snapshot.pet_guid();
         if (!cur_pet.IsEmpty() && cur_pet != last_known_pet_guid_)
         {
-            emit.pet_set_react_state(1);   // REACT_DEFENSIVE
+            emit.pet_set_react_state(0);   // REACT_PASSIVE
         }
         last_known_pet_guid_ = cur_pet;
     }
@@ -705,7 +709,9 @@ void BotAI::update_dungeon_autopilot_hold(BotSnapshotView s, GroupSnapshotView g
             human_lead_hold_ = lead_hold;
             TC_LOG_INFO("playerbot.v2", "[dungeon_flow] {} {} the dungeon autopilot on map {}: {}",
                 s.name(), lead_hold ? "suspends" : "resumes", s.map_id(),
-                lead_hold ? "a human leads (follows him, advances/pulls on his orders)" : "order / fight window or no human near");
+                lead_hold ? "a human leads (follows him, advances/pulls on his orders)"
+                          : !s.is_in_dungeon() ? "left the dungeon (the autopilot runs only inside one)"
+                                               : "order / fight window or no human near");
         }
     }
 
@@ -784,9 +790,12 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
                 const int32 diff = int32(s.level()) - int32(s.duel_initiator_level());
                 const uint32 h = ((uint32(s.bot_id()) + 1u) * 2654435761u) ^
                                  (uint32(s.duel_initiator().GetCounter()) * 2246822519u) ^ ((now_ms / 60000u) * 3266489917u);
-                const bool close = diff >= -5 && diff <= 5;
+                // Playerbot.World.GateDuels.Enable: a player who wants a duel gets one from any idle bot within 10 levels (the
+                // nostalgic duel outside the gate); otherwise about one time in three within 5.
+                const bool gate_duels = Services::Config().gate_duels_enable();
+                const bool close = gate_duels ? V2::GateDuels::PlayerDuelOk(s.level(), s.duel_initiator_level()) : (diff >= -5 && diff <= 5);
                 const bool fit = s.hp_pct() >= 70 && !s.in_combat() && s.is_alive() && !s.is_moving();
-                if (close && fit && ((h >> 9) % 3u) == 0u)
+                if (close && fit && (gate_duels || ((h >> 9) % 3u) == 0u))
                 {
                     em.duel_accept();
                     em.say_world("alright, you're on");
@@ -814,7 +823,12 @@ void BotAI::dispatch_layers(BotSnapshotView s, GroupSnapshotView g,
     // Trades opened on the bot are likewise declined automatically. Window
     // stays open server-side until either side cancels — without this the
     // bot would sit there with the dialog up indefinitely.
-    if (s.has_trade_request() &&
+    if (s.has_trade_request() && ::Playerbot::Pool::IsScenarioBot(s.bot_id()))
+    {
+        // A scenario test character (the scorecard raids in Tier 3 test gear) never buys, sells or takes a gift: cancelled at once.
+        em.trade_decline();
+    }
+    else if (s.has_trade_request() &&
         AcceptsTradeFrom(Services::Config().behavior_accept_owner_trade(), s.trade_partner_is_real(),
                          !s.raw().owner_guid.IsEmpty() && s.raw().social_events.trade_partner_guid == s.raw().owner_guid,
                          s.raw().social_events.trade_partner_in_my_group))

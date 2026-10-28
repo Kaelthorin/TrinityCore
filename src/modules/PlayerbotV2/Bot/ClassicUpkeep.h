@@ -16,6 +16,8 @@
 #include <functional>
 #include <string_view>
 #include "InstanceSchools.h"
+#include "AlwaysBuffs.h"
+#include "ClassicSupplies.h"   // RaidConsumableRole
 #include "BotTypes.h"
 #include "ObjectGuid.h"
 #include <vector>
@@ -90,14 +92,19 @@ bool InstanceDealsSchool(uint32 map_id, Resist school);
 // the fear prep ([raid_fear]).
 bool BossFears(uint32 map_id, uint32 creature_entry);
 
-// The resistance potion for an instance's resistance (Fire: Greater Fire
-// Protection Potion 13457), 0 when there is none.
+// The Greater Protection Potion for a resistance school (Fire 13457, Frost
+// 13456, Nature 13458, Shadow 13459), 0 when there is none.
 uint32 ResistPotionItem(Resist r);
 
 // In combat: the resistance potion the raid plan asks this bot to drink
 // (PveOrder::resist_potion, opt-in Playerbot.Raid.ResistPotions) when it is
 // in the bags, off cooldown and its protection is not already up. 0 = none.
 uint32 PickResistPotion(BotSnapshotView const& s);
+
+// Raid resistance gear (Playerbot.Raid.ResistGear): the school (SpellSchools value) of the boss a grouped bot stands before: the nearest living
+// boss within the bot's 40 yd scan whose RaidRules::resistPotion row names a Greater Protection Potion, on a map the swap runs on
+// (Bot/ResistGear.h). 0 = none: the bot wears its own gear.
+uint8 PickResistGearSchool(BotSnapshotView const& s);
 
 // Dwarf priest: Fear Ward (6346) on the tank the raid plan gave it
 // (PveOrder::fear_ward_target) while that tank is in range. spell 0 = nothing.
@@ -115,6 +122,10 @@ CastPick PickFearWard(BotSnapshotView const& s, GroupSnapshotView const& g);
 // change the plan. Out of combat only; nothing while this bot is in a form
 // (DruidFormToLeave takes it out first).
 CastPick PickClassBuff(BotSnapshotView const& s, GroupSnapshotView const& g, PickSkip skip = {});
+// A world bot's buff for a passing real player (Playerbot.World.Kindness): Fortitude (priest), Intellect (mage, a mana user only)
+// or Mark of the Wild (druid), the spell the bot would cast on its own group. `held` = the Strangers::BuffBit the player has.
+// `bit_out` = the buff picked. Nothing in combat, mounted or in a druid form.
+uint32 PickStrangerBuff(BotSnapshotView const& s, uint8 held, bool target_has_mana, uint8& bit_out);
 // A cast PickClassBuff returned with a kind 6 key (caster-centred buff): tracks whether it reached anyone, and backs the buff off when not.
 void NoteAreaBuffCast(ObjectGuid caster, uint64 key, uint32 needy, uint32 now_ms);
 
@@ -261,8 +272,15 @@ void ShortClassSupplies(BotSnapshotView const& s, std::vector<uint32>& out);
 // PickRaidConsumableStock: the kit item the bags are short of whose buff is missing, to stock (0 = none).
 // Playerbot.Consumables.PvE / .PvP for the bot's current map (battlegrounds and arenas are PvP, everything else PvE).
 bool ConsumablesAllowed(BotSnapshotView const& s);
+// Playerbot.AlwaysBuffs.<Switch>.<Place>: where the bot stands (a battleground or arena map, else a raid or dungeon instance, else the world)
+// and whether a switch is on there. A bot in a raid-type group counts as in a raid wherever it stands (the dps scorecard fights in the
+// open world with a 22-bot raid and its flasks and world buffs were stripped there).
+AlwaysPlace AlwaysPlaceOf(BotSnapshotView const& s, GroupSnapshotView const* g = nullptr);
+bool AlwaysOn(BotSnapshotView const& s, AlwaysSwitch what, GroupSnapshotView const* g = nullptr);
 uint32 PickRaidConsumable(BotSnapshotView const& s, GroupSnapshotView const& g);
 uint32 PickRaidConsumableStock(BotSnapshotView const& s, GroupSnapshotView const& g);
+// The role whose kit (ClassicSupplies RaidConsumablesFor) the bot drinks: the group's role first, then the tank test, then the spec.
+RaidConsumableRole RaidConsumableRoleOf(BotSnapshotView const& s, GroupSnapshotView const& g);
 
 // Physical melee damage dealer or tank by class and (virtual Classic) spec.
 bool IsMeleeSpec(uint8 cls, uint32 spec);
@@ -287,12 +305,18 @@ enum class ConsumableKind : uint8
 // first on a tie. With `conjured_only` only conjured items count. 0 = none.
 uint32 BestConsumable(BotSnapshotView const& s, ConsumableKind kind, bool conjured_only = false);
 
+// Food / Drink to recover with: BestConsumable, else (PlayerbotV2.Classic.ClassSupplies: infinite supplies) the Food / Water rank of
+// the bot's level, which the API eats / drinks without the item (Api/VirtualSupply.h). A healer is never left with nothing to drink.
+uint32 RecoveryConsumable(BotSnapshotView const& s, ConsumableKind kind);
+
 // Mage Conjure Water / Conjure Food: the best rank the mage knows (found in the spell data, like
 // the healthstones) when fewer than `want_below` conjured items of that kind (Drink / Food) are
 // in the bags, else 0.
 uint32 MageConjureSpell(BotSnapshotView const& s, ConsumableKind kind, uint32 want_below);
 // Best Conjure Water (Drink) / Conjure Food (Food) rank `knows` accepts, 0 = none.
 uint32 BestMageConjure(ConsumableKind kind, std::function<bool(uint32)> const& knows);
+// `spell` is a Conjure Water (Drink) / Conjure Food (Food) rank: its kind in `kind`. Found by the spell data, so any locale.
+bool   IsMageConjure(uint32 spell, ConsumableKind& kind);
 // A mage that can conjure the item of supply family `family` ("Water", "Food") makes its own: the restock skips it.
 bool   MageConjuresFamily(uint8 cls, std::string_view family, std::function<bool(uint32)> const& knows);
 
@@ -400,8 +424,8 @@ uint32 PickCombatManaItem(BotSnapshotView const& s, GroupSnapshotView const* g =
 constexpr int32 kCombatHealthItemPct = 30;
 // Mana % at or below which a group healer in a boss fight uses a mana item.
 constexpr int32 kBossHealerManaItemPct = 35;
-// ... and the mana % above which it does not even look. The items are on a 2-minute cooldown: spent at 71-81 % they were on cooldown
-// when the bar ran dry 80 s later, so a healer uses one only when mana is low.
+// ... and the mana % above which it does not even look. The items are on a 2-minute cooldown: spent at 71-81 % (UBRS 20 Oct, both priests)
+// they were on cooldown when the bar ran dry 80 s later, so a healer uses one only when mana is low.
 constexpr int32 kHealerManaItemCeilingPct = 30;
 
 // ======================= Boss fights (major cooldowns) =======================

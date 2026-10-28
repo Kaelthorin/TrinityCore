@@ -1,4 +1,4 @@
-#include "BotSnapshotView.h"
+﻿#include "BotSnapshotView.h"
 #include "SpellMgr.h"
 #include "Log.h"
 #include "SpellInfo.h"
@@ -426,15 +426,32 @@ bool BotSnapshotView::in_spell_range(uint32 spell_id, NearbyUnit const& t, float
         limit = std::max(kSelfReach + t.combat_reach + 4.0f / 3.0f, kNominalMelee);
     else
     {
-        float const base = si->GetMaxRange(false);
+        float base = si->GetMaxRange(false);
         if (base <= 0.f)
             return true;
+        // The bot's range modifiers on this spell (SpellbookState::range_bonus), as Spell::CalcMinMaxRange applies them.
+        auto const& rb = s_->spellbook.range_bonus;
+        if (auto it = std::lower_bound(rb.begin(), rb.end(), spell_id, [](std::pair<uint32, float> const& e, uint32 id) { return e.first < id; });
+            it != rb.end() && it->first == spell_id)
+            base += it->second;
         limit = base + kSelfReach + t.combat_reach;
         if (si->CalcCastTime() > 0)   // Spell::CheckRange: hard casts get +10% (<= 3y)
             limit += std::min(3.0f, base * 0.1f);
     }
     limit += slack;
     return d2 <= limit * limit;
+}
+
+float BotSnapshotView::spell_min_range(uint32 spell_id, NearbyUnit const& t) const
+{
+    if (uint32 known = resolve_rank(spell_id)) spell_id = known;
+    SpellInfo const* si = sSpellMgr->GetSpellInfo(spell_id, DIFFICULTY_NONE);
+    if (!si || !si->RangeEntry)
+        return 0.f;
+    float min = si->GetMinRange(false);
+    if (si->RangeEntry->Flags & SPELL_RANGE_RANGED)
+        min += std::max(1.5f + t.combat_reach + 4.0f / 3.0f, 5.0f);   // DEFAULT_PLAYER_COMBAT_REACH + target reach + 4/3, at least NOMINAL_MELEE_RANGE
+    return min;
 }
 
 bool BotSnapshotView::victim_in_spell_range(uint32 spell_id, float slack) const
@@ -982,7 +999,7 @@ static NearbyUnit const* UnclaimedLooseAttacker(BotSnapshot const& s, float rang
         // The victim's role from the bot's own friend sweep (the snapshot carries no group list; a victim outside the 12 closest friends
         // reads as no preference). Cloth casters would need a class on NearbyUnit; only healers are preferred here. A victim already
         // below kDyingVictimPct comes before everyone: with more loose mobs than tanks the mob on the member about to die is the one
-        // to take (two mobs on a rogue at 5% health while both tanks took mobs on members at full health).
+        // to take (UBRS 132f 22:15:30: two Dragonspawn on a rogue at 5% health, both tanks took mobs on members at full health).
         for (NearbyUnit const& f : s.combat.nearby_friends)
             if (f.guid == e.victim)
             {
@@ -1005,7 +1022,11 @@ NearbyUnit const* BotSnapshotView::taunt_candidate(float range) const
         // Ours, and not on us yet: taunt it wherever it is, another tank
         // included. No ping-pong: the holder sees it as a mob on itself,
         // and its own fallback below skips mobs claimed by other tanks.
-        if (ThreatVictim(a->victim_kind) != ThreatVictim::Me)
+        // A raid boss another tank holds is left there: each swap turns it (Onyxia's Flame Breath and Tail Sweep, Broodlord's
+        // Cleave) and the taunt war never settles. The planned swaps (debuff stacks) are RaidBrain's taunt orders, not this.
+        bool const boss_on_tank = s_->instance_ctx.is_in_raid && ThreatVictim(a->victim_kind) == ThreatVictim::Tank &&
+                                  (a->is_dungeon_boss || a->is_boss_rank);
+        if (ThreatVictim(a->victim_kind) != ThreatVictim::Me && !boss_on_tank)
         {
             const float dx = a->x - s_->position.x;
             const float dy = a->y - s_->position.y;

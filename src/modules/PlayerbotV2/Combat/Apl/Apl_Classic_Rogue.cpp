@@ -10,7 +10,7 @@
 // Openers: on a target nobody is fighting yet the rogue stealths, Saps a
 // humanoid standing next to it, then opens with Ambush (behind, dagger),
 // Cheap Shot, or Garrote (behind, before Cheap Shot is learned). Backstab
-// replaces Sinister Strike when behind the target with a dagger. "Behind"
+// replaces Sinister Strike when behind the target with a dagger; Mutilate (when learned, dagger) replaces both up to 3 combo points. "Behind"
 // is read from the target's facing in the snapshot. Poisons are kept up out
 // of combat by idle:classic_weapon (Bot/ClassicUpkeep.cpp).
 // Skipped: Kidney Shot, Vanish, Gouge. Feint: threat dump at 60% of the tank's threat (idea from Karrz's VMaNGOS bots).
@@ -61,6 +61,7 @@ constexpr uint32 CHEAP_SHOT      = 1833;
 constexpr uint32 AMBUSH          = 8676;    // dagger, from behind
 constexpr uint32 GARROTE         = 703;     // from behind
 constexpr uint32 BACKSTAB        = 53;      // dagger, from behind
+constexpr uint32 MUTILATE        = 399956;  // dagger, two combo points for 60 energy (1329 is the Burning Crusade id, its strike 5374 is not in the client data)
 
 constexpr uint8 POWER_ENERGY = 3;
 constexpr uint8 POWER_COMBO  = 4;
@@ -125,7 +126,7 @@ bool UnengagedVictim(ApPredicateContext const& ctx)
 
 bool ShouldStealth(ApPredicateContext const& ctx)
 {
-    if (ctx.bot.in_combat() || Stealthed(ctx) || ctx.bot.is_mounted() || !UnengagedVictim(ctx) || !Ready(ctx, STEALTH))
+    if (ctx.bot.in_combat() || Stealthed(ctx) || ctx.bot.is_mounted() || ctx.bot.owner_stealth_off() || !UnengagedVictim(ctx) || !Ready(ctx, STEALTH))
         return false;
     float const d = DistTo(ctx, *ctx.bot.victim_info());
     return d > 8.f && d < 40.f;
@@ -187,10 +188,11 @@ void DoEvasion(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(EVASION)
 // Feint when close to pulling the tank's aggro (VMaNGOS medium-threat trigger: 60% of the tank's threat).
 bool ShouldFeint(ApPredicateContext const& ctx)
 {
-    return ctx.bot.in_combat() && ctx.group.members() && Ready(ctx, FEINT)
+    return ctx.bot.in_combat() && ctx.group.members() && HasLiveTarget(ctx) && (Ready(ctx, FEINT) && ctx.bot.victim_in_spell_range(FEINT))
         && ThreatDump::ThreatPct(ctx.bot) >= ThreatDump::kMediumThreatPct;
 }
-void DoFeint(ApPredicateContext const&, BotIntentEmitter& e) { e.cast(FEINT); }
+// Feint is cast on the mob (ThreatLimits kThreatDrops): cast with no target it is refused BAD_TARGETS (onyxia 115: 93 refusals, one loop).
+void DoFeint(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(FEINT, ctx.bot.victim()); }
 
 bool ShouldKick(ApPredicateContext const& ctx)
 {
@@ -237,20 +239,24 @@ void DoBladeFlurry(ApPredicateContext const& ctx, BotIntentEmitter& e)
     Classic::NoteCooldownUse(ctx.bot, BLADE_FLURRY, "Blade Flurry");
 }
 
-// Slice and Dice at 1-2 combo points when it is missing; not worth it on a
-// target about to die.
-// Up with more than 3 s left: recast before it drops, not after (a gap of a GCD plus the next builder every cycle).
-static bool SliceAndDiceUp(ApPredicateContext const& ctx)
+// Slice and Dice lasts 9 s at one point and 21 s at five. See ShouldSliceAndDice for how it shares the points with Eviscerate.
+static int32 SliceAndDiceMs(ApPredicateContext const& ctx)
 {
     AuraEntry const* a = ctx.bot.find_aura(SLICE_AND_DICE);
-    return a && a->remaining.count() > 3000;
+    return a ? int32(a->remaining.count()) : 0;
 }
 
 bool ShouldSliceAndDice(ApPredicateContext const& ctx)
 {
     if (!HasLiveTarget(ctx) || Combo(ctx) < 1 || Energy(ctx) < 25) return false;
     if (VictimHpPct(ctx) < 25 && !VictimIsBossLike(ctx)) return false;
-    return (Ready(ctx, SLICE_AND_DICE) && ctx.bot.victim_in_spell_range(SLICE_AND_DICE)) && !SliceAndDiceUp(ctx);
+    if (!(Ready(ctx, SLICE_AND_DICE) && ctx.bot.victim_in_spell_range(SLICE_AND_DICE))) return false;
+    // Only a lapsed Slice and Dice is cast again, and while one is running the points go to Eviscerate: a builder gives one point per
+    // 40 energy, 0.25 a second, which Slice and Dice at its 15 s upkeep (3 points) takes entirely (damage_parity 164: Eviscerate never
+    // cast in a 180 s leg of 43 points). Five points buy 21 s, then Eviscerate takes the next five: Slice and Dice up about half the
+    // time and both finishers in use. A short fight against an ordinary mob has no five points to wait for: it starts at two.
+    if (SliceAndDiceMs(ctx) > 0) return false;
+    return Combo(ctx) >= 5 || (Combo(ctx) >= 2 && !VictimIsBossLike(ctx));
 }
 // Cast at the victim like a finishing move (the owner's PartyBotAI does the same): in the
 // Classic data a finishing move is bound to the combo target, and the self cast
@@ -310,6 +316,15 @@ bool ShouldHemorrhage(ApPredicateContext const& ctx)
 }
 void DoHemorrhage(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(HEMORRHAGE, ctx.bot.victim()); }
 
+// Two combo points for 60 energy, against one for 60 (Backstab) or 45 (Sinister Strike): the cheapest combo point there is, and from any side.
+// Up to 3 points so the 2 it awards never overflow 5; the last point comes from Backstab / Sinister Strike.
+bool ShouldMutilate(ApPredicateContext const& ctx)
+{
+    return HasLiveTarget(ctx) && Energy(ctx) >= 60 && Combo(ctx) <= 3 && (Ready(ctx, MUTILATE) && ctx.bot.victim_in_spell_range(MUTILATE))
+        && MainHandDagger(ctx);
+}
+void DoMutilate(ApPredicateContext const& ctx, BotIntentEmitter& e) { e.cast(MUTILATE, ctx.bot.victim()); }
+
 bool ShouldBackstab(ApPredicateContext const& ctx)
 {
     return HasLiveTarget(ctx) && Energy(ctx) >= 60 && Combo(ctx) < 5 && (Ready(ctx, BACKSTAB) && ctx.bot.victim_in_spell_range(BACKSTAB))
@@ -340,6 +355,7 @@ ApRule const kRules[] = {
     { ShouldExposeArmor,    DoExposeArmor,    "classic_rogue:expose_armor" },
     { ShouldEviscerate,     DoEviscerate,     "classic_rogue:eviscerate" },
     { ShouldRiposte,        DoRiposte,        "classic_rogue:riposte" },
+    { ShouldMutilate,       DoMutilate,       "classic_rogue:mutilate" },
     { ShouldBackstab,       DoBackstab,       "classic_rogue:backstab" },
     { ShouldHemorrhage,     DoHemorrhage,     "classic_rogue:hemorrhage" },
     { ShouldSinisterStrike, DoSinisterStrike, "classic_rogue:sinister_strike" },

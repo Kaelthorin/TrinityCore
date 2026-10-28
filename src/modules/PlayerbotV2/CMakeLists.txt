@@ -59,7 +59,10 @@ function(playerbot_v2_configure_sublib target_name)
     target_compile_options(${target_name} PRIVATE /W4 /we4717)
   else()
     target_compile_options(${target_name} PRIVATE -Wall -Wextra -Wpedantic)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # -Winfinite-recursion exists from GCC 12 / Clang 4; GCC 11 stops on an unknown -Werror= option, so ask first
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-Winfinite-recursion PLAYERBOT_V2_HAS_WINFINITE_RECURSION)
+    if(PLAYERBOT_V2_HAS_WINFINITE_RECURSION)
       target_compile_options(${target_name} PRIVATE -Werror=infinite-recursion)
     endif()
   endif()
@@ -175,6 +178,7 @@ playerbot_v2_configure_sublib(playerbot-v2-api)
 add_library(playerbot-v2-core STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2Scripts.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/LfgBotFill.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Services.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/Commands/cs_playerbot_v2.cpp
 )
@@ -183,6 +187,7 @@ target_sources(playerbot-v2-core
     FILE_SET headers_root TYPE HEADERS BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
     FILES
       ${CMAKE_CURRENT_SOURCE_DIR}/PlayerbotV2.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/LfgBotFill.h
       ${CMAKE_CURRENT_SOURCE_DIR}/Services.h
       ${CMAKE_CURRENT_SOURCE_DIR}/PCH.h
 )
@@ -247,10 +252,15 @@ if(COPY_CONF)
     set(_pbv2_install_conf_dir ${CMAKE_INSTALL_PREFIX}/worldserver.conf.d)
   endif()
   if(_pbv2_build_conf_dir)
+    # The Looking-for-group settings are a file of their own (zz-forever-lfg.conf), copied the same way.
+    set(PLAYERBOT_V2_LFG_CONF ${CMAKE_CURRENT_SOURCE_DIR}/conf/zz-forever-lfg.conf)
     add_custom_target(playerbot-v2-default-conf ALL
       COMMAND ${CMAKE_COMMAND} -DSRC=${PLAYERBOT_V2_DEFAULT_CONF} -DDST_DIR=${_pbv2_build_conf_dir}
+              -P ${PLAYERBOT_V2_COPY_IF_MISSING}
+      COMMAND ${CMAKE_COMMAND} -DSRC=${PLAYERBOT_V2_LFG_CONF} -DDST_DIR=${_pbv2_build_conf_dir}
               -P ${PLAYERBOT_V2_COPY_IF_MISSING})
     install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" \"-DSRC=${PLAYERBOT_V2_DEFAULT_CONF}\" \"-DDST_DIR=\$ENV{DESTDIR}${_pbv2_install_conf_dir}\" -P \"${PLAYERBOT_V2_COPY_IF_MISSING}\")")
+    install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" \"-DSRC=${PLAYERBOT_V2_LFG_CONF}\" \"-DDST_DIR=\$ENV{DESTDIR}${_pbv2_install_conf_dir}\" -P \"${PLAYERBOT_V2_COPY_IF_MISSING}\")")
   endif()
 endif()
 
