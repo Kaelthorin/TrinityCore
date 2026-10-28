@@ -84,7 +84,7 @@ LoginREST.TicketDuration=3600
 #        Description: Comma-separated client builds that every realm also lists for and lets in, besides its own
 #                     realmlist.gamebuild. Use it only for builds with the same game data and protocol as the realm's
 #                     build; each one also needs a row in auth.build_info.
-#        Example:     "70630,70532,70450" (a realm on 70634 that older clients may also join)
+#        Example:     "70634,70630,70532" (a realm on 70658 that older clients may also join)
 #        Default:     "" - (only the realm's own build)
 
 Realm.AlsoAcceptBuilds = ""
