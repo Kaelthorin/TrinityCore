@@ -138,6 +138,7 @@ private:
     SellerConfiguration _houseConfig[MAX_AUCTION_HOUSE_TYPE];
 
     ItemPool _itemPool[MAX_AUCTION_QUALITY][MAX_ITEM_CLASS];
+    bool _bonusQualityReported = false;
 
     void LoadSellerValues(SellerConfiguration& config);
     uint32 SetStat(SellerConfiguration& config);

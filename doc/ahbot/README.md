@@ -8,7 +8,12 @@ Seller.cpp has a 3-line hook. Everything stays off unless `AuctionHouseBot.Selle
 Filter (`AuctionHouseBot.Vanilla.Only = 1`): no gems/glyphs, no later-expansion items, quality up to epic,
 required level <= `Vanilla.MaxReqLevel` (60), item level <= `Vanilla.MaxItemLevel` (100). Force-include list
 (`AuctionHouseBot.forceIncludeItems`) bypasses it. Prices come from vendor buy/sell price x the
-`AuctionHouseBot.*.Price.Ratio` keys. Per-bot posting/buying lives separately in
+`AuctionHouseBot.*.Price.Ratio` keys. `AuctionHouseBot.Items.Crafted = 1` (presets) also lists items a profession recipe makes, which are in no loot or vendor
+list and so were dropped by `Items.Misc = 0`. `AuctionHouseBot.Class.WeightByPoolSize = 1` (presets) shares each quality's amount by class priority times
+the number of different items in that class, so greens and blues are mostly gear instead of the same few bags, arrows and trade goods.
+`AuctionHouseBot.Vanilla.ValueCurve = 1` (presets) prices by item level squared x quality (1/2/15/50/150 copper for gray to epic)
+x class (gear, bags, trade goods 100%, recipes and misc 50%, consumables 25%, ammo and reagents vendor price only), never below
+vendor price; the buyer's fair price uses the same value. The 70532 data gives loot-only goods such as essences a 1 copper vendor price. Per-bot posting/buying lives separately in
 `Bot/States/Rules/AuctionRules.cpp`.
 
 Not built or run in the cloud (no full toolchain): first test is on the PC. Check the startup log for

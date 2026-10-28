@@ -19,6 +19,8 @@
 #include "Config.h"
 #include "ItemTemplate.h"
 #include "SharedDefines.h"
+#include <algorithm>
+#include <array>
 
 namespace AuctionBotVanilla
 {
@@ -27,6 +29,10 @@ namespace
     bool _enabled = false;
     int32 _maxReqLevel = 60;
     uint32 _maxItemLevel = 100;   // Naxxramas epics top out around 92
+    bool _valueCurve = false;
+
+    // copper per item level squared, by quality (gray .. epic)
+    constexpr std::array<uint32, 5> QualityFactor = { 1, 2, 15, 50, 150 };
 }
 
 void LoadConfig()
@@ -34,6 +40,7 @@ void LoadConfig()
     _enabled = sConfigMgr->GetBoolDefault("AuctionHouseBot.Vanilla.Only", false);
     _maxReqLevel = sConfigMgr->GetIntDefault("AuctionHouseBot.Vanilla.MaxReqLevel", 60);
     _maxItemLevel = sConfigMgr->GetIntDefault("AuctionHouseBot.Vanilla.MaxItemLevel", 100);
+    _valueCurve = sConfigMgr->GetBoolDefault("AuctionHouseBot.Vanilla.ValueCurve", false);
 }
 
 bool Enabled()
@@ -71,5 +78,42 @@ bool IsAllowed(ItemTemplate const* proto)
         return false;
 
     return true;
+}
+
+uint64 UnitValue(ItemTemplate const* proto)
+{
+    if (!_valueCurve)
+        return 0;
+
+    // the 70532 data gives most loot-only goods a token vendor price (enchanting essences and shards: 1 copper),
+    // so the vendor price alone lists them for a few copper
+    uint64 vendor = std::max<uint64>(proto->GetBuyPrice() / std::max<uint32>(1, proto->GetBuyCount()), uint64(proto->GetSellPrice()) * 4);
+    if (proto->GetClass() == ITEM_CLASS_PROJECTILE)
+        vendor = proto->GetBuyPrice() / 200;   // ammo is bought in stacks of 200
+
+    uint32 classPct = 0;
+    switch (proto->GetClass())
+    {
+        case ITEM_CLASS_WEAPON:
+        case ITEM_CLASS_ARMOR:
+        case ITEM_CLASS_CONTAINER:
+        case ITEM_CLASS_TRADE_GOODS:
+            classPct = 100;
+            break;
+        case ITEM_CLASS_RECIPE:
+        case ITEM_CLASS_MISCELLANEOUS:
+            classPct = 50;
+            break;
+        case ITEM_CLASS_CONSUMABLE:
+            classPct = 25;
+            break;
+        default:                        // ammo, reagents, quivers: vendor goods, vendor price
+            break;
+    }
+
+    uint32 quality = std::min<uint32>(proto->GetQuality(), QualityFactor.size() - 1);
+    uint64 itemLevel = proto->GetBaseItemLevel();
+    uint64 curve = itemLevel * itemLevel * QualityFactor[quality] * classPct / 100;
+    return std::max<uint64>(vendor, curve);
 }
 }

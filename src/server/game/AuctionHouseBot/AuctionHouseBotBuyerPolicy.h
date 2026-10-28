@@ -55,6 +55,25 @@ namespace AuctionBotBuyerPolicy
     // Updates the hourly/daily counters after a buyout.
     TC_GAME_API void RecordBuy(AuctionPosting const* auction, uint64 totalPrice, char const* house);
 
+    // What became of one auction the buyer looked at, for the periodic counter line.
+    enum class Outcome : uint8
+    {
+        SkippedFresh,       // the listing is too new (Buyer.MinDelay / MaxDelay)
+        SkippedHourLimit,   // Buyer.MaxBuysPerHour is spent
+        SkippedDayLimit,    // Buyer.DailyBudgetGold is spent
+        Bought,             // buyout done
+        Bid,                // a bid was placed instead
+        LostRoll,           // rolled for a buyout and a bid, neither came up
+        OverCap             // a roll came up but the price is above Buyer.MaxPriceMultiplier
+    };
+    TC_GAME_API void Note(Outcome outcome);
+
+    // One buyer cycle ran for a house, with `eligible` listings the buyer may buy or bid on (0 = nothing to look at).
+    TC_GAME_API void NoteCycle(uint32 eligible);
+
+    // Every ten minutes: one info line with the counters since the last one, then they start again.
+    TC_GAME_API void LogCounters();
+
     // Buyer spend today and limits, for .ahbot stats
     TC_GAME_API std::string Describe();
 }

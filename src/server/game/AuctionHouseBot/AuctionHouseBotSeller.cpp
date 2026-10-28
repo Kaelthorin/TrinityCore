@@ -26,7 +26,10 @@
 #include "Containers.h"
 #include "ObjectMgr.h"
 #include "Random.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include <limits>
+#include <map>
 #include <sstream>
 
 AuctionBotSeller::AuctionBotSeller()
@@ -44,6 +47,7 @@ bool AuctionBotSeller::Initialize()
 {
     std::unordered_set<uint32> npcItems;
     std::unordered_set<uint32> lootItems;
+    std::unordered_set<uint32> craftedItems;
     std::unordered_set<uint32> includeItems;
     std::unordered_set<uint32> excludeItems;
 
@@ -107,6 +111,28 @@ bool AuctionBotSeller::Initialize()
     }
 
     TC_LOG_DEBUG("ahbot", "Loot filter has {} items", lootItems.size());
+
+    // AuctionHouseBot.Items.Crafted: items a profession recipe makes (Lesser Magic Wand, crafted gear) are in no loot or
+    // vendor table, so Items.Misc = 0 dropped every one of them
+    if (sAuctionBotConfig->GetConfig(CONFIG_AHBOT_ITEMS_CRAFTED))
+    {
+        for (SkillLineAbilityEntry const* ability : sSkillLineAbilityStore)
+        {
+            SkillLineEntry const* skillLine = sSkillLineStore.LookupEntry(ability->SkillLine);
+            if (!skillLine || (skillLine->CategoryID != SKILL_CATEGORY_PROFESSION && skillLine->CategoryID != SKILL_CATEGORY_SECONDARY))
+                continue;
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(ability->Spell, DIFFICULTY_NONE);
+            if (!spellInfo)
+                continue;
+
+            for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+                if (effect.IsEffect(SPELL_EFFECT_CREATE_ITEM) && effect.ItemType)
+                    craftedItems.insert(effect.ItemType);
+        }
+    }
+
+    TC_LOG_DEBUG("ahbot", "Crafted filter has {} items", craftedItems.size());
     TC_LOG_DEBUG("ahbot", "Sorting and cleaning items for AHBot seller...");
 
     uint32 itemsAdded = 0;
@@ -229,8 +255,9 @@ bool AuctionBotSeller::Initialize()
         {
             bool const isVendorItem = npcItems.count(itemId) > 0;
             bool const isLootItem = lootItems.count(itemId) > 0;
+            bool const isCraftedItem = craftedItems.count(itemId) > 0;
 
-            if (!isLootItem && !isVendorItem)
+            if (!isLootItem && !isVendorItem && !isCraftedItem)
                 continue;
         }
 
@@ -453,6 +480,15 @@ void AuctionBotSeller::LoadItemsQuantity(SellerConfiguration& config)
         return sAuctionBotConfig->GetConfig(index);
     };
 
+    // AuctionHouseBot.Class.WeightByPoolSize: a class's share also grows with its number of different items,
+    // so a few green bags or arrows are not listed dozens of times each while green gear gets few slots
+    bool const weightByPool = sAuctionBotConfig->GetConfig(CONFIG_AHBOT_CLASS_WEIGHT_BY_POOL);
+    auto getWeight = [&](uint32 quality, uint32 itemClass) -> uint32
+    {
+        uint32 prio = getPriorityForClass(itemClass);
+        return weightByPool ? prio * uint32(_itemPool[quality][itemClass].size()) : prio;
+    };
+
     std::vector<uint32> totalPrioPerQuality(MAX_AUCTION_QUALITY);
     for (uint32 j = 0; j < MAX_AUCTION_QUALITY; ++j)
     {
@@ -462,7 +498,7 @@ void AuctionBotSeller::LoadItemsQuantity(SellerConfiguration& config)
             if (_itemPool[j][i].empty())
                 continue;
 
-            totalPrioPerQuality[j] += getPriorityForClass(i);
+            totalPrioPerQuality[j] += getWeight(j, i);
         }
     }
 
@@ -474,7 +510,7 @@ void AuctionBotSeller::LoadItemsQuantity(SellerConfiguration& config)
 
         for (uint32 i = 0; i < MAX_ITEM_CLASS; ++i)
         {
-            uint32 classPrio = getPriorityForClass(i);
+            uint32 classPrio = getWeight(j, i);
             if (_itemPool[j][i].empty())
                 classPrio = 0;
 
@@ -532,14 +568,32 @@ void AuctionBotSeller::LoadSellerValues(SellerConfiguration& config)
 // Fill ItemInfos object with real content of AH.
 uint32 AuctionBotSeller::SetStat(SellerConfiguration& config)
 {
-    AllItemsArray itemsSaved;
+    AllItemsArray itemsSaved = {};
 
+    std::map<std::pair<uint32, uint32>, uint32> bonusQualityDiffers; // (item quality, bonus quality) -> listings
     AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsById(sAuctionBotConfig->GetAuctionHouseId(config.GetHouseType()));
     for (auto itr = auctionHouse->GetAuctionsBegin(); itr != auctionHouse->GetAuctionsEnd(); ++itr)
     {
         AuctionPosting const* auctionEntry = &itr->second;
         if (auctionEntry->Owner.IsEmpty() || sAuctionBotConfig->IsBotChar(auctionEntry->Owner)) // Add only ahbot items
-            ++itemsSaved[auctionEntry->Items[0]->GetQuality()][auctionEntry->Bucket->ItemClass];
+        {
+            // count by the template, the same key _itemPool and the listing were chosen by: a bonus list
+            // can change the item's quality, and such a listing was then never counted in its own slot
+            ItemTemplate const* proto = auctionEntry->Items[0]->GetTemplate();
+            if (proto->GetQuality() >= MAX_AUCTION_QUALITY || proto->GetClass() >= MAX_ITEM_CLASS)
+                continue;
+            if (auctionEntry->Items[0]->GetQuality() != proto->GetQuality())
+                ++bonusQualityDiffers[{ proto->GetQuality(), auctionEntry->Items[0]->GetQuality() }];
+            ++itemsSaved[proto->GetQuality()][proto->GetClass()];
+        }
+    }
+
+    if (!bonusQualityDiffers.empty() && !_bonusQualityReported)
+    {
+        for (auto const& [qualities, listings] : bonusQualityDiffers)
+            TC_LOG_INFO("ahbot", "AHBot: {} listings in the {} house: item quality {}, bonus list quality {}",
+                listings, AuctionBotConfig::GetHouseTypeName(config.GetHouseType()), qualities.first, qualities.second);
+        _bonusQualityReported = true;
     }
 
     uint32 count = 0;
@@ -625,6 +679,8 @@ void AuctionBotSeller::SetPricesOfItem(ItemTemplate const* itemProto, SellerConf
         buyPrice = sellPrice;
 
     float basePriceFloat = buyPrice * stackCount / (itemProto->GetClass() == 6 ? 200.0f : static_cast<float>(itemProto->GetBuyCount()));
+    if (uint64 unitValue = AuctionBotVanilla::UnitValue(itemProto))
+        basePriceFloat = float(unitValue) * stackCount;
     basePriceFloat *= priceRatio;
 
     float range = basePriceFloat * 0.04f;
@@ -837,7 +893,7 @@ void AuctionBotSeller::AddNewAuctions(SellerConfiguration& config)
     AuctionHouseObject* auctionHouse = sAuctionMgr->GetAuctionsById(sAuctionBotConfig->GetAuctionHouseId(config.GetHouseType()));
 
     ItemsToSellArray itemsToSell;
-    AllItemsArray allItems;
+    AllItemsArray allItems = {};
     // Main loop
     // getRandomArray will give what categories of items should be added (return true if there is at least 1 items missed)
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
@@ -871,7 +927,7 @@ void AuctionBotSeller::AddNewAuctions(SellerConfiguration& config)
         if (!item)
         {
             TC_LOG_ERROR("ahbot", "AHBot: Item::CreateItem() returned NULL for item {} (stack: {})", itemId, stackCount);
-            return;
+            continue;
         }
 
         // Update the just created item so that if it needs random properties it has them.
@@ -912,13 +968,16 @@ void AuctionBotSeller::AddNewAuctions(SellerConfiguration& config)
         auction.StartTime = GameTime::GetSystemTime();
         auction.EndTime = auction.StartTime + Hours(urand(config.GetMinTime(), config.GetMaxTime()));
 
+        // save the item like a player listing does, otherwise the next start finds no item and deletes the auction
+        item->SaveToDB(trans);
         auctionHouse->AddAuction(trans, std::move(auction));
 
         ++count;
     }
     CharacterDatabase.CommitTransaction(trans);
 
-    TC_LOG_DEBUG("ahbot", "AHBot: Added {} items to auction", count);
+    if (count)
+        TC_LOG_INFO("ahbot", "AHBot: sold {} items into the {} house", count, AuctionBotConfig::GetHouseTypeName(config.GetHouseType()));
 }
 
 bool AuctionBotSeller::Update(AuctionHouseType houseType)
