@@ -301,6 +301,9 @@ class TC_GAME_API Group
         bool IsFull() const;
         bool isLFGGroup()  const;
         bool isRaidGroup() const;
+        bool HasBotMember() const;
+        // a raid that blocks normal quests: one with more players than a party holds (bots alone do not make a raid for quests)
+        bool IsRaidForQuests() const;
         bool isBGGroup()   const;
         bool isBFGroup()   const;
         bool IsCreated()   const;

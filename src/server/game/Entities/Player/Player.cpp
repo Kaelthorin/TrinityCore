@@ -17705,7 +17705,7 @@ void Player::UpdateQuestObjectiveProgress(QuestObjectiveType objectiveType, int3
             continue;
 
         if (!QuestObjective::CanAlwaysBeProgressedInRaid(objectiveType))
-            if (GetGroup() && GetGroup()->isRaidGroup() && !quest->IsAllowedInRaid(GetMap()->GetDifficultyID()))
+            if (GetGroup() && GetGroup()->IsRaidForQuests() && !quest->IsAllowedInRaid(GetMap()->GetDifficultyID()))
                 continue;
 
         uint16 logSlot = objectiveItr.second.QuestStatusItr->second.Slot;
@@ -17903,7 +17903,7 @@ bool Player::HasQuestForItem(uint32 itemid) const
 
         Quest const* qInfo = ASSERT_NOTNULL(sObjectMgr->GetQuestTemplate(questStatus.first));
         // hide quest if player is in raid-group and quest is no raid quest
-        if (GetGroup() && GetGroup()->isRaidGroup() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
+        if (GetGroup() && GetGroup()->IsRaidForQuests() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
             if (!InBattleground())
                 continue;
 
@@ -17942,7 +17942,7 @@ QuestObjective const* Player::GetQuestObjectiveForItem(uint32 itemId, bool onlyI
                 continue;
 
             // hide quest if player is in raid-group and quest is no raid quest
-            if (GetGroup() && GetGroup()->isRaidGroup() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
+            if (GetGroup() && GetGroup()->IsRaidForQuests() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
                 if (!InBattleground()) //there are two ways.. we can make every bg-quest a raidquest, or add this code here.. i don't know if this can be exploited by other quests, but i think all other quests depend on a specific area.. but keep this in mind, if something strange happens later
                     continue;
 
@@ -17973,7 +17973,7 @@ bool Player::HasQuestForCurrency(uint32 currencyId) const
             return false;
 
         // hide quest if player is in raid-group and quest is no raid quest
-        if (GetGroup() && GetGroup()->isRaidGroup() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
+        if (GetGroup() && GetGroup()->IsRaidForQuests() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
             if (!InBattleground()) //there are two ways.. we can make every bg-quest a raidquest, or add this code here.. i don't know if this can be exploited by other quests, but i think all other quests depend on a specific area.. but keep this in mind, if something strange happens later
                 return false;
 
@@ -26923,7 +26923,7 @@ bool Player::HasQuestForGO(int32 GOId) const
             continue;
 
         // hide quest if player is in raid-group and quest is no raid quest
-        if (GetGroup() && GetGroup()->isRaidGroup() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
+        if (GetGroup() && GetGroup()->IsRaidForQuests() && !qInfo->IsAllowedInRaid(GetMap()->GetDifficultyID()))
             if (!InBattleground()) //there are two ways.. we can make every bg-quest a raidquest, or add this code here.. i don't know if this can be exploited by other quests, but i think all other quests depend on a specific area.. but keep this in mind, if something strange happens later
                 continue;
 
