@@ -7,6 +7,9 @@
 > ask the TrinityCore team for help with this fork: questions and bug reports go to the
 > [Forever Discord](https://discord.gg/9GdBGrWPfj).
 
+Branch `forever-bots` is `forever` plus Karrz's player bots (`src/modules/PlayerbotV2`). Questions about the bots go to
+[Karrz's Discord](https://discord.gg/7kJH4YyvZf).
+
 Branch `forever` runs TrinityCore master against the **WoW Classic beta client 1.60.1.70338** (`_classic_beta_\WowB.exe`)
 with a vanilla world (converted from VMaNGOS) and the Skyborne / Zephras Isle content.
 Preliminary support for client 1.60.1.70450: see [doc/Classic70450.md](doc/Classic70450.md).
@@ -198,3 +201,4 @@ Read file [AUTHORS](AUTHORS).
 * [Wiki](https://www.trinitycore.info)
 * [Forums](https://talk.trinitycore.org/)
 * [Discord (Forever)](https://discord.gg/9GdBGrWPfj)
+* [Discord (Karrz, player bots)](https://discord.gg/7kJH4YyvZf)
